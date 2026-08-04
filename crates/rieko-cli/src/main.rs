@@ -15,8 +15,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the vertical slice: ingest → detect → recommend → explain → alert → persist.
+    /// Run the detection pipeline once: ingest → detect → recommend → explain → alert → persist.
     Scan(commands::scan::ScanArgs),
+    /// Run the same pipeline continuously, tracking channel state over time.
+    Monitor(commands::monitor::MonitorArgs),
     /// Show what's stored in the durable database.
     Status(commands::status::StatusArgs),
     /// Run the read-only HTTP API.
@@ -34,6 +36,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(args) => commands::scan::run(args),
+        Command::Monitor(args) => commands::monitor::run(args),
         Command::Status(args) => commands::status::run(args),
         Command::Serve(args) => commands::serve::run(args),
     }

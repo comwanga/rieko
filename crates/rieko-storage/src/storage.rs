@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use rieko_domain::ChannelSnapshot;
 use rieko_findings::{AuditEntry, Finding, Recommendation};
 use thiserror::Error;
 
@@ -32,6 +33,14 @@ pub trait Storage: Send {
     fn save_source_last_seen(&mut self, source: &str, at: &DateTime<Utc>)
         -> Result<(), StorageError>;
     fn source_last_seen(&mut self, source: &str) -> Result<Option<DateTime<Utc>>, StorageError>;
+
+    /// Persist one point-in-time liquidity snapshot per channel per cycle.
+    fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError>;
+    fn recent_channel_snapshots(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError>;
 }
 
 /// In-memory implementation for tests and fixtures.
@@ -41,6 +50,7 @@ pub struct MemoryStorage {
     recommendations: Vec<Recommendation>,
     audit: Vec<AuditEntry>,
     source_ledger: Vec<(String, DateTime<Utc>)>,
+    channel_snapshots: Vec<ChannelSnapshot>,
 }
 
 impl MemoryStorage {
@@ -121,5 +131,25 @@ impl Storage for MemoryStorage {
             .iter()
             .find(|(s, _)| s == source)
             .map(|(_, at)| *at))
+    }
+
+    fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
+        self.channel_snapshots.push(snapshot.clone());
+        Ok(())
+    }
+
+    fn recent_channel_snapshots(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        Ok(self
+            .channel_snapshots
+            .iter()
+            .filter(|s| s.channel_id == channel_id)
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
     }
 }

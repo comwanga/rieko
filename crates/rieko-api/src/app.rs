@@ -40,11 +40,15 @@ impl RiekoApi {
             .route("/status", axum::routing::get(crate::routes::status))
             .route("/findings", axum::routing::get(crate::routes::findings))
             .route(
-                "/findings/channel/{channel_id}",
+                "/findings/channel/:channel_id",
                 axum::routing::get(crate::routes::findings_for_channel),
             )
             .route("/recommendations", axum::routing::get(crate::routes::recommendations))
             .route("/audit", axum::routing::get(crate::routes::audit))
+            .route(
+                "/snapshots/channel/:channel_id",
+                axum::routing::get(crate::routes::channel_snapshots),
+            )
             .with_state(state)
     }
 }

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use rieko_domain::ChannelSnapshot;
 use rieko_findings::{AuditEntry, Finding, Recommendation};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -75,6 +76,19 @@ impl SqliteStorage {
                 source     TEXT PRIMARY KEY,
                 last_seen  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS channel_snapshots (
+                channel_id        TEXT NOT NULL,
+                ts                TEXT NOT NULL,
+                local_ratio       REAL NOT NULL,
+                local_balance_msat INTEGER,
+                remote_balance_msat INTEGER,
+                capacity_msat     INTEGER,
+                status_int        INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, ts)
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_channel_ts
+                ON channel_snapshots (channel_id, ts DESC);
             "#,
         )?;
         Ok(())
@@ -304,6 +318,67 @@ impl Storage for SqliteStorage {
             .optional()?;
         Ok(ts.and_then(|t| DateTime::parse_from_rfc3339(&t).ok().map(|d| d.with_timezone(&Utc))))
     }
+
+    fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO channel_snapshots
+             (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snapshot.channel_id,
+                snapshot.ts.to_rfc3339(),
+                snapshot.local_ratio,
+                snapshot.local_balance_msat,
+                snapshot.remote_balance_msat,
+                snapshot.capacity_msat,
+                snapshot.status as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn recent_channel_snapshots(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int
+             FROM channel_snapshots WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![channel_id, limit], |row| {
+            let status_int: u32 = row.get(6)?;
+            let ts: String = row.get(1)?;
+            Ok(ChannelSnapshot {
+                channel_id: row.get(0)?,
+                local_ratio: row.get(2)?,
+                local_balance_msat: row.get(3)?,
+                remote_balance_msat: row.get(4)?,
+                capacity_msat: row.get(5)?,
+                status: status_from_i64(status_int),
+                ts: parse_ts(&ts),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
+fn status_from_i64(v: u32) -> rieko_domain::ChannelStatus {
+    use rieko_domain::ChannelStatus;
+    match v {
+        0 => ChannelStatus::Opening,
+        1 => ChannelStatus::Active,
+        2 => ChannelStatus::Inactive,
+        3 => ChannelStatus::Closing,
+        4 => ChannelStatus::Closed,
+        5 => ChannelStatus::PendingOpen,
+        6 => ChannelStatus::WaitingClose,
+        _ => ChannelStatus::ForceClosing,
+    }
 }
 
 fn parse_ts(s: &str) -> DateTime<Utc> {
@@ -385,5 +460,38 @@ mod tests {
         assert_eq!(s.latest_findings(10).unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c1").unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c2").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn channel_snapshots_roundtrip() {
+        use rieko_domain::ChannelStatus;
+
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let ts = Utc::now();
+        let snap = ChannelSnapshot {
+            channel_id: "c1".into(),
+            local_ratio: 0.42,
+            local_balance_msat: 420_000,
+            remote_balance_msat: 580_000,
+            capacity_msat: 1_000_000,
+            status: ChannelStatus::Active,
+            ts,
+        };
+        s.save_channel_snapshot(&snap).unwrap();
+        s.save_channel_snapshot(&ChannelSnapshot {
+            channel_id: "c1".into(),
+            local_ratio: 0.30,
+            ts: ts + chrono::Duration::seconds(60),
+            ..snap.clone()
+        })
+        .unwrap();
+
+        let got = s.recent_channel_snapshots("c1", 10).unwrap();
+        assert_eq!(got.len(), 2);
+        // newest first
+        assert_eq!(got[0].local_ratio, 0.30);
+        assert_eq!(got[0].status, ChannelStatus::Active);
+        assert_eq!(got[1].local_ratio, 0.42);
+        assert_eq!(s.recent_channel_snapshots("other", 10).unwrap().len(), 0);
     }
 }

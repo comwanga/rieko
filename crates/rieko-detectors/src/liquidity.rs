@@ -4,7 +4,7 @@ use rieko_findings::{Evidence, Finding, Severity};
 use rieko_graph::GraphView;
 use uuid::Uuid;
 
-use crate::registry::Detector;
+use crate::registry::{Detector, DetectorContext};
 
 /// Tunable thresholds for liquidity severity. Detector severity is separate
 /// from the structural imbalance classification in the domain model.
@@ -48,7 +48,7 @@ impl Detector for LiquidityDetector {
         "channel_liquidity"
     }
 
-    fn run(&self, view: &dyn GraphView) -> Vec<Finding> {
+    fn run(&self, view: &dyn GraphView, _ctx: &DetectorContext) -> Vec<Finding> {
         let mut findings = Vec::new();
         for channel in view.channels() {
             if !channel.status.is_open() {
@@ -114,6 +114,7 @@ mod tests {
     use rieko_graph::{GraphStore, InMemoryGraph};
 
     use super::*;
+    use crate::registry::DetectorContext;
 
     fn channel(id: &str, local: u64, remote: u64) -> Channel {
         let capacity = local + remote;
@@ -140,14 +141,14 @@ mod tests {
     fn balanced_channel_is_silent() {
         let g = graph_with(vec![channel("c1", 50_000, 50_000)]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g).is_empty());
+        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
     }
 
     #[test]
     fn outbound_drained_yields_warning() {
         let g = graph_with(vec![channel("c1", 8_000, 92_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g);
+        let findings = d.run(&g, &DetectorContext::no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert_eq!(findings[0].channel.as_deref(), Some("c1"));
@@ -157,7 +158,7 @@ mod tests {
     fn critically_drained_yields_critical() {
         let g = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g);
+        let findings = d.run(&g, &DetectorContext::no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].evidence_value("local_ratio").unwrap(), &serde_json::json!(0.02));
@@ -169,7 +170,7 @@ mod tests {
         c.status = ChannelStatus::Closed;
         let g = graph_with(vec![c]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g).is_empty());
+        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
     }
 
     #[test]
@@ -179,7 +180,7 @@ mod tests {
             channel("c2", 1_000, 99_000),
         ]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g);
+        let findings = d.run(&g, &DetectorContext::no_context());
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].severity, Severity::Critical);
     }

@@ -12,8 +12,13 @@ repository.workspace = true
 rieko-storage.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+rieko-domain.workspace = true
