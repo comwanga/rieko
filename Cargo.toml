@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rieko-domain",
+    "crates/rieko-graph",
+    "crates/rieko-storage",
+    "crates/rieko-findings",
+    "crates/rieko-ingest-lnd",
+    "crates/rieko-ingest-core",
+    "crates/rieko-detectors",
+    "crates/rieko-recommendations",
+    "crates/rieko-alerts",
+    "crates/rieko-llm",
+    "crates/rieko-api",
+    "crates/rieko-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+authors = ["comwanga"]
+repository = "https://github.com/comwanga/rieko"
+
+[workspace.dependencies]
+# kernel
+rieko-domain = { path = "crates/rieko-domain", version = "0.1.0" }
+rieko-graph = { path = "crates/rieko-graph", version = "0.1.0" }
+
+# storage
+rieko-storage = { path = "crates/rieko-storage", version = "0.1.0" }
+
+# engine layers
+rieko-findings = { path = "crates/rieko-findings", version = "0.1.0" }
+rieko-ingest-lnd = { path = "crates/rieko-ingest-lnd", version = "0.1.0" }
+rieko-ingest-core = { path = "crates/rieko-ingest-core", version = "0.1.0" }
+rieko-detectors = { path = "crates/rieko-detectors", version = "0.1.0" }
+rieko-recommendations = { path = "crates/rieko-recommendations", version = "0.1.0" }
+rieko-alerts = { path = "crates/rieko-alerts", version = "0.1.0" }
+rieko-llm = { path = "crates/rieko-llm", version = "0.1.0" }
+
+# API + CLI
+rieko-api = { path = "crates/rieko-api", version = "0.1.0" }
+rieko-cli = { path = "crates/rieko-cli", version = "0.1.0" }
+
+# third-party
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev]
+debug = true

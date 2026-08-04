@@ -1,0 +1,196 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use rieko_domain::{Channel, ChannelId, ForwardEvent, Node, NodeId, PaymentEvent};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum GraphError {
+    #[error("node {0} not found")]
+    NodeNotFound(NodeId),
+    #[error("channel {0} not found")]
+    ChannelNotFound(ChannelId),
+}
+
+/// Read-only view of the graph that detectors consume. Detectors must never
+/// mutate the graph: they see a snapshot and return findings.
+pub trait GraphView {
+    fn nodes(&self) -> Vec<&Node>;
+    fn node(&self, id: &NodeId) -> Option<&Node>;
+    fn channels(&self) -> Vec<&Channel>;
+    fn channel(&self, id: &ChannelId) -> Option<&Channel>;
+    fn channels_for_peer(&self, peer: &NodeId) -> Vec<&Channel>;
+    fn recent_forwards(&self, limit: usize) -> Vec<&ForwardEvent>;
+    fn recent_payments(&self, limit: usize) -> Vec<&PaymentEvent>;
+}
+
+/// Write side of the graph. All writes are idempotent upserts keyed by entity
+/// id, which (with the per-source last-seen ledger) satisfies the D9 replay
+/// constraint.
+pub trait GraphStore: GraphView {
+    fn upsert_node(&mut self, node: Node) -> GraphResult<()>;
+    fn upsert_channel(&mut self, channel: Channel) -> GraphResult<()>;
+    fn upsert_channels(&mut self, channels: Vec<Channel>) -> GraphResult<usize>;
+    fn record_forward(&mut self, event: ForwardEvent);
+    fn record_payment(&mut self, event: PaymentEvent);
+
+    /// Advance the per-source ingestion ledger. Idempotency: sources should
+    /// skip events older than the last seen marker.
+    fn mark_source_seen(&mut self, source: &str, at: DateTime<Utc>);
+    fn source_last_seen(&self, source: &str) -> Option<DateTime<Utc>>;
+}
+
+pub type GraphResult<T> = Result<T, GraphError>;
+
+/// In-memory graph. Single-binary v1 keeps the live graph in memory; durable
+/// records (findings, actions, audit, source ledger) live in `rieko-storage`.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryGraph {
+    nodes: HashMap<NodeId, Node>,
+    channels: HashMap<ChannelId, Channel>,
+    forwards: Vec<ForwardEvent>,
+    payments: Vec<PaymentEvent>,
+    source_ledger: HashMap<String, DateTime<Utc>>,
+}
+
+impl InMemoryGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> (usize, usize) {
+        (self.nodes.len(), self.channels.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.channels.is_empty()
+    }
+}
+
+impl GraphView for InMemoryGraph {
+    fn nodes(&self) -> Vec<&Node> {
+        self.nodes.values().collect()
+    }
+
+    fn node(&self, id: &NodeId) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+
+    fn channels(&self) -> Vec<&Channel> {
+        self.channels.values().collect()
+    }
+
+    fn channel(&self, id: &ChannelId) -> Option<&Channel> {
+        self.channels.get(id)
+    }
+
+    fn channels_for_peer(&self, peer: &NodeId) -> Vec<&Channel> {
+        self.channels
+            .values()
+            .filter(|c| &c.peer == peer)
+            .collect()
+    }
+
+    fn recent_forwards(&self, limit: usize) -> Vec<&ForwardEvent> {
+        self.forwards.iter().rev().take(limit).collect()
+    }
+
+    fn recent_payments(&self, limit: usize) -> Vec<&PaymentEvent> {
+        self.payments.iter().rev().take(limit).collect()
+    }
+}
+
+impl GraphStore for InMemoryGraph {
+    fn upsert_node(&mut self, node: Node) -> GraphResult<()> {
+        self.nodes.insert(node.id.clone(), node);
+        Ok(())
+    }
+
+    fn upsert_channel(&mut self, channel: Channel) -> GraphResult<()> {
+        self.nodes
+            .entry(channel.peer.clone())
+            .or_insert_with(|| Node {
+                id: channel.peer.clone(),
+                alias: None,
+                version: None,
+                status: rieko_domain::NodeStatus::Unknown,
+                last_seen: channel.last_seen,
+            });
+        self.channels.insert(channel.id.clone(), channel);
+        Ok(())
+    }
+
+    fn upsert_channels(&mut self, channels: Vec<Channel>) -> GraphResult<usize> {
+        let n = channels.len();
+        for channel in channels {
+            self.upsert_channel(channel)?;
+        }
+        Ok(n)
+    }
+
+    fn record_forward(&mut self, event: ForwardEvent) {
+        self.forwards.push(event);
+    }
+
+    fn record_payment(&mut self, event: PaymentEvent) {
+        self.payments.push(event);
+    }
+
+    fn mark_source_seen(&mut self, source: &str, at: DateTime<Utc>) {
+        self.source_ledger.insert(source.to_string(), at);
+    }
+
+    fn source_last_seen(&self, source: &str) -> Option<DateTime<Utc>> {
+        self.source_ledger.get(source).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rieko_domain::{
+        Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
+    };
+
+    use super::*;
+
+    fn channel(id: &str, peer: &str, local: u64, remote: u64) -> Channel {
+        let capacity = local + remote;
+        Channel {
+            id: ChannelId::new(id),
+            node: NodeId::new("local-node"),
+            peer: NodeId::new(peer),
+            capacity_msat: capacity,
+            fee_policy: FeePolicy::default(),
+            status: ChannelStatus::Active,
+            liquidity: LiquidityProfile::compute(capacity, local, remote),
+            last_seen: Utc::now(),
+            opening_height: Some(100),
+        }
+    }
+
+    #[test]
+    fn upsert_is_idempotent_and_replaces() {
+        let mut g = InMemoryGraph::new();
+        g.upsert_channel(channel("c1", "peer1", 40_000, 60_000)).unwrap();
+        g.upsert_channel(channel("c1", "peer1", 10_000, 90_000)).unwrap();
+        let c = g.channel(&ChannelId::new("c1")).unwrap();
+        assert_eq!(c.liquidity.local_balance_msat, 10_000);
+        assert_eq!(g.channels().len(), 1);
+    }
+
+    #[test]
+    fn upserting_channel_creates_peer_node() {
+        let mut g = InMemoryGraph::new();
+        g.upsert_channel(channel("c1", "peer9", 50_000, 50_000)).unwrap();
+        assert!(g.node(&NodeId::new("peer9")).is_some());
+    }
+
+    #[test]
+    fn source_ledger_tracks_last_seen() {
+        let mut g = InMemoryGraph::new();
+        let t1 = Utc::now();
+        g.mark_source_seen("lnd", t1);
+        assert_eq!(g.source_last_seen("lnd"), Some(t1));
+        assert_eq!(g.source_last_seen("core"), None);
+    }
+}

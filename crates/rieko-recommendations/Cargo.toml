@@ -1,0 +1,17 @@
+[package]
+name = "rieko-recommendations"
+description = "Findings → typed, auditable recommendations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rieko-findings.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["serde"] }

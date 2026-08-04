@@ -1,0 +1,15 @@
+[package]
+name = "rieko-ingest-core"
+description = "Bitcoin Core normalizer (placeholder; expanded post-v1 slice)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rieko-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

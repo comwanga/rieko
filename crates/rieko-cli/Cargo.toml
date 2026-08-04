@@ -1,0 +1,38 @@
+[package]
+name = "rieko-cli"
+description = "Rieko command-line entrypoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rieko"
+path = "src/main.rs"
+
+[dependencies]
+rieko-domain.workspace = true
+rieko-graph.workspace = true
+rieko-storage.workspace = true
+rieko-findings.workspace = true
+rieko-detectors.workspace = true
+rieko-recommendations.workspace = true
+rieko-alerts.workspace = true
+rieko-llm.workspace = true
+rieko-ingest-lnd.workspace = true
+rieko-api.workspace = true
+
+anyhow.workspace = true
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
