@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::action_identity;
+
 /// Lifecycle of a recommended action (D7). v1 only ever reaches `Recommended`;
 /// later milestones add Simulated / Approved / Executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,9 +59,48 @@ impl Action {
         params: serde_json::Value,
         summary: impl Into<String>,
     ) -> Self {
+        Self::with_default(
+            Uuid::new_v4().to_string(),
+            action_type,
+            stage,
+            target,
+            params,
+            summary,
+        )
+    }
+
+    /// Construct an action whose id is deterministically derived from its
+    /// source finding and action kind, so re-persisting the same recommendation
+    /// over many runs yields the same row (RIEKO-AUDIT-002).
+    pub fn for_recommendation(
+        finding_id: &str,
+        action_type: ActionType,
+        target: Option<String>,
+        params: serde_json::Value,
+        summary: impl Into<String>,
+    ) -> Self {
+        let id = action_identity(finding_id, action_type, target.as_deref());
+        Self::with_default(
+            id,
+            action_type,
+            ActionStage::Recommended,
+            target,
+            params,
+            summary,
+        )
+    }
+
+    fn with_default(
+        id: String,
+        action_type: ActionType,
+        stage: ActionStage,
+        target: Option<String>,
+        params: serde_json::Value,
+        summary: impl Into<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
-            id: Uuid::new_v4().to_string(),
+            id,
             action_type,
             stage,
             target,

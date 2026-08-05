@@ -1,8 +1,7 @@
 use chrono::Utc;
 use rieko_domain::{LiquidityImbalance, NodeId};
-use rieko_findings::{Evidence, Finding, Severity};
+use rieko_findings::{finding_identity, Evidence, Finding, Severity};
 use rieko_graph::GraphView;
-use uuid::Uuid;
 
 use crate::registry::{Detector, DetectorContext};
 
@@ -79,20 +78,29 @@ impl Detector for LiquidityDetector {
                 severity
             };
 
+            let evidence = vec![
+                Evidence::text("direction", direction),
+                Evidence::number("local_ratio", round4(profile.local_ratio)),
+                Evidence::number("local_balance_msat", profile.local_balance_msat as f64),
+                Evidence::number("remote_balance_msat", profile.remote_balance_msat as f64),
+                Evidence::number("capacity_msat", channel.capacity_msat as f64),
+                Evidence::text("peer", channel.peer.to_string()),
+            ];
+
             findings.push(Finding {
-                id: Uuid::new_v4().to_string(),
+                id: finding_identity(
+                    self.id(),
+                    self.version(),
+                    severity,
+                    Some(self.local_node.as_ref()),
+                    Some(channel.id.as_ref()),
+                    &evidence,
+                ),
                 detector: self.id().to_string(),
                 severity,
                 node: Some(self.local_node.to_string()),
                 channel: Some(channel.id.to_string()),
-                evidence: vec![
-                    Evidence::text("direction", direction),
-                    Evidence::number("local_ratio", round4(profile.local_ratio)),
-                    Evidence::number("local_balance_msat", profile.local_balance_msat as f64),
-                    Evidence::number("remote_balance_msat", profile.remote_balance_msat as f64),
-                    Evidence::number("capacity_msat", channel.capacity_msat as f64),
-                    Evidence::text("peer", channel.peer.to_string()),
-                ],
+                evidence,
                 explanation: None,
                 timestamp: Utc::now(),
             });

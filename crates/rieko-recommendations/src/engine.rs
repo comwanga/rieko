@@ -1,4 +1,4 @@
-use rieko_findings::{Action, ActionStage, ActionType, Finding, Recommendation, Severity};
+use rieko_findings::{Action, ActionType, Finding, Recommendation, Severity};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,9 +45,9 @@ impl RecommendationEngine {
         match direction {
             "outbound" => out.push(Recommendation {
                 finding_id: finding.id.clone(),
-                action: Action::new(
+                action: Action::for_recommendation(
+                    &finding.id,
                     ActionType::RebalanceChannel,
-                    ActionStage::Recommended,
                     Some(channel.clone()),
                     serde_json::json!({
                         "reason": "outbound liquidity drained",
@@ -60,9 +60,9 @@ impl RecommendationEngine {
             "inbound" => {
                 out.push(Recommendation {
                     finding_id: finding.id.clone(),
-                    action: Action::new(
+                    action: Action::for_recommendation(
+                        &finding.id,
                         ActionType::UpdateFeePolicy,
-                        ActionStage::Recommended,
                         Some(channel.clone()),
                         serde_json::json!({
                             "reason": "inbound liquidity drained",
@@ -77,9 +77,9 @@ impl RecommendationEngine {
                 if finding.severity >= Severity::Warning {
                     out.push(Recommendation {
                         finding_id: finding.id.clone(),
-                        action: Action::new(
+                        action: Action::for_recommendation(
+                            &finding.id,
                             ActionType::RebalanceChannel,
-                            ActionStage::Recommended,
                             Some(channel),
                             serde_json::json!({
                                 "reason": "inbound liquidity drained",
@@ -99,7 +99,7 @@ impl RecommendationEngine {
 
 #[cfg(test)]
 mod tests {
-    use rieko_findings::{Evidence, Severity};
+    use rieko_findings::{ActionStage, Evidence, Severity};
 
     use super::*;
 

@@ -1,8 +1,7 @@
 use chrono::Utc;
 use rieko_domain::NodeId;
-use rieko_findings::{Evidence, Finding, Severity};
+use rieko_findings::{finding_identity, Evidence, Finding, Severity};
 use rieko_graph::GraphView;
-use uuid::Uuid;
 
 use crate::registry::{Detector, DetectorContext};
 
@@ -90,21 +89,30 @@ impl Detector for DriftDetector {
                 .map(|s| s.local_ratio)
                 .fold(f64::INFINITY, f64::min);
 
+            let evidence = vec![
+                Evidence::text("direction", "draining"),
+                Evidence::number("start_ratio", round4(start)),
+                Evidence::number("current_ratio", round4(current)),
+                Evidence::number("decline", round4(decline)),
+                Evidence::number("min_in_window", round4(min_in_window)),
+                Evidence::number("window", snaps.len() as f64),
+                Evidence::text("peer", channel.peer.to_string()),
+            ];
+
             findings.push(Finding {
-                id: Uuid::new_v4().to_string(),
+                id: finding_identity(
+                    self.id(),
+                    self.version(),
+                    severity,
+                    Some(self.local_node.as_ref()),
+                    Some(channel.id.as_ref()),
+                    &evidence,
+                ),
                 detector: self.id().to_string(),
                 severity,
                 node: Some(self.local_node.to_string()),
                 channel: Some(channel.id.to_string()),
-                evidence: vec![
-                    Evidence::text("direction", "draining"),
-                    Evidence::number("start_ratio", round4(start)),
-                    Evidence::number("current_ratio", round4(current)),
-                    Evidence::number("decline", round4(decline)),
-                    Evidence::number("min_in_window", round4(min_in_window)),
-                    Evidence::number("window", snaps.len() as f64),
-                    Evidence::text("peer", channel.peer.to_string()),
-                ],
+                evidence,
                 explanation: None,
                 timestamp: Utc::now(),
             });
