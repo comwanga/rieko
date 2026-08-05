@@ -4,8 +4,9 @@
   import Simulations from "./pages/Simulations.svelte";
   import Actions from "./pages/Actions.svelte";
   import Status from "./pages/Status.svelte";
+  import Audit from "./pages/Audit.svelte";
 
-  type Tab = "status" | "findings" | "snapshots" | "simulations" | "actions";
+  type Tab = "status" | "findings" | "snapshots" | "simulations" | "actions" | "audit";
   let tab: Tab = "status";
 </script>
 
@@ -18,6 +19,7 @@
       <button class:active={tab === "snapshots"} on:click={() => (tab = "snapshots")}>Channels</button>
       <button class:active={tab === "simulations"} on:click={() => (tab = "simulations")}>Simulations</button>
       <button class:active={tab === "actions"} on:click={() => (tab = "actions")}>Actions</button>
+      <button class:active={tab === "audit"} on:click={() => (tab = "audit")}>Audit</button>
     </nav>
   </header>
 
@@ -29,8 +31,10 @@
     <Snapshots />
   {:else if tab === "simulations"}
     <Simulations />
-  {:else}
+  {:else if tab === "actions"}
     <Actions />
+  {:else}
+    <Audit />
   {/if}
 </main>
 
