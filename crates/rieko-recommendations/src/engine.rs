@@ -1,6 +1,4 @@
-use rieko_findings::{
-    Action, ActionStage, ActionType, Finding, Recommendation, Severity,
-};
+use rieko_findings::{Action, ActionStage, ActionType, Finding, Recommendation, Severity};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,14 +15,22 @@ pub enum RecommendationEngineError {
 pub struct RecommendationEngine;
 
 impl RecommendationEngine {
-    pub fn recommend(&self, finding: &Finding) -> Result<Vec<Recommendation>, RecommendationEngineError> {
+    pub fn recommend(
+        &self,
+        finding: &Finding,
+    ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
         match finding.detector.as_str() {
             "channel_liquidity" => self.recommend_liquidity(finding),
-            other => Err(RecommendationEngineError::UnsupportedDetector(other.to_string())),
+            other => Err(RecommendationEngineError::UnsupportedDetector(
+                other.to_string(),
+            )),
         }
     }
 
-    fn recommend_liquidity(&self, finding: &Finding) -> Result<Vec<Recommendation>, RecommendationEngineError> {
+    fn recommend_liquidity(
+        &self,
+        finding: &Finding,
+    ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
         let channel = finding
             .channel
             .clone()
@@ -58,13 +64,13 @@ impl RecommendationEngine {
                         ActionType::UpdateFeePolicy,
                         ActionStage::Recommended,
                         Some(channel.clone()),
-serde_json::json!({
-                        "reason": "inbound liquidity drained",
-                        "suggested": "reduce fee_rate_ppm to attract inbound liquidity",
-                        "fee_rate_ppm": 1,
-                        "base_fee_msat": 0,
-                        "cltv_delta": 40,
-                    }),
+                        serde_json::json!({
+                            "reason": "inbound liquidity drained",
+                            "suggested": "reduce fee_rate_ppm to attract inbound liquidity",
+                            "fee_rate_ppm": 1,
+                            "base_fee_msat": 0,
+                            "cltv_delta": 40,
+                        }),
                         format!("Lower fees on channel {channel} to attract inbound liquidity"),
                     ),
                 });

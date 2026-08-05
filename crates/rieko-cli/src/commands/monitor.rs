@@ -12,7 +12,7 @@ use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
 use rieko_storage::{SqliteStorage, Storage};
 use tracing::{info, warn};
 
-use super::common::{GraphSource, persist_and_recommend};
+use super::common::{persist_and_recommend, GraphSource};
 
 #[derive(Args, Debug)]
 pub struct MonitorArgs {
@@ -68,7 +68,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
     let mut alert_sink = if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
-            Ok(sink) => Some(DedupingSink::new(sink, Duration::from_secs(args.alert_cooldown))),
+            Ok(sink) => Some(DedupingSink::new(
+                sink,
+                Duration::from_secs(args.alert_cooldown),
+            )),
             Err(e) => {
                 warn!("telegram configured but unusable: {e}");
                 None

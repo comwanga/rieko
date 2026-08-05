@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::storage::StorageError;
@@ -137,9 +137,8 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
         let severity = finding.severity as i64;
-        let evidence = serde_json::to_string(&finding.evidence).map_err(|e| {
-            StorageError::Corrupt(format!("finding evidence: {e}"))
-        })?;
+        let evidence = serde_json::to_string(&finding.evidence)
+            .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
         self.conn.execute(
             "INSERT OR REPLACE INTO findings (id, detector, severity, node_id, channel_id, evidence, explanation, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -292,7 +291,11 @@ impl Storage for SqliteStorage {
         rows.next().transpose().map_err(Into::into)
     }
 
-    fn set_action_stage(&mut self, action_id: &str, stage: ActionStage) -> Result<(), StorageError> {
+    fn set_action_stage(
+        &mut self,
+        action_id: &str,
+        stage: ActionStage,
+    ) -> Result<(), StorageError> {
         let updated = chrono::Utc::now();
         self.conn.execute(
             "UPDATE recommendations SET stage = ?1, updated_at = ?2 WHERE action_id = ?3",
@@ -381,7 +384,11 @@ impl Storage for SqliteStorage {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(ts.and_then(|t| DateTime::parse_from_rfc3339(&t).ok().map(|d| d.with_timezone(&Utc))))
+        Ok(ts.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }))
     }
 
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
@@ -412,6 +419,31 @@ impl Storage for SqliteStorage {
              FROM channel_snapshots WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![channel_id, limit], |row| {
+            let status_int: u32 = row.get(6)?;
+            let ts: String = row.get(1)?;
+            Ok(ChannelSnapshot {
+                channel_id: row.get(0)?,
+                local_ratio: row.get(2)?,
+                local_balance_msat: row.get(3)?,
+                remote_balance_msat: row.get(4)?,
+                capacity_msat: row.get(5)?,
+                status: status_from_i64(status_int),
+                ts: parse_ts(&ts),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int
+             FROM channel_snapshots ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
             let status_int: u32 = row.get(6)?;
             let ts: String = row.get(1)?;
             Ok(ChannelSnapshot {
@@ -485,8 +517,8 @@ impl SqliteStorage {
             "custom" => ActionType::Custom,
             _ => ActionType::RebalanceChannel,
         };
-        let projection = serde_json::from_str(&row.get::<_, String>(4)?)
-            .unwrap_or(rieko_findings::SimulationProjection {
+        let projection = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or(
+            rieko_findings::SimulationProjection {
                 local_ratio_before: 0.0,
                 local_ratio_after: 0.0,
                 local_balance_msat_after: 0,
@@ -494,7 +526,8 @@ impl SqliteStorage {
                 delta_msat: 0,
                 clears_finding: false,
                 summary: "corrupt projection".into(),
-            });
+            },
+        );
         Ok(Simulation {
             id: row.get(0)?,
             action_id: row.get(1)?,
@@ -608,11 +641,18 @@ mod tests {
         };
         s.save_recommendation(&rec).unwrap();
 
-        let fetched = s.recommendation_for_action(&rec.action.id).unwrap().unwrap();
+        let fetched = s
+            .recommendation_for_action(&rec.action.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.action.stage, ActionStage::Recommended);
 
-        s.set_action_stage(&rec.action.id, ActionStage::Simulated).unwrap();
-        let after = s.recommendation_for_action(&rec.action.id).unwrap().unwrap();
+        s.set_action_stage(&rec.action.id, ActionStage::Simulated)
+            .unwrap();
+        let after = s
+            .recommendation_for_action(&rec.action.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(after.action.stage, ActionStage::Simulated);
         assert!(after.action.updated_at >= after.action.created_at);
 

@@ -22,8 +22,8 @@ impl BlockSummaryNormalizer {
     /// Normalizes a block into a summary. Accepts either a plain JSON object
     /// or a string. Kept deliberately small for the placeholder stage.
     pub fn from_json(payload: &str) -> Result<BlockSummary, NormalizerError> {
-        let value: serde_json::Value = serde_json::from_str(payload)
-            .map_err(|e| NormalizerError::Malformed(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|e| NormalizerError::Malformed(e.to_string()))?;
         let height = value
             .get("height")
             .and_then(|v| v.as_u64())
@@ -33,10 +33,7 @@ impl BlockSummaryNormalizer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| NormalizerError::Malformed("missing hash".into()))?
             .to_string();
-        let tx_count = value
-            .get("tx_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let tx_count = value.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
         Ok(BlockSummary {
             height: height as u32,
             hash,

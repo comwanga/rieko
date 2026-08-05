@@ -108,9 +108,7 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use rieko_domain::{
-        Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
-    };
+    use rieko_domain::{Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId};
     use rieko_graph::{GraphStore, InMemoryGraph};
 
     use super::*;
@@ -161,7 +159,10 @@ mod tests {
         let findings = d.run(&g, &DetectorContext::no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
-        assert_eq!(findings[0].evidence_value("local_ratio").unwrap(), &serde_json::json!(0.02));
+        assert_eq!(
+            findings[0].evidence_value("local_ratio").unwrap(),
+            &serde_json::json!(0.02)
+        );
     }
 
     #[test]

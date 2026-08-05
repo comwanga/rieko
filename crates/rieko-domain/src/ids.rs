@@ -44,6 +44,12 @@ macro_rules! id_type {
     };
 }
 
-id_type!(NodeId, "A node's identity (compressed hex pubkey, or alias for local).");
-id_type!(ChannelId, "A channel identity (channel point `txid:index` or short channel id).");
+id_type!(
+    NodeId,
+    "A node's identity (compressed hex pubkey, or alias for local)."
+);
+id_type!(
+    ChannelId,
+    "A channel identity (channel point `txid:index` or short channel id)."
+);
 id_type!(InvoiceId, "An invoice identity (payment hash).");

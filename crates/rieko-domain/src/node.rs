@@ -40,7 +40,11 @@ impl NodeVersion {
 
         let mut parts = num
             .split('.')
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
             .filter(|p| !p.is_empty());
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;

@@ -38,7 +38,8 @@ impl<S: AlertSink> AlertSink for DedupingSink<S> {
             }
         }
         self.inner.send(alert)?;
-        self.last_sent.insert(alert.dedup_key.clone(), Instant::now());
+        self.last_sent
+            .insert(alert.dedup_key.clone(), Instant::now());
         self.sent_count += 1;
         Ok(())
     }

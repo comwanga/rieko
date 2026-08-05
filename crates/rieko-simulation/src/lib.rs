@@ -80,11 +80,7 @@ impl Simulator {
         let remote_after = channel.capacity_msat.saturating_sub(local_after);
         let before_local = channel.liquidity.local_balance_msat;
 
-        let projected = LiquidityProfile::compute(
-            channel.capacity_msat,
-            local_after,
-            remote_after,
-        );
+        let projected = LiquidityProfile::compute(channel.capacity_msat, local_after, remote_after);
         let clears_finding = projected.imbalance == LiquidityImbalance::Balanced;
 
         Ok(SimulationProjection {
@@ -99,7 +95,11 @@ impl Simulator {
                 channel.id,
                 desired * 100.0,
                 local_after.abs_diff(before_local),
-                if clears_finding { "balanced" } else { "still unbalanced" },
+                if clears_finding {
+                    "balanced"
+                } else {
+                    "still unbalanced"
+                },
             ),
         })
     }
@@ -139,7 +139,9 @@ mod tests {
     #[test]
     fn rebalance_to_half_clears_drained_channel() {
         let c = channel("c1", 10_000, 90_000);
-        let sim = Simulator.project(&c, &rebalance_action("c1", 0.5), "f1").unwrap();
+        let sim = Simulator
+            .project(&c, &rebalance_action("c1", 0.5), "f1")
+            .unwrap();
         assert!(sim.projection.clears_finding);
         assert!((sim.projection.local_ratio_after - 0.5).abs() < 1e-9);
         assert_eq!(sim.projection.delta_msat, 40_000);
@@ -149,7 +151,9 @@ mod tests {
     #[test]
     fn rebalance_delta_is_absolute_motion() {
         let c = channel("c1", 90_000, 10_000);
-        let sim = Simulator.project(&c, &rebalance_action("c1", 0.5), "f1").unwrap();
+        let sim = Simulator
+            .project(&c, &rebalance_action("c1", 0.5), "f1")
+            .unwrap();
         assert_eq!(sim.projection.delta_msat, 40_000);
         assert_eq!(sim.projection.local_balance_msat_after, 50_000);
     }
@@ -187,6 +191,8 @@ mod tests {
     fn zero_capacity_is_rejected() {
         let mut c = channel("c1", 0, 0);
         c.capacity_msat = 0;
-        assert!(Simulator.project(&c, &rebalance_action("c1", 0.5), "f1").is_err());
+        assert!(Simulator
+            .project(&c, &rebalance_action("c1", 0.5), "f1")
+            .is_err());
     }
 }

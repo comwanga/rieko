@@ -14,6 +14,10 @@ pub struct ServeArgs {
 
     #[arg(long, default_value = "127.0.0.1:8080", value_name = "ADDR")]
     addr: SocketAddr,
+
+    /// Directory of built frontend assets to serve at `/`.
+    #[arg(long, value_name = "DIR")]
+    static_dir: Option<PathBuf>,
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
@@ -24,13 +28,22 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     let storage = SqliteStorage::open(&db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
-    let api = RiekoApi::new(Box::new(storage))?;
+    let mut api = RiekoApi::new(Box::new(storage))?;
+    if let Some(dir) = args.static_dir.as_ref() {
+        api = api.with_static_dir(dir);
+    }
 
     let app = api.router();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(args.addr).await?;
-        info!(addr = %args.addr, "rieko api listening (read-only)");
-        axum::serve(listener, app).await.context("axum serve failed")
+        info!(
+            addr = %args.addr,
+            static_dir = args.static_dir.as_ref().map(|d| d.display().to_string()),
+            "rieko api listening (read-only)"
+        );
+        axum::serve(listener, app)
+            .await
+            .context("axum serve failed")
     })
 }

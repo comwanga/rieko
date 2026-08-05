@@ -10,7 +10,7 @@ use rieko_storage::SqliteStorage;
 use tracing::info;
 use tracing::warn;
 
-use super::common::{GraphSource, persist_and_recommend};
+use super::common::{persist_and_recommend, GraphSource};
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
@@ -70,7 +70,10 @@ pub fn run(args: ScanArgs) -> Result<()> {
 
     let mut alert_sink = if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
-            Ok(sink) => Some(DedupingSink::new(sink, Duration::from_secs(args.alert_cooldown))),
+            Ok(sink) => Some(DedupingSink::new(
+                sink,
+                Duration::from_secs(args.alert_cooldown),
+            )),
             Err(e) => {
                 warn!("telegram configured but unusable: {e}");
                 None
@@ -139,7 +142,11 @@ fn print_summary(findings: &[rieko_findings::Finding]) {
             rieko_findings::Severity::Warning => "warning",
             rieko_findings::Severity::Info => "info",
         };
-        println!("  [{sev}] {} {}", f.detector, f.channel.as_deref().unwrap_or(""));
+        println!(
+            "  [{sev}] {} {}",
+            f.detector,
+            f.channel.as_deref().unwrap_or("")
+        );
         match &f.explanation {
             Some(e) => println!("      {e}"),
             None => {

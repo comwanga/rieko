@@ -89,10 +89,17 @@ impl LndClient {
             .collect()
     }
 
-    pub fn forwards(&self, _limit: usize) -> Result<Vec<rieko_domain::ForwardEvent>, LndClientError> {
+    pub fn forwards(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<rieko_domain::ForwardEvent>, LndClientError> {
         let body = self.get("/v1/forwarding/events?num_max_events=100")?;
         let parsed: LndForwardResponse = serde_json::from_str(&body)?;
-        Ok(parsed.forwarding_events.iter().map(Normalizer::forward).collect())
+        Ok(parsed
+            .forwarding_events
+            .iter()
+            .map(Normalizer::forward)
+            .collect())
     }
 }
 

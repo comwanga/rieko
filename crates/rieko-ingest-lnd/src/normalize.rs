@@ -19,7 +19,11 @@ pub enum NormalizerError {
 pub struct Normalizer;
 
 impl Normalizer {
-    pub fn channel(lnd: &LndChannel, local_node: &NodeId, seen_at: DateTime<Utc>) -> Result<Channel, NormalizerError> {
+    pub fn channel(
+        lnd: &LndChannel,
+        local_node: &NodeId,
+        seen_at: DateTime<Utc>,
+    ) -> Result<Channel, NormalizerError> {
         let id = lnd.chan_point.replace(':', "x");
         if !lnd.chan_point.contains(':') {
             return Err(NormalizerError::BadChannelPoint(lnd.chan_point.clone()));
@@ -90,7 +94,10 @@ mod tests {
         let c = Normalizer::channel(&lnd, &NodeId::new("local"), Utc::now()).unwrap();
         assert_eq!(c.capacity_msat, 100_000_000);
         assert_eq!(c.liquidity.local_balance_msat, 95_000_000);
-        assert_eq!(c.liquidity.imbalance, rieko_domain::LiquidityImbalance::InboundDrained);
+        assert_eq!(
+            c.liquidity.imbalance,
+            rieko_domain::LiquidityImbalance::InboundDrained
+        );
         assert!(c.status.is_open());
         assert_eq!(c.peer.as_str(), "peerpubkey");
     }

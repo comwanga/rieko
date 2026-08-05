@@ -40,9 +40,7 @@ pub async fn findings(
         .storage
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-    let rows = storage
-        .latest_findings(limit(&q))
-        .map_err(api_err)?;
+    let rows = storage.latest_findings(limit(&q)).map_err(api_err)?;
     let out: Vec<Value> = rows
         .into_iter()
         .map(|f| serde_json::to_value(&f).unwrap_or(Value::Null))
@@ -59,9 +57,7 @@ pub async fn findings_for_channel(
         .storage
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-    let rows = storage
-        .findings_for_channel(&channel_id)
-        .map_err(api_err)?;
+    let rows = storage.findings_for_channel(&channel_id).map_err(api_err)?;
     let out: Vec<Value> = rows
         .into_iter()
         .map(|f| serde_json::to_value(&f).unwrap_or(Value::Null))
@@ -78,9 +74,7 @@ pub async fn recommendations(
         .storage
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-    let rows = storage
-        .latest_recommendations(limit(&q))
-        .map_err(api_err)?;
+    let rows = storage.latest_recommendations(limit(&q)).map_err(api_err)?;
     let out: Vec<Value> = rows
         .into_iter()
         .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
@@ -115,6 +109,24 @@ pub async fn recent_simulations(
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
     let rows = storage.recent_simulations(limit(&q)).map_err(api_err)?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|s| serde_json::to_value(&s).unwrap_or(Value::Null))
+        .collect();
+    Ok(Json(out))
+}
+
+/// Newest-first liquidity history across all channels.
+pub async fn all_snapshots(
+    State(api): State<RiekoApi>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let mut storage = api
+        .state
+        .storage
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+    let rows = storage.recent_snapshots_all(limit(&q)).map_err(api_err)?;
     let out: Vec<Value> = rows
         .into_iter()
         .map(|s| serde_json::to_value(&s).unwrap_or(Value::Null))

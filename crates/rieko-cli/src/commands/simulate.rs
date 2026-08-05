@@ -4,14 +4,14 @@ use anyhow::{Context, Result};
 use clap::Args;
 use rieko_detectors::Detector;
 use rieko_domain::ChannelId;
-use rieko_findings::{AuditEntry, ActionStage};
+use rieko_findings::{ActionStage, AuditEntry};
 use rieko_graph::GraphView;
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
 use rieko_simulation::Simulator;
 use rieko_storage::{SqliteStorage, Storage};
 use tracing::{info, warn};
 
-use super::common::{GraphSource, persist_and_recommend};
+use super::common::{persist_and_recommend, GraphSource};
 
 #[derive(Args, Debug)]
 pub struct SimulateArgs {
@@ -93,14 +93,17 @@ pub fn run(args: SimulateArgs) -> Result<()> {
             action_type: rec.action.action_type,
             stage: ActionStage::Simulated,
             actor: "system".into(),
-            details: serde_json::to_value(&sim.projection)
-                .unwrap_or(serde_json::Value::Null),
+            details: serde_json::to_value(&sim.projection).unwrap_or(serde_json::Value::Null),
             timestamp: chrono::Utc::now(),
         };
         storage.append_audit(&audit)?;
     }
 
-    info!(recommendations = recommendations.len(), simulated = n_simulated, "simulation complete");
+    info!(
+        recommendations = recommendations.len(),
+        simulated = n_simulated,
+        "simulation complete"
+    );
     print_simulations(&mut storage, 50)?;
     Ok(())
 }
@@ -113,13 +116,18 @@ fn print_simulations(storage: &mut SqliteStorage, limit: u32) -> Result<()> {
     }
     println!("Simulations (newest first):");
     for s in sims {
-        println!("  [{}] {} {} -> {} ({} msat, clears: {})",
+        println!(
+            "  [{}] {} {} -> {} ({} msat, clears: {})",
             s.action_type.as_str(),
             s.id.chars().take(8).collect::<String>(),
             fmt_ratio(s.projection.local_ratio_before),
             fmt_ratio(s.projection.local_ratio_after),
             s.projection.delta_msat,
-            if s.projection.clears_finding { "yes" } else { "no" },
+            if s.projection.clears_finding {
+                "yes"
+            } else {
+                "no"
+            },
         );
         println!("      {}", s.projection.summary);
     }

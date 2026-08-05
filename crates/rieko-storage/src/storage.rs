@@ -39,8 +39,11 @@ pub trait Storage: Send {
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError>;
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError>;
 
-    fn save_source_last_seen(&mut self, source: &str, at: &DateTime<Utc>)
-        -> Result<(), StorageError>;
+    fn save_source_last_seen(
+        &mut self,
+        source: &str,
+        at: &DateTime<Utc>,
+    ) -> Result<(), StorageError>;
     fn source_last_seen(&mut self, source: &str) -> Result<Option<DateTime<Utc>>, StorageError>;
 
     /// Persist one point-in-time liquidity snapshot per channel per cycle.
@@ -50,6 +53,8 @@ pub trait Storage: Send {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError>;
+    /// Newest-first snapshots across all channels (for the UI channel list).
+    fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError>;
 
     /// Record a what-if simulation of a recommended action (D7 Simulate).
     fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError>;
@@ -125,7 +130,11 @@ impl Storage for MemoryStorage {
             .cloned())
     }
 
-    fn set_action_stage(&mut self, action_id: &str, stage: ActionStage) -> Result<(), StorageError> {
+    fn set_action_stage(
+        &mut self,
+        action_id: &str,
+        stage: ActionStage,
+    ) -> Result<(), StorageError> {
         if let Some(rec) = self
             .recommendations
             .iter_mut()
@@ -157,8 +166,7 @@ impl Storage for MemoryStorage {
         source: &str,
         at: &DateTime<Utc>,
     ) -> Result<(), StorageError> {
-        self.source_ledger
-            .retain(|(s, _)| s != source);
+        self.source_ledger.retain(|(s, _)| s != source);
         self.source_ledger.push((source.to_string(), *at));
         Ok(())
     }
@@ -185,6 +193,16 @@ impl Storage for MemoryStorage {
             .channel_snapshots
             .iter()
             .filter(|s| s.channel_id == channel_id)
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        Ok(self
+            .channel_snapshots
+            .iter()
             .rev()
             .take(limit as usize)
             .cloned()

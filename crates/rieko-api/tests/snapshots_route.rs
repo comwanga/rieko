@@ -46,7 +46,12 @@ async fn snapshots_path_param_route_reachable() {
         .unwrap();
     let status = resp.status();
     let body = to_bytes(resp.into_body(), 4096).await.unwrap();
-    assert_eq!(status, StatusCode::OK, "status={status} body: {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "status={status} body: {}",
+        String::from_utf8_lossy(&body)
+    );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let arr = json.as_array().expect("expected array of snapshots");
     assert_eq!(arr.len(), 1, "expected one snapshot back");
