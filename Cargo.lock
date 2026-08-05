@@ -1227,6 +1227,7 @@ dependencies = [
  "chrono",
  "reqwest",
  "rieko-findings",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -1405,6 +1406,7 @@ name = "rieko-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rieko-alerts",
  "rieko-domain",
  "rieko-findings",
  "rusqlite",

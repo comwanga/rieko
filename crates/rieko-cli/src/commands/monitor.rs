@@ -1,12 +1,11 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_alerts::{Alert, AlertSink, DedupingSink, TelegramSink};
+use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
 use rieko_detectors::{Detector, DetectorContext, DriftDetector, LiquidityDetector};
-use rieko_findings::{Finding, Severity};
+use rieko_findings::Finding;
 use rieko_graph::{GraphView, InMemoryHistory};
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
 use rieko_storage::{SqliteStorage, Storage};
@@ -73,10 +72,21 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
     let mut alert_sink = if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
-            Ok(sink) => Some(DedupingSink::new(
-                sink,
-                Duration::from_secs(args.alert_cooldown),
-            )),
+            Ok(sink) => {
+                // Dedup state lives in a separate connection to the same DB,
+                // shared (WAL) with the main one. This keeps the sink's store
+                // out of the `&mut storage` borrow in the loop while still
+                // surviving a restart.
+                let store: Box<dyn AlertStateStore> =
+                    Box::new(SqliteStorage::open(&db_path).with_context(|| {
+                        format!("opening alert-state db {}", db_path.display())
+                    })?);
+                Some(PersistentDedupingSink::new(
+                    sink,
+                    store,
+                    Duration::from_secs(args.alert_cooldown),
+                ))
+            }
             Err(e) => {
                 warn!("telegram configured but unusable: {e}");
                 None
@@ -88,8 +98,6 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
     // History lives across cycles so the drift detector can reason over time.
     let mut history = InMemoryHistory::new(200);
-    // Last seen finding per dedup key; alerts fire only on new or escalated.
-    let mut previous: HashMap<String, Severity> = HashMap::new();
 
     let detectors: Vec<Box<dyn Detector>> = vec![
         Box::new(LiquidityDetector::new(args.node.clone())),
@@ -126,40 +134,29 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         let recommendations =
             persist_and_recommend(&mut storage, &*llm, &engine, &args.node, &findings)?;
 
-        // Transition-aware alerts: new finding or severity escalation only.
+        // Cooldown and severity-escalation are enforced by the persistent
+        // sink, so the loop only decides *what* to say, not *whether*.
         let mut n_alerts = 0u64;
-        let mut next_previous: HashMap<String, Severity> = HashMap::new();
         if let Some(sink) = alert_sink.as_mut() {
             for finding in &findings {
-                let key = finding.dedup_key();
-                let prev = previous.get(&key).copied();
-                let should_alert = prev.map_or(true, |p| finding.severity > p);
-                if should_alert {
-                    let alert = Alert::from_finding(
-                        finding,
-                        format!(
-                            "{}: {}",
-                            finding.detector,
-                            finding.channel.as_deref().unwrap_or("(node)")
-                        ),
-                        finding
-                            .explanation
-                            .clone()
-                            .unwrap_or_else(|| summarize_finding(finding)),
-                    );
-                    match sink.send(&alert) {
-                        Ok(()) => n_alerts += 1,
-                        Err(e) => warn!(error = %e, "alert delivery failed"),
-                    }
+                let alert = Alert::from_finding(
+                    finding,
+                    format!(
+                        "{}: {}",
+                        finding.detector,
+                        finding.channel.as_deref().unwrap_or("(node)")
+                    ),
+                    finding
+                        .explanation
+                        .clone()
+                        .unwrap_or_else(|| summarize_finding(finding)),
+                );
+                match sink.send(&alert) {
+                    Ok(()) => n_alerts += 1,
+                    Err(e) => warn!(error = %e, "alert delivery failed"),
                 }
-                next_previous.insert(key, finding.severity);
-            }
-        } else {
-            for finding in &findings {
-                next_previous.insert(finding.dedup_key(), finding.severity);
             }
         }
-        previous = next_previous;
 
         info!(
             cycle,

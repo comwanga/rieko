@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
 use thiserror::Error;
@@ -62,6 +65,7 @@ pub struct MemoryStorage {
     audit: Vec<AuditEntry>,
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
+    alert_state: HashMap<String, AlertState>,
 }
 
 impl MemoryStorage {
@@ -221,5 +225,16 @@ impl Storage for MemoryStorage {
             .rev()
             .cloned()
             .collect())
+    }
+}
+
+impl AlertStateStore for MemoryStorage {
+    fn read(&self, key: &str) -> Result<Option<AlertState>, AlertError> {
+        Ok(self.alert_state.get(key).copied())
+    }
+
+    fn write(&mut self, key: &str, state: &AlertState) -> Result<(), AlertError> {
+        self.alert_state.insert(key.to_string(), *state);
+        Ok(())
     }
 }

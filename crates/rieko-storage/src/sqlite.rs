@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
 use rusqlite::{params, Connection};
@@ -98,6 +99,13 @@ impl SqliteStorage {
                 ON simulations (action_id);
             CREATE INDEX IF NOT EXISTS idx_simulations_ts
                 ON simulations (created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS alert_state (
+                dedup_key      TEXT PRIMARY KEY,
+                last_sent_at   TEXT,
+                last_severity  INTEGER,
+                last_status    TEXT NOT NULL
+            );
             "#,
         )?;
         // Best-effort additive migration for pre-existing databases created
@@ -536,6 +544,81 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+impl AlertStateStore for SqliteStorage {
+    fn read(&self, key: &str) -> Result<Option<rieko_alerts::AlertState>, AlertError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_sent_at, last_severity, last_status FROM alert_state WHERE dedup_key = ?1")
+            .map_err(|e| AlertError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![key], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| AlertError::Store(e.to_string()))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (sent, sev, status) = row.map_err(|e| AlertError::Store(e.to_string()))?;
+        Ok(Some(rieko_alerts::AlertState {
+            last_sent_at: sent.map(|s| parse_ts(&s)),
+            last_severity: sev.and_then(severity_from_int),
+            last_status: parse_status(&status),
+        }))
+    }
+
+    fn write(&mut self, key: &str, state: &AlertState) -> Result<(), AlertError> {
+        self.conn
+            .execute(
+                "INSERT INTO alert_state (dedup_key, last_sent_at, last_severity, last_status)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(dedup_key) DO UPDATE SET
+                    last_sent_at = excluded.last_sent_at,
+                    last_severity = excluded.last_severity,
+                    last_status = excluded.last_status",
+                params![
+                    key,
+                    state.last_sent_at.map(|t| t.to_rfc3339()),
+                    state.last_severity.map(|s| s as i64),
+                    status_str(state.last_status),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| AlertError::Store(e.to_string()))
+    }
+}
+
+fn severity_from_int(v: i64) -> Option<rieko_findings::Severity> {
+    match v {
+        0 => Some(rieko_findings::Severity::Info),
+        1 => Some(rieko_findings::Severity::Warning),
+        2 => Some(rieko_findings::Severity::Critical),
+        _ => None,
+    }
+}
+
+fn parse_status(s: &str) -> rieko_alerts::DeliveryStatus {
+    match s {
+        "success" => rieko_alerts::DeliveryStatus::Success,
+        "failed" => rieko_alerts::DeliveryStatus::Failed,
+        "skipped" => rieko_alerts::DeliveryStatus::Skipped,
+        _ => rieko_alerts::DeliveryStatus::None,
+    }
+}
+
+fn status_str(s: rieko_alerts::DeliveryStatus) -> &'static str {
+    use rieko_alerts::DeliveryStatus::*;
+    match s {
+        Success => "success",
+        Failed => "failed",
+        Skipped => "skipped",
+        None => "none",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +776,68 @@ mod tests {
         assert_eq!(got[0].status, ChannelStatus::Active);
         assert_eq!(got[1].local_ratio, 0.42);
         assert_eq!(s.recent_channel_snapshots("other", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn alert_state_roundtrips_through_sqlite() {
+        use rieko_alerts::{AlertState, AlertStateStore, DeliveryStatus};
+        use rieko_findings::Severity;
+
+        let mut s = SqliteStorage::in_memory().unwrap();
+        assert_eq!(
+            AlertStateStore::read(&s, "k1").unwrap(),
+            None,
+            "unknown key reads as None"
+        );
+
+        let now = Utc::now();
+        let state = AlertState {
+            last_sent_at: Some(now),
+            last_severity: Some(Severity::Critical),
+            last_status: DeliveryStatus::Success,
+        };
+        s.write("k1", &state).unwrap();
+
+        let got = AlertStateStore::read(&s, "k1").unwrap().unwrap();
+        assert_eq!(got.last_severity, Some(Severity::Critical));
+        assert_eq!(got.last_status, DeliveryStatus::Success);
+        assert!(got.last_sent_at.is_some());
+    }
+
+    #[test]
+    fn alert_state_survives_reopen() {
+        use rieko_alerts::{AlertState, AlertStateStore, DeliveryStatus};
+        use rieko_findings::Severity;
+
+        let dir = std::env::temp_dir().join(format!("rieko-alert-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("alerts.db");
+
+        {
+            let mut s = SqliteStorage::open(&file).unwrap();
+            let now = Utc::now();
+            let state = AlertState {
+                last_sent_at: Some(now),
+                last_severity: Some(Severity::Critical),
+                last_status: DeliveryStatus::Success,
+            };
+            s.write("k1", &state).unwrap();
+        }
+
+        // Re-open against the same file to prove it survives a "restart".
+        let mut s2 = SqliteStorage::open(&file).unwrap();
+        let got2 = AlertStateStore::read(&s2, "k1").unwrap().unwrap();
+        assert_eq!(got2.last_severity, Some(Severity::Critical));
+
+        // Overwrite on conflict, keyed by dedup_key.
+        let older = AlertState {
+            last_sent_at: Some(Utc::now() - chrono::Duration::hours(2)),
+            last_severity: Some(Severity::Warning),
+            last_status: DeliveryStatus::Skipped,
+        };
+        s2.write("k1", &older).unwrap();
+        let got3 = AlertStateStore::read(&s2, "k1").unwrap().unwrap();
+        assert_eq!(got3.last_severity, Some(Severity::Warning));
+        assert_eq!(got3.last_status, DeliveryStatus::Skipped);
     }
 }
