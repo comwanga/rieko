@@ -27,6 +27,10 @@ pub struct SimulateArgs {
     #[arg(long, value_name = "FILE")]
     macaroon: Option<PathBuf>,
 
+    /// Path to LND's TLS certificate (tls.cert), trusted for this client only.
+    #[arg(long, value_name = "FILE")]
+    tls_cert: Option<PathBuf>,
+
     /// Local node id (pubkey). Defaults to `local-node`.
     #[arg(long, default_value = "local-node")]
     node: String,
@@ -48,6 +52,7 @@ pub fn run(args: SimulateArgs) -> Result<()> {
         fixture: args.fixture.clone(),
         lnd_rest: args.lnd_rest.clone(),
         macaroon: args.macaroon.clone(),
+        tls_cert: args.tls_cert.clone(),
         node: args.node.clone(),
     };
     let graph = source.build()?;
