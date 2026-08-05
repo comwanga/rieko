@@ -1101,6 +1101,7 @@ dependencies = [
  "rieko-api",
  "rieko-detectors",
  "rieko-domain",
+ "rieko-execution",
  "rieko-findings",
  "rieko-graph",
  "rieko-ingest-lnd",
@@ -1136,6 +1137,16 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "rieko-execution"
+version = "0.1.0"
+dependencies = [
+ "rieko-domain",
+ "rieko-findings",
  "serde_json",
  "thiserror",
 ]

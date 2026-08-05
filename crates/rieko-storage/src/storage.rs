@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{AuditEntry, Finding, Recommendation, Simulation};
+use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,6 +26,15 @@ pub trait Storage: Send {
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError>;
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError>;
+    /// Look up one recommendation by its action id (for approve/execute).
+    fn recommendation_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Option<Recommendation>, StorageError>;
+    /// Advance (or regress) the stage of a persisted action. The legal
+    /// transitions are enforced upstream by `rieko-execution`.
+    fn set_action_stage(&mut self, action_id: &str, stage: ActionStage)
+        -> Result<(), StorageError>;
 
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError>;
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError>;
@@ -103,6 +112,29 @@ impl Storage for MemoryStorage {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    fn recommendation_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Option<Recommendation>, StorageError> {
+        Ok(self
+            .recommendations
+            .iter()
+            .find(|r| r.action.id == action_id)
+            .cloned())
+    }
+
+    fn set_action_stage(&mut self, action_id: &str, stage: ActionStage) -> Result<(), StorageError> {
+        if let Some(rec) = self
+            .recommendations
+            .iter_mut()
+            .find(|r| r.action.id == action_id)
+        {
+            rec.action.stage = stage;
+            rec.action.updated_at = chrono::Utc::now();
+        }
+        Ok(())
     }
 
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError> {

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{AuditEntry, Finding, Recommendation, Simulation};
+use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
@@ -247,6 +247,58 @@ impl Storage for SqliteStorage {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn recommendation_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Option<Recommendation>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at
+             FROM recommendations WHERE action_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([action_id], |row| {
+            use rieko_findings::{Action, ActionStage, ActionType};
+            let stage = match row.get::<_, String>(3)?.as_str() {
+                "Simulated" => ActionStage::Simulated,
+                "Approved" => ActionStage::Approved,
+                "Executed" => ActionStage::Executed,
+                "Rejected" => ActionStage::Rejected,
+                "Failed" => ActionStage::Failed,
+                _ => ActionStage::Recommended,
+            };
+            let action_type = match row.get::<_, String>(2)?.as_str() {
+                "update_fee_policy" => ActionType::UpdateFeePolicy,
+                "restart_service" => ActionType::RestartService,
+                "custom" => ActionType::Custom,
+                _ => ActionType::RebalanceChannel,
+            };
+            let params: Value =
+                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+            Ok(Recommendation {
+                finding_id: row.get(0)?,
+                action: Action {
+                    id: row.get(1)?,
+                    action_type,
+                    stage,
+                    target: row.get::<_, Option<String>>(4)?,
+                    params,
+                    summary: row.get(6)?,
+                    created_at: parse_ts(&row.get::<_, String>(7)?),
+                    updated_at: parse_ts(&row.get::<_, String>(8)?),
+                },
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    fn set_action_stage(&mut self, action_id: &str, stage: ActionStage) -> Result<(), StorageError> {
+        let updated = chrono::Utc::now();
+        self.conn.execute(
+            "UPDATE recommendations SET stage = ?1, updated_at = ?2 WHERE action_id = ?3",
+            params![format!("{:?}", stage), updated.to_rfc3339(), action_id],
+        )?;
+        Ok(())
     }
 
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError> {
@@ -538,6 +590,62 @@ mod tests {
         let t2 = t1 + chrono::Duration::seconds(10);
         s.save_source_last_seen("lnd", &t2).unwrap();
         assert_eq!(s.source_last_seen("lnd").unwrap(), Some(t2));
+    }
+
+    #[test]
+    fn action_stage_can_be_fetched_and_transitioned() {
+        use rieko_findings::{Action, ActionStage, ActionType};
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: Action::new(
+                ActionType::RebalanceChannel,
+                ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({"desired_ratio": 0.5}),
+                "rebalance c1",
+            ),
+        };
+        s.save_recommendation(&rec).unwrap();
+
+        let fetched = s.recommendation_for_action(&rec.action.id).unwrap().unwrap();
+        assert_eq!(fetched.action.stage, ActionStage::Recommended);
+
+        s.set_action_stage(&rec.action.id, ActionStage::Simulated).unwrap();
+        let after = s.recommendation_for_action(&rec.action.id).unwrap().unwrap();
+        assert_eq!(after.action.stage, ActionStage::Simulated);
+        assert!(after.action.updated_at >= after.action.created_at);
+
+        assert!(s.recommendation_for_action("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn simulations_roundtrip() {
+        use rieko_findings::{Simulation, SimulationProjection};
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let sim = Simulation {
+            id: "sim1".into(),
+            action_id: "a1".into(),
+            finding_id: "f1".into(),
+            action_type: rieko_findings::ActionType::RebalanceChannel,
+            projection: SimulationProjection {
+                local_ratio_before: 0.1,
+                local_ratio_after: 0.5,
+                local_balance_msat_after: 50_000,
+                remote_balance_msat_after: 50_000,
+                delta_msat: 40_000,
+                clears_finding: true,
+                summary: "balanced".into(),
+            },
+            created_at: Utc::now(),
+        };
+        s.save_simulation(&sim).unwrap();
+        let got = s.recent_simulations(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "sim1");
+        assert!(got[0].projection.clears_finding);
+        assert_eq!(s.simulations_for_action("a1").unwrap().len(), 1);
+        assert_eq!(s.simulations_for_action("zz").unwrap().len(), 0);
     }
 
     #[test]

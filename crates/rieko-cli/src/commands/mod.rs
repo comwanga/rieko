@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod common;
 pub mod monitor;
 pub mod scan;

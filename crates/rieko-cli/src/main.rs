@@ -21,6 +21,8 @@ enum Command {
     Monitor(commands::monitor::MonitorArgs),
     /// Run the pipeline once, then project what each recommendation would do.
     Simulate(commands::simulate::SimulateArgs),
+    /// Approve or execute recommended actions (human-gated).
+    Actions(commands::actions::ActionsArgs),
     /// Show what's stored in the durable database.
     Status(commands::status::StatusArgs),
     /// Run the read-only HTTP API.
@@ -40,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         Command::Scan(args) => commands::scan::run(args),
         Command::Monitor(args) => commands::monitor::run(args),
         Command::Simulate(args) => commands::simulate::run(args),
+        Command::Actions(args) => commands::actions::run(args),
         Command::Status(args) => commands::status::run(args),
         Command::Serve(args) => commands::serve::run(args),
     }
