@@ -11,6 +11,8 @@ pub enum StorageError {
     Backend(String),
     #[error("corrupt record: {0}")]
     Corrupt(String),
+    #[error("unsupported database: {0}")]
+    Unsupported(String),
 }
 
 impl From<rusqlite::Error> for StorageError {

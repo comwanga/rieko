@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_storage::{SqliteStorage, Storage};
+use rieko_storage::{SqliteStorage, Storage, CURRENT_SCHEMA_VERSION};
 use tracing::info;
 
 #[derive(Args, Debug)]
@@ -41,6 +41,10 @@ pub fn run(args: StatusArgs) -> Result<()> {
     };
 
     println!("Rieko status (db: {})", db_path.display());
+    println!(
+        "  schema version:  {} (current {CURRENT_SCHEMA_VERSION})",
+        storage.schema_version()?
+    );
     println!("  findings:        {}", findings.len());
     println!("    critical:      {critical}");
     println!("    warning:       {warnings}");

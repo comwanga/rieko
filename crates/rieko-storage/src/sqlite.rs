@@ -18,102 +18,23 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
+        crate::migrations::migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
     pub fn in_memory() -> Result<Self, StorageError> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
+        crate::migrations::migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
-    fn migrate(&self) -> Result<(), StorageError> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS findings (
-                id          TEXT PRIMARY KEY,
-                detector    TEXT NOT NULL,
-                severity    INTEGER NOT NULL,
-                node_id     TEXT,
-                channel_id  TEXT,
-                evidence    TEXT NOT NULL,
-                explanation TEXT,
-                ts          TEXT NOT NULL,
-                last_seen   TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings (ts DESC);
-            CREATE INDEX IF NOT EXISTS idx_findings_channel ON findings (channel_id);
-
-            CREATE TABLE IF NOT EXISTS recommendations (
-                finding_id   TEXT NOT NULL,
-                action_id    TEXT PRIMARY KEY,
-                action_type  TEXT NOT NULL,
-                stage        TEXT NOT NULL,
-                target       TEXT,
-                params       TEXT NOT NULL,
-                summary      TEXT NOT NULL,
-                created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS audit (
-                id          TEXT PRIMARY KEY,
-                action_id   TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                stage       TEXT NOT NULL,
-                actor       TEXT NOT NULL,
-                details     TEXT NOT NULL,
-                ts          TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts DESC);
-
-            CREATE TABLE IF NOT EXISTS channel_snapshots (
-                channel_id        TEXT NOT NULL,
-                ts                TEXT NOT NULL,
-                local_ratio       REAL NOT NULL,
-                local_balance_msat INTEGER,
-                remote_balance_msat INTEGER,
-                capacity_msat     INTEGER,
-                status_int        INTEGER NOT NULL,
-                PRIMARY KEY (channel_id, ts)
-            );
-            CREATE INDEX IF NOT EXISTS idx_snapshots_channel_ts
-                ON channel_snapshots (channel_id, ts DESC);
-
-            CREATE TABLE IF NOT EXISTS simulations (
-                id          TEXT PRIMARY KEY,
-                action_id   TEXT NOT NULL,
-                finding_id  TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                projection  TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_simulations_action
-                ON simulations (action_id);
-            CREATE INDEX IF NOT EXISTS idx_simulations_ts
-                ON simulations (created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS alert_state (
-                dedup_key      TEXT PRIMARY KEY,
-                last_sent_at   TEXT,
-                last_severity  INTEGER,
-                last_status    TEXT NOT NULL
-            );
-            "#,
-        )?;
-        // Best-effort additive migration for pre-existing databases created
-        // before `last_seen` was introduced. Safe to ignore if already applied.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE findings ADD COLUMN last_seen TEXT;");
-        Ok(())
+    /// Current persisted schema version for diagnostics.
+    pub fn schema_version(&self) -> Result<i64, StorageError> {
+        crate::migrations::schema_version(&self.conn)
     }
 
     fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<Finding> {

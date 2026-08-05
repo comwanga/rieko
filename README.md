@@ -102,6 +102,24 @@ cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080 \
 #     /audit, /snapshots, /snapshots/channel/{id}
 ```
 
+## Database upgrades
+
+The SQLite database is versioned internally (`PRAGMA user_version`) and
+migrated automatically and transactionally when a newer binary opens it.
+`rieko status` reports the schema version applied to your database.
+
+* A database created by an older version is upgraded in place on first open.
+* Data is preserved across these upgrades; each step runs inside a
+  transaction, so a failed step rolls back cleanly.
+* A database from a **newer** version than this binary understands is
+  rejected rather than risked.
+
+As with any SQLite database, take a backup before upgrading a long-lived node:
+
+```sh
+sqlite3 ~/.rieko/rieko.db ".backup '~/.rieko/backup.db'"
+```
+
 ## License
 
 Apache-2.0
