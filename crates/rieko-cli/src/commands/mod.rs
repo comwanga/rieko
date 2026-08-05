@@ -1,7 +1,9 @@
+#[cfg(feature = "future")]
 pub mod actions;
 pub mod common;
 pub mod monitor;
 pub mod scan;
 pub mod serve;
+#[cfg(feature = "future")]
 pub mod simulate;
 pub mod status;

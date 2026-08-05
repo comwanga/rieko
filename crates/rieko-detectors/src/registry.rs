@@ -17,5 +17,10 @@ impl<'a> DetectorContext<'a> {
 /// returns findings. Detectors are pure: no I/O, no LLM calls, no mutation.
 pub trait Detector {
     fn id(&self) -> &'static str;
+    /// Detector version, part of the stable finding identity. Bump when the
+    /// detection semantics change so re-runs produce fresh identities.
+    fn version(&self) -> &'static str {
+        "1"
+    }
     fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding>;
 }

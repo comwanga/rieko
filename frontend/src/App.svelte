@@ -1,12 +1,10 @@
 <script lang="ts">
   import Findings from "./pages/Findings.svelte";
   import Snapshots from "./pages/Snapshots.svelte";
-  import Simulations from "./pages/Simulations.svelte";
-  import Actions from "./pages/Actions.svelte";
   import Status from "./pages/Status.svelte";
   import Audit from "./pages/Audit.svelte";
 
-  type Tab = "status" | "findings" | "snapshots" | "simulations" | "actions" | "audit";
+  type Tab = "status" | "findings" | "snapshots" | "audit";
   let tab: Tab = "status";
 </script>
 
@@ -17,8 +15,6 @@
       <button class:active={tab === "status"} on:click={() => (tab = "status")}>Overview</button>
       <button class:active={tab === "findings"} on:click={() => (tab = "findings")}>Findings</button>
       <button class:active={tab === "snapshots"} on:click={() => (tab = "snapshots")}>Channels</button>
-      <button class:active={tab === "simulations"} on:click={() => (tab = "simulations")}>Simulations</button>
-      <button class:active={tab === "actions"} on:click={() => (tab = "actions")}>Actions</button>
       <button class:active={tab === "audit"} on:click={() => (tab = "audit")}>Audit</button>
     </nav>
   </header>
@@ -29,10 +25,6 @@
     <Findings />
   {:else if tab === "snapshots"}
     <Snapshots />
-  {:else if tab === "simulations"}
-    <Simulations />
-  {:else if tab === "actions"}
-    <Actions />
   {:else}
     <Audit />
   {/if}

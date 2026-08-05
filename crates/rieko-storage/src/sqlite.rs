@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 
 use crate::storage::StorageError;
@@ -44,7 +44,8 @@ impl SqliteStorage {
                 channel_id  TEXT,
                 evidence    TEXT NOT NULL,
                 explanation TEXT,
-                ts          TEXT NOT NULL
+                ts          TEXT NOT NULL,
+                last_seen   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings (ts DESC);
             CREATE INDEX IF NOT EXISTS idx_findings_channel ON findings (channel_id);
@@ -71,11 +72,6 @@ impl SqliteStorage {
                 ts          TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts DESC);
-
-            CREATE TABLE IF NOT EXISTS source_ledger (
-                source     TEXT PRIMARY KEY,
-                last_seen  TEXT NOT NULL
-            );
 
             CREATE TABLE IF NOT EXISTS channel_snapshots (
                 channel_id        TEXT NOT NULL,
@@ -104,6 +100,11 @@ impl SqliteStorage {
                 ON simulations (created_at DESC);
             "#,
         )?;
+        // Best-effort additive migration for pre-existing databases created
+        // before `last_seen` was introduced. Safe to ignore if already applied.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE findings ADD COLUMN last_seen TEXT;");
         Ok(())
     }
 
@@ -140,8 +141,12 @@ impl Storage for SqliteStorage {
         let evidence = serde_json::to_string(&finding.evidence)
             .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO findings (id, detector, severity, node_id, channel_id, evidence, explanation, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, explanation, ts, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                explanation = COALESCE(excluded.explanation, findings.explanation),
+                ts = excluded.ts,
+                last_seen = excluded.last_seen",
             params![
                 finding.id,
                 finding.detector,
@@ -150,6 +155,7 @@ impl Storage for SqliteStorage {
                 finding.channel,
                 evidence,
                 finding.explanation,
+                finding.timestamp.to_rfc3339(),
                 finding.timestamp.to_rfc3339()
             ],
         )?;
@@ -360,35 +366,6 @@ impl Storage for SqliteStorage {
             out.push(r?);
         }
         Ok(out)
-    }
-
-    fn save_source_last_seen(
-        &mut self,
-        source: &str,
-        at: &DateTime<Utc>,
-    ) -> Result<(), StorageError> {
-        self.conn.execute(
-            "INSERT INTO source_ledger (source, last_seen) VALUES (?1, ?2)
-             ON CONFLICT(source) DO UPDATE SET last_seen = excluded.last_seen",
-            params![source, at.to_rfc3339()],
-        )?;
-        Ok(())
-    }
-
-    fn source_last_seen(&mut self, source: &str) -> Result<Option<DateTime<Utc>>, StorageError> {
-        let ts: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT last_seen FROM source_ledger WHERE source = ?1",
-                [source],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(ts.and_then(|t| {
-            DateTime::parse_from_rfc3339(&t)
-                .ok()
-                .map(|d| d.with_timezone(&Utc))
-        }))
     }
 
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
@@ -611,18 +588,6 @@ mod tests {
         let audit_rows = s.recent_audit(10).unwrap();
         assert_eq!(audit_rows.len(), 1);
         assert_eq!(audit_rows[0].action_id, rec.action.id);
-    }
-
-    #[test]
-    fn source_ledger_is_upserted() {
-        let mut s = SqliteStorage::in_memory().unwrap();
-        let t1 = Utc::now();
-        s.save_source_last_seen("lnd", &t1).unwrap();
-        assert_eq!(s.source_last_seen("lnd").unwrap(), Some(t1));
-
-        let t2 = t1 + chrono::Duration::seconds(10);
-        s.save_source_last_seen("lnd", &t2).unwrap();
-        assert_eq!(s.source_last_seen("lnd").unwrap(), Some(t2));
     }
 
     #[test]

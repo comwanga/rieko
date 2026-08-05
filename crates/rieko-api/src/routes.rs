@@ -144,6 +144,7 @@ pub async fn audit(
     Ok(Json(out))
 }
 
+#[cfg(feature = "future")]
 pub async fn recent_simulations(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,

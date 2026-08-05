@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
 use thiserror::Error;
@@ -39,13 +38,6 @@ pub trait Storage: Send {
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError>;
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError>;
 
-    fn save_source_last_seen(
-        &mut self,
-        source: &str,
-        at: &DateTime<Utc>,
-    ) -> Result<(), StorageError>;
-    fn source_last_seen(&mut self, source: &str) -> Result<Option<DateTime<Utc>>, StorageError>;
-
     /// Persist one point-in-time liquidity snapshot per channel per cycle.
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError>;
     fn recent_channel_snapshots(
@@ -68,7 +60,6 @@ pub struct MemoryStorage {
     findings: Vec<Finding>,
     recommendations: Vec<Recommendation>,
     audit: Vec<AuditEntry>,
-    source_ledger: Vec<(String, DateTime<Utc>)>,
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
 }
@@ -81,7 +72,15 @@ impl MemoryStorage {
 
 impl Storage for MemoryStorage {
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
-        self.findings.push(finding.clone());
+        if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
+            // Idempotent replay: refresh explanation/last-seen, never duplicate.
+            if finding.explanation.is_some() {
+                existing.explanation = finding.explanation.clone();
+            }
+            existing.timestamp = finding.timestamp;
+        } else {
+            self.findings.push(finding.clone());
+        }
         Ok(())
     }
 
@@ -105,7 +104,15 @@ impl Storage for MemoryStorage {
     }
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError> {
-        self.recommendations.push(rec.clone());
+        if let Some(existing) = self
+            .recommendations
+            .iter_mut()
+            .find(|r| r.action.id == rec.action.id)
+        {
+            existing.action.updated_at = rec.action.updated_at;
+        } else {
+            self.recommendations.push(rec.clone());
+        }
         Ok(())
     }
 
@@ -159,24 +166,6 @@ impl Storage for MemoryStorage {
             .take(limit as usize)
             .cloned()
             .collect())
-    }
-
-    fn save_source_last_seen(
-        &mut self,
-        source: &str,
-        at: &DateTime<Utc>,
-    ) -> Result<(), StorageError> {
-        self.source_ledger.retain(|(s, _)| s != source);
-        self.source_ledger.push((source.to_string(), *at));
-        Ok(())
-    }
-
-    fn source_last_seen(&mut self, source: &str) -> Result<Option<DateTime<Utc>>, StorageError> {
-        Ok(self
-            .source_ledger
-            .iter()
-            .find(|(s, _)| s == source)
-            .map(|(_, at)| *at))
     }
 
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {

@@ -62,6 +62,7 @@ async fn snapshots_path_param_route_reachable() {
     assert_eq!(arr[0]["local_ratio"], 0.42);
 }
 
+#[cfg(feature = "future")]
 #[tokio::test]
 async fn simulations_route_returns_persisted_sims() {
     use rieko_findings::{Action, ActionStage, ActionType, Simulation, SimulationProjection};
@@ -109,6 +110,55 @@ async fn simulations_route_returns_persisted_sims() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["action_id"], sim.action_id);
     assert!(arr[0]["projection"]["clears_finding"].as_bool().unwrap());
+}
+
+#[cfg(not(feature = "future"))]
+#[tokio::test]
+async fn simulations_route_is_absent_in_read_only_v1() {
+    let mem = MemoryStorage::new();
+    let app = RiekoApi::new(Box::new(mem)).unwrap().router();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/simulations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the read-only v1 API must not expose /simulations"
+    );
+
+    for (method, uri) in [
+        ("POST", "/simulations"),
+        ("PUT", "/simulations"),
+        ("DELETE", "/simulations"),
+        ("POST", "/findings"),
+        ("POST", "/audit"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
+            "no mutation endpoint expected for {method} {uri}, got {}",
+            resp.status()
+        );
+    }
 }
 
 #[tokio::test]

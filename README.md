@@ -77,7 +77,7 @@ cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080 \
   --static-dir frontend/dist
 # UI at http://127.0.0.1:8080/  (build it first with `npm run build` in frontend/)
 # GET /status, /findings, /findings/channel/{id}, /recommendations,
-#     /simulations, /audit, /snapshots, /snapshots/channel/{id}
+#     /audit, /snapshots, /snapshots/channel/{id}
 ```
 
 ## License
