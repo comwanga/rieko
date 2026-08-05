@@ -1,5 +1,5 @@
 use rieko_findings::{Action, ActionType};
-use rieko_ingest_lnd::LndClient;
+use rieko_ingest_lnd::LndMutator;
 
 use crate::{is_executable, ExecutionError, ExecutionReport, Executor};
 
@@ -13,14 +13,18 @@ use crate::{is_executable, ExecutionError, ExecutionReport, Executor};
 /// the honest default (D7: explicit human approval, deterministic actions)
 /// without mutating a node in a way we can't reason about.
 pub struct LndExecutor {
-    client: LndClient,
+    client: LndMutator,
 }
 
 impl LndExecutor {
-    pub fn new(rest_base: impl Into<String>, macaroon: Option<String>) -> Self {
-        Self {
-            client: LndClient::new(rest_base, macaroon),
-        }
+    pub fn new(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+    ) -> Result<Self, ExecutionError> {
+        let client = LndMutator::new(rest_base, macaroon, tls_cert_pem)
+            .map_err(|e| ExecutionError::Node(e.to_string()))?;
+        Ok(Self { client })
     }
 }
 
@@ -104,7 +108,7 @@ mod tests {
 
     #[test]
     fn unsupported_rebalance_is_loud() {
-        let e = LndExecutor::new("http://127.0.0.1:1", None);
+        let e = LndExecutor::new("http://127.0.0.1:1", None, None).unwrap();
         let action = Action::new(
             ActionType::RebalanceChannel,
             ActionStage::Approved,
@@ -120,7 +124,7 @@ mod tests {
 
     #[test]
     fn executor_requires_approval() {
-        let e = LndExecutor::new("http://127.0.0.1:1", None);
+        let e = LndExecutor::new("http://127.0.0.1:1", None, None).unwrap();
         let mut action = fee_action();
         action.stage = ActionStage::Simulated;
         assert!(matches!(

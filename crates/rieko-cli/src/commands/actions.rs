@@ -30,6 +30,10 @@ pub struct ActionsArgs {
     #[arg(long, value_name = "FILE")]
     macaroon: Option<PathBuf>,
 
+    /// Path to LND's TLS certificate (tls.cert), trusted for this client only.
+    #[arg(long, value_name = "FILE")]
+    tls_cert: Option<PathBuf>,
+
     /// Local node id (pubkey). Defaults to `local-node`.
     #[arg(long, default_value = "local-node")]
     node: String,
@@ -155,6 +159,7 @@ fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
         fixture: args.fixture.clone(),
         lnd_rest: args.lnd_rest.clone(),
         macaroon: args.macaroon.clone(),
+        tls_cert: args.tls_cert.clone(),
         node: args.node.clone(),
     };
     let _graph = source.build()?;
@@ -163,11 +168,17 @@ fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
     let macaroon = args
         .macaroon
         .as_ref()
-        .map(|p| std::fs::read_to_string(p).map(|s| s.trim().to_string()))
+        .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
         .transpose()
         .context("reading macaroon")?;
+    let tls_cert = args
+        .tls_cert
+        .as_ref()
+        .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
+        .transpose()
+        .context("reading TLS certificate")?;
     let executor: Box<dyn Executor> = match &args.lnd_rest {
-        Some(rest) => Box::new(LndExecutor::new(rest.clone(), macaroon)),
+        Some(rest) => Box::new(LndExecutor::new(rest.clone(), macaroon, tls_cert)?),
         None => {
             info!("no --lnd-rest configured; using recording executor");
             Box::new(RecordingExecutor)

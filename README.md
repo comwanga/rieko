@@ -39,12 +39,34 @@ The scan runs the full v1 slice: ingest → detect → recommend → explain →
 alert → persist. Findings and recommendations are written to `~/.rieko/rieko.db`
 (override with `--db`).
 
-Against a live node:
+Against a live node (Rieko v1 is strictly read-only — it only fetches
+channels and forwarding history, never mutates state):
 
 ```sh
 cargo run -- scan --lnd-rest https://localhost:8080 \
-  --macaroon admin.macaroon --node <your-node-pubkey>
+  --tls-cert ~/.lnd/tls.cert --macaroon read-only.macaroon \
+  --node <your-node-pubkey>
 ```
+
+`--tls-cert` adds LND's `tls.cert` as a trusted root for that client only;
+certificate and hostname validation are never disabled. Without it, a
+self-signed LND cert is rejected.
+
+For the macaroon, do **not** use `admin.macaroon`. Create a restricted
+macaroon containing only the two permissions Rieko v1 exercises:
+
+- `Lightning.Channels` — reads `GET /v1/channels`
+- `Lightning.ForwardingHistory` — reads `GET /v1/forwarding/events`
+
+For example with `lncli`:
+
+```sh
+lncli bakemacaroon --save_to read-only.macaroon \
+  uri:/lnrpc.Lightning/Channels uri:/lnrpc.Lightning/ForwardingHistory
+```
+
+An admin macaroon grants far more than Rieko needs and is unnecessary and
+unsafe for a read-only watcher.
 
 Optional LLM explanations (OpenAI-compatible; works with Ollama too):
 
@@ -66,7 +88,7 @@ row per channel per cycle, feeding the drift detector and the Channels UI):
 
 ```sh
 cargo run -- monitor --fixture fixtures/channels.json --interval 300
-# or against a live node: --lnd-rest https://localhost:8080 --macaroon admin.macaroon
+# or against a live node: --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert --macaroon read-only.macaroon
 ```
 
 Inspect stored state and serve the read-only API, plus the built UI:

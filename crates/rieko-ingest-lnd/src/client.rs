@@ -16,33 +16,68 @@ pub enum LndClientError {
     Json(#[from] serde_json::Error),
     #[error("normalization failed: {0}")]
     Normalize(#[from] crate::NormalizerError),
+    #[error("TLS setup failed: {0}")]
+    Tls(String),
 }
 
-/// Minimal LND REST client. Reads channels and forwards; macaroon is sent via
-/// the `Grpc-Metadata-macaroon` header. TLS is not enforced here — operators
-/// run Rieko on the same host and should use `--rest` over localhost.
+/// Build the shared HTTP/TLS client. A provided PEM certificate is added as a
+/// trusted root for this client only; certificate and hostname validation are
+/// never disabled. Returns a clear error on an unparseable certificate.
+fn build_http_client(
+    tls_cert_pem: Option<Vec<u8>>,
+) -> Result<reqwest::blocking::Client, LndClientError> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
+    if let Some(pem) = tls_cert_pem {
+        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(&pem))
+            .next()
+            .transpose()
+            .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?
+            .ok_or_else(|| LndClientError::Tls("no certificate found in --tls-cert".into()))?;
+        let cert = reqwest::Certificate::from_der(der.as_ref())
+            .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    builder.build().map_err(LndClientError::Transport)
+}
+
+/// Lowercase hex encoding of the macaroon bytes, as LND expects the value of
+/// the `Grpc-Metadata-macaroon` header.
+fn macaroon_header(bytes: Vec<u8>) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Minimal read-only LND REST client. It reads channels and forwards and sends
+/// the macaroon as lowercase-hex bytes in the `Grpc-Metadata-macaroon` header.
+///
+/// This is the v1 observation surface and deliberately exposes no node-mutating
+/// RPC; write operations live on [`LndMutator`] instead. Certificate validation
+/// is never disabled, so an optional certificate only narrows trust to the
+/// configured peer.
 pub struct LndClient {
     rest_base: String,
-    macaroon: Option<String>,
+    macaroon_hex: Option<String>,
     client: reqwest::blocking::Client,
 }
 
 impl LndClient {
-    pub fn new(rest_base: impl Into<String>, macaroon: Option<String>) -> Self {
-        Self {
+    /// `macaroon` and `tls_cert_pem` are raw file bytes, read binary-safe by the
+    /// caller — a macaroon is not UTF-8 text.
+    pub fn new(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+    ) -> Result<Self, LndClientError> {
+        Ok(Self {
             rest_base: rest_base.into(),
-            macaroon,
-            client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("reqwest client builds"),
-        }
+            macaroon_hex: macaroon.map(macaroon_header),
+            client: build_http_client(tls_cert_pem)?,
+        })
     }
 
     fn get(&self, path: &str) -> Result<String, LndClientError> {
         let url = format!("{}{}", self.rest_base.trim_end_matches('/'), path);
         let mut req = self.client.get(url);
-        if let Some(mac) = &self.macaroon {
+        if let Some(mac) = &self.macaroon_hex {
             req = req.header("Grpc-Metadata-macaroon", mac);
         }
         let resp = req.send()?;
@@ -51,31 +86,6 @@ impl LndClient {
             return Err(LndClientError::Status(status));
         }
         Ok(resp.text()?)
-    }
-
-    fn put(&self, path: &str, body: &str) -> Result<String, LndClientError> {
-        use reqwest::header;
-        let url = format!("{}{}", self.rest_base.trim_end_matches('/'), path);
-        let mut req = self
-            .client
-            .put(url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body.to_string());
-        if let Some(mac) = &self.macaroon {
-            req = req.header("Grpc-Metadata-macaroon", mac);
-        }
-        let resp = req.send()?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(LndClientError::Status(status));
-        }
-        Ok(resp.text()?)
-    }
-
-    /// Update channel routing fee policy. body is the JSON for
-    /// `UpdateChanPolicyRequest` (from the params on an UpdateFeePolicy action).
-    pub fn update_chan_policy(&self, body: &str) -> Result<String, LndClientError> {
-        self.put("/v1/chanpolicy", body)
     }
 
     pub fn channels(&self, local_node: &NodeId) -> Result<Vec<Channel>, LndClientError> {
@@ -103,14 +113,76 @@ impl LndClient {
     }
 }
 
+/// Node-mutating LND REST client, kept separate from the read-only v1 surface.
+/// Only the future-gated execution path constructs this.
+pub struct LndMutator {
+    rest_base: String,
+    macaroon_hex: Option<String>,
+    client: reqwest::blocking::Client,
+}
+
+impl LndMutator {
+    pub fn new(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+    ) -> Result<Self, LndClientError> {
+        Ok(Self {
+            rest_base: rest_base.into(),
+            macaroon_hex: macaroon.map(macaroon_header),
+            client: build_http_client(tls_cert_pem)?,
+        })
+    }
+
+    fn put(&self, path: &str, body: &str) -> Result<String, LndClientError> {
+        use reqwest::header;
+        let url = format!("{}{}", self.rest_base.trim_end_matches('/'), path);
+        let mut req = self
+            .client
+            .put(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        if let Some(mac) = &self.macaroon_hex {
+            req = req.header("Grpc-Metadata-macaroon", mac);
+        }
+        let resp = req.send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(LndClientError::Status(status));
+        }
+        Ok(resp.text()?)
+    }
+
+    /// Update channel routing fee policy. body is the JSON for
+    /// `UpdateChanPolicyRequest` (from the params on an UpdateFeePolicy action).
+    pub fn update_chan_policy(&self, body: &str) -> Result<String, LndClientError> {
+        self.put("/v1/chanpolicy", body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn channels_fetch_fails_cleanly_offline() {
-        let client = LndClient::new("http://127.0.0.1:1", None);
+        let client = LndClient::new("http://127.0.0.1:1", None, None).unwrap();
         let err = client.channels(&NodeId::new("local")).unwrap_err();
         assert!(matches!(err, LndClientError::Transport(_)));
+    }
+
+    #[test]
+    fn macaroon_is_lowercase_hex() {
+        let mac = vec![0xde, 0xad, 0xbe, 0xef];
+        let client = LndClient::new("http://127.0.0.1:1", Some(mac), None).unwrap();
+        assert_eq!(client.macaroon_hex.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn read_client_exposes_no_mutation_method() {
+        // The read-only v1 client must not compile a `put`/mutation surface.
+        let client = LndClient::new("http://127.0.0.1:1", None, None).unwrap();
+        assert!(client.macaroon_hex.is_none());
+        assert!(client.rest_base.starts_with("http"));
     }
 }

@@ -36,6 +36,8 @@ pub enum AlertError {
     Sink(String),
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("alert state persistence failed: {0}")]
+    Store(String),
 }
 
 /// Where alerts go (Telegram, and later email/webhook/API).

@@ -17,6 +17,7 @@ pub struct GraphSource {
     pub fixture: Option<PathBuf>,
     pub lnd_rest: Option<String>,
     pub macaroon: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
     pub node: String,
 }
 
@@ -29,10 +30,16 @@ impl GraphSource {
             let macaroon = self
                 .macaroon
                 .as_ref()
-                .map(|p| std::fs::read_to_string(p).map(|s| s.trim().to_string()))
+                .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
                 .transpose()
                 .context("reading macaroon")?;
-            let client = LndClient::new(rest, macaroon);
+            let tls_cert = self
+                .tls_cert
+                .as_ref()
+                .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
+                .transpose()
+                .context("reading TLS certificate")?;
+            let client = LndClient::new(rest, macaroon, tls_cert).context("building LND client")?;
             let channels = client
                 .channels(&local)
                 .context("fetching channels from LND")?;
@@ -163,6 +170,20 @@ mod tests {
     fn detect(graph: &InMemoryGraph) -> Vec<rieko_findings::Finding> {
         let detector = LiquidityDetector::new("local-node");
         detector.run(graph, &rieko_detectors::DetectorContext::no_context())
+    }
+
+    #[test]
+    fn missing_macaroon_file_fails_cleanly() {
+        let source = GraphSource {
+            lnd_rest: Some("http://127.0.0.1:1".into()),
+            macaroon: Some(std::path::PathBuf::from("/definitely/not/a/macaroon")),
+            ..Default::default()
+        };
+        let msg = source.build().unwrap_err().to_string();
+        assert!(
+            msg.contains("macaroon"),
+            "missing macaroon file should fail with a clear message, got: {msg}"
+        );
     }
 
     #[test]
