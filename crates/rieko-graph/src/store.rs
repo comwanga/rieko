@@ -85,10 +85,7 @@ impl GraphView for InMemoryGraph {
     }
 
     fn channels_for_peer(&self, peer: &NodeId) -> Vec<&Channel> {
-        self.channels
-            .values()
-            .filter(|c| &c.peer == peer)
-            .collect()
+        self.channels.values().filter(|c| &c.peer == peer).collect()
     }
 
     fn recent_forwards(&self, limit: usize) -> Vec<&ForwardEvent> {
@@ -147,9 +144,7 @@ impl GraphStore for InMemoryGraph {
 
 #[cfg(test)]
 mod tests {
-    use rieko_domain::{
-        Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
-    };
+    use rieko_domain::{Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId};
 
     use super::*;
 
@@ -171,8 +166,10 @@ mod tests {
     #[test]
     fn upsert_is_idempotent_and_replaces() {
         let mut g = InMemoryGraph::new();
-        g.upsert_channel(channel("c1", "peer1", 40_000, 60_000)).unwrap();
-        g.upsert_channel(channel("c1", "peer1", 10_000, 90_000)).unwrap();
+        g.upsert_channel(channel("c1", "peer1", 40_000, 60_000))
+            .unwrap();
+        g.upsert_channel(channel("c1", "peer1", 10_000, 90_000))
+            .unwrap();
         let c = g.channel(&ChannelId::new("c1")).unwrap();
         assert_eq!(c.liquidity.local_balance_msat, 10_000);
         assert_eq!(g.channels().len(), 1);
@@ -181,7 +178,8 @@ mod tests {
     #[test]
     fn upserting_channel_creates_peer_node() {
         let mut g = InMemoryGraph::new();
-        g.upsert_channel(channel("c1", "peer9", 50_000, 50_000)).unwrap();
+        g.upsert_channel(channel("c1", "peer9", 50_000, 50_000))
+            .unwrap();
         assert!(g.node(&NodeId::new("peer9")).is_some());
     }
 

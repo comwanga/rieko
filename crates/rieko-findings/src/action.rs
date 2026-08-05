@@ -93,7 +93,11 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
-    pub fn from_action(action: &Action, actor: impl Into<String>, details: serde_json::Value) -> Self {
+    pub fn from_action(
+        action: &Action,
+        actor: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             action_id: action.id.clone(),

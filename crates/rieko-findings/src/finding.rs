@@ -55,7 +55,10 @@ pub struct Finding {
 
 impl Finding {
     pub fn evidence_value(&self, key: &str) -> Option<&serde_json::Value> {
-        self.evidence.iter().find(|e| e.key == key).map(|e| &e.value)
+        self.evidence
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| &e.value)
     }
 
     pub fn dedup_key(&self) -> String {

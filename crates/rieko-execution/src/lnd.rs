@@ -1,7 +1,7 @@
 use rieko_findings::{Action, ActionType};
 use rieko_ingest_lnd::LndClient;
 
-use crate::{ExecutionError, ExecutionReport, Executor, is_executable};
+use crate::{is_executable, ExecutionError, ExecutionReport, Executor};
 
 /// An executor backed by a live LND node. Performs actions whose effect is
 /// deterministic against the node's REST API.
@@ -43,9 +43,9 @@ impl Executor for LndExecutor {
             ActionType::RebalanceChannel => Err(ExecutionError::Unsupported(
                 "rebalance_channel has no node-backed executor yet".into(),
             )),
-            ActionType::RestartService | ActionType::Custom => Err(
-                ExecutionError::Unsupported(action.action_type.as_str().into()),
-            ),
+            ActionType::RestartService | ActionType::Custom => Err(ExecutionError::Unsupported(
+                action.action_type.as_str().into(),
+            )),
         }
     }
 }
@@ -70,7 +70,9 @@ fn fee_policy_request(action: &Action) -> Result<String, ExecutionError> {
         body.insert("chan_point".into(), serde_json::json!(cp));
     }
     if body.is_empty() {
-        return Err(ExecutionError::MissingParams("no fee params on action".into()));
+        return Err(ExecutionError::MissingParams(
+            "no fee params on action".into(),
+        ));
     }
     serde_json::to_string(&serde_json::Value::Object(body))
         .map_err(|e| ExecutionError::MissingParams(e.to_string()))

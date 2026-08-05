@@ -61,12 +61,23 @@ export RIEKO_TELEGRAM_TOKEN=...
 export RIEKO_TELEGRAM_CHAT_ID=...
 ```
 
-Inspect stored state and serve the read-only API:
+Track channel liquidity history over time (records one `channel_snapshots`
+row per channel per cycle, feeding the drift detector and the Channels UI):
+
+```sh
+cargo run -- monitor --fixture fixtures/channels.json --interval 300
+# or against a live node: --lnd-rest https://localhost:8080 --macaroon admin.macaroon
+```
+
+Inspect stored state and serve the read-only API, plus the built UI:
 
 ```sh
 cargo run -- status --db ~/.rieko/rieko.db
-cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080
-# GET /status, /findings, /findings/channel/{id}, /recommendations, /audit
+cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080 \
+  --static-dir frontend/dist
+# UI at http://127.0.0.1:8080/  (build it first with `npm run build` in frontend/)
+# GET /status, /findings, /findings/channel/{id}, /recommendations,
+#     /simulations, /audit, /snapshots, /snapshots/channel/{id}
 ```
 
 ## License

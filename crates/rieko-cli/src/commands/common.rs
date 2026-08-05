@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rieko_domain::NodeId;
 use rieko_findings::{AuditEntry, Finding, Recommendation};
 use rieko_graph::{GraphStore, InMemoryGraph};

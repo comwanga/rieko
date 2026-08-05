@@ -8,10 +8,7 @@ pub use lnd::LndExecutor;
 #[derive(Debug, Error)]
 pub enum ExecutionError {
     #[error("illegal transition {from:?} -> {to:?}")]
-    IllegalTransition {
-        from: ActionStage,
-        to: ActionStage,
-    },
+    IllegalTransition { from: ActionStage, to: ActionStage },
     #[error("approval requires a human actor, got `{0}` (the system cannot self-approve)")]
     NeedsHuman(String),
     #[error("action {0} is not in a stage that can be executed")]
@@ -48,14 +45,20 @@ pub fn can_transition(from: ActionStage, to: ActionStage) -> bool {
 
 /// Promote an action to a later stage. The only stage that does not allow
 /// self-service is approval, which requires a non-system human actor.
-pub fn transition(action: &Action, to: ActionStage, actor: &str) -> Result<ActionStage, ExecutionError> {
+pub fn transition(
+    action: &Action,
+    to: ActionStage,
+    actor: &str,
+) -> Result<ActionStage, ExecutionError> {
     if !can_transition(action.stage, to) {
         return Err(ExecutionError::IllegalTransition {
             from: action.stage,
             to,
         });
     }
-    if to == ActionStage::Approved && actor.trim().is_empty() || to == ActionStage::Approved && actor == SYSTEM_ACTOR {
+    if to == ActionStage::Approved && actor.trim().is_empty()
+        || to == ActionStage::Approved && actor == SYSTEM_ACTOR
+    {
         return Err(ExecutionError::NeedsHuman(actor.to_string()));
     }
     Ok(to)
@@ -172,9 +175,16 @@ mod tests {
 
     #[test]
     fn rejection_is_always_legal_from_active_stages() {
-        for stage in [ActionStage::Recommended, ActionStage::Simulated, ActionStage::Approved] {
+        for stage in [
+            ActionStage::Recommended,
+            ActionStage::Simulated,
+            ActionStage::Approved,
+        ] {
             let a = action(stage);
-            assert_eq!(transition(&a, ActionStage::Rejected, "alice").unwrap(), ActionStage::Rejected);
+            assert_eq!(
+                transition(&a, ActionStage::Rejected, "alice").unwrap(),
+                ActionStage::Rejected
+            );
         }
     }
 

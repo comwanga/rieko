@@ -13,6 +13,7 @@ rieko-storage.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

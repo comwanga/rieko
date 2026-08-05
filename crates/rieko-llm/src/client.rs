@@ -45,7 +45,11 @@ pub struct OpenAiCompatibleClient {
 }
 
 impl OpenAiCompatibleClient {
-    pub fn new(endpoint: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             api_key,
@@ -57,8 +61,7 @@ impl OpenAiCompatibleClient {
     /// From `RIEKO_LLM_ENDPOINT`, `RIEKO_LLM_API_KEY`, `RIEKO_LLM_MODEL`.
     pub fn from_env() -> Option<Self> {
         let endpoint = std::env::var("RIEKO_LLM_ENDPOINT").ok()?;
-        let model = std::env::var("RIEKO_LLM_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model = std::env::var("RIEKO_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         let api_key = std::env::var("RIEKO_LLM_API_KEY").ok();
         Some(Self::new(endpoint, api_key, model))
     }
@@ -123,7 +126,10 @@ mod tests {
     #[test]
     fn null_client_returns_none() {
         let c = NullClient;
-        let req = ExplainRequest { finding: &finding(), context: None };
+        let req = ExplainRequest {
+            finding: &finding(),
+            context: None,
+        };
         assert_eq!(c.explain(&req).unwrap(), None);
     }
 

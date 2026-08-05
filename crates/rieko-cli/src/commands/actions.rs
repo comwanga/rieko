@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use rieko_execution::{
-    ExecutionError, Executor, LndExecutor, RecordingExecutor, SYSTEM_ACTOR, transition,
+    transition, ExecutionError, Executor, LndExecutor, RecordingExecutor, SYSTEM_ACTOR,
 };
 use rieko_findings::{Action, ActionStage, AuditEntry};
 use rieko_storage::{SqliteStorage, Storage};
@@ -84,8 +84,7 @@ pub fn run(args: ActionsArgs) -> Result<()> {
 
 fn open(args: &ActionsArgs) -> Result<SqliteStorage> {
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
-    SqliteStorage::open(&db_path)
-        .with_context(|| format!("opening db {}", db_path.display()))
+    SqliteStorage::open(&db_path).with_context(|| format!("opening db {}", db_path.display()))
 }
 
 fn run_list(args: &ActionsArgs, limit: u32) -> Result<()> {
@@ -107,12 +106,7 @@ fn run_list(args: &ActionsArgs, limit: u32) -> Result<()> {
     Ok(())
 }
 
-fn run_transition(
-    args: &ActionsArgs,
-    action_id: &str,
-    actor: &str,
-    to: ActionStage,
-) -> Result<()> {
+fn run_transition(args: &ActionsArgs, action_id: &str, actor: &str, to: ActionStage) -> Result<()> {
     if to != ActionStage::Rejected && actor == SYSTEM_ACTOR {
         bail!("approval must come from a human, not `{SYSTEM_ACTOR}`");
     }
@@ -121,8 +115,8 @@ fn run_transition(
         .recommendation_for_action(action_id)?
         .with_context(|| format!("no action with id {action_id}"))?;
 
-    let next = transition(&rec.action, to, actor)
-        .map_err(|e: ExecutionError| anyhow::anyhow!(e))?;
+    let next =
+        transition(&rec.action, to, actor).map_err(|e: ExecutionError| anyhow::anyhow!(e))?;
 
     storage.set_action_stage(action_id, next)?;
     storage.append_audit(&AuditEntry::from_action(
@@ -134,8 +128,16 @@ fn run_transition(
         serde_json::json!({ "previous_stage": format!("{:?}", rec.action.stage) }),
     ))?;
 
-    info!(action_id, actor, stage = format!("{:?}", next), "action transition");
-    println!("{action_id}: {:?} -> {next:?} (actor {actor})", rec.action.stage);
+    info!(
+        action_id,
+        actor,
+        stage = format!("{:?}", next),
+        "action transition"
+    );
+    println!(
+        "{action_id}: {:?} -> {next:?} (actor {actor})",
+        rec.action.stage
+    );
     Ok(())
 }
 
@@ -171,7 +173,9 @@ fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
             Box::new(RecordingExecutor)
         }
     };
-    let report = executor.execute(&rec.action).map_err(|e| anyhow::anyhow!(e))?;
+    let report = executor
+        .execute(&rec.action)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let next = if report.success {
         ActionStage::Executed

@@ -18,10 +18,7 @@ pub enum ChannelStatus {
 
 impl ChannelStatus {
     pub fn is_open(self) -> bool {
-        matches!(
-            self,
-            Self::Active | Self::Opening | Self::PendingOpen
-        )
+        matches!(self, Self::Active | Self::Opening | Self::PendingOpen)
     }
 
     pub fn is_closed(self) -> bool {

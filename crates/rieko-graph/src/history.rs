@@ -6,7 +6,11 @@ use rieko_domain::{Channel, ChannelId, ChannelSnapshot};
 /// the engine accumulates it each cycle.
 pub trait HistoryView {
     /// Newest-first snapshots for a channel, at most `limit`.
-    fn recent_channel_snapshots(&self, channel_id: &ChannelId, limit: usize) -> Vec<ChannelSnapshot>;
+    fn recent_channel_snapshots(
+        &self,
+        channel_id: &ChannelId,
+        limit: usize,
+    ) -> Vec<ChannelSnapshot>;
 }
 
 /// Bounded in-memory history buffer. The engine pushes one snapshot per
@@ -26,10 +30,7 @@ impl InMemoryHistory {
     }
 
     pub fn push(&mut self, snapshot: ChannelSnapshot) {
-        let bucket = self
-            .snapshots
-            .entry(snapshot.channel_id())
-            .or_default();
+        let bucket = self.snapshots.entry(snapshot.channel_id()).or_default();
         bucket.push_back(snapshot);
         while bucket.len() > self.max_per_channel {
             bucket.pop_front();
@@ -52,7 +53,11 @@ impl InMemoryHistory {
 }
 
 impl HistoryView for InMemoryHistory {
-    fn recent_channel_snapshots(&self, channel_id: &ChannelId, limit: usize) -> Vec<ChannelSnapshot> {
+    fn recent_channel_snapshots(
+        &self,
+        channel_id: &ChannelId,
+        limit: usize,
+    ) -> Vec<ChannelSnapshot> {
         self.snapshots
             .get(channel_id)
             .map(|q| q.iter().rev().take(limit).cloned().collect())
@@ -105,19 +110,17 @@ mod tests {
     #[test]
     fn push_channels_records_all() {
         let mut h = InMemoryHistory::new(10);
-        let channels: Vec<Channel> = vec![
-            Channel {
-                id: ChannelId::new("c1"),
-                node: NodeId::new("n"),
-                peer: NodeId::new("p"),
-                capacity_msat: 100_000,
-                fee_policy: Default::default(),
-                status: ChannelStatus::Active,
-                liquidity: LiquidityProfile::compute(100_000, 40_000, 60_000),
-                last_seen: chrono::Utc::now(),
-                opening_height: None,
-            },
-        ];
+        let channels: Vec<Channel> = vec![Channel {
+            id: ChannelId::new("c1"),
+            node: NodeId::new("n"),
+            peer: NodeId::new("p"),
+            capacity_msat: 100_000,
+            fee_policy: Default::default(),
+            status: ChannelStatus::Active,
+            liquidity: LiquidityProfile::compute(100_000, 40_000, 60_000),
+            last_seen: chrono::Utc::now(),
+            opening_height: None,
+        }];
         h.push_channels(&channels, chrono::Utc::now());
         assert_eq!(h.len(), 1);
     }
