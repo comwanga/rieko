@@ -105,6 +105,23 @@ pub async fn audit(
     Ok(Json(out))
 }
 
+pub async fn recent_simulations(
+    State(api): State<RiekoApi>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let mut storage = api
+        .state
+        .storage
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+    let rows = storage.recent_simulations(limit(&q)).map_err(api_err)?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|s| serde_json::to_value(&s).unwrap_or(Value::Null))
+        .collect();
+    Ok(Json(out))
+}
+
 /// Newest-first liquidity history for one channel.
 pub async fn channel_snapshots(
     State(api): State<RiekoApi>,

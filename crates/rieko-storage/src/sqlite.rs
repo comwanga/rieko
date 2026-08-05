@@ -2,7 +2,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{AuditEntry, Finding, Recommendation};
+use rieko_findings::{AuditEntry, Finding, Recommendation, Simulation};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
@@ -89,6 +89,19 @@ impl SqliteStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_channel_ts
                 ON channel_snapshots (channel_id, ts DESC);
+
+            CREATE TABLE IF NOT EXISTS simulations (
+                id          TEXT PRIMARY KEY,
+                action_id   TEXT NOT NULL,
+                finding_id  TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                projection  TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_simulations_action
+                ON simulations (action_id);
+            CREATE INDEX IF NOT EXISTS idx_simulations_ts
+                ON simulations (created_at DESC);
             "#,
         )?;
         Ok(())
@@ -364,6 +377,80 @@ impl Storage for SqliteStorage {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError> {
+        let projection = serde_json::to_string(&sim.projection)
+            .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO simulations (id, action_id, finding_id, action_type, projection, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sim.id,
+                sim.action_id,
+                sim.finding_id,
+                sim.action_type.as_str(),
+                projection,
+                sim.created_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, finding_id, action_type, projection, created_at
+             FROM simulations ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map([limit], Self::row_to_simulation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, finding_id, action_type, projection, created_at
+             FROM simulations WHERE action_id = ? ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([action_id], Self::row_to_simulation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
+impl SqliteStorage {
+    fn row_to_simulation(row: &rusqlite::Row) -> rusqlite::Result<Simulation> {
+        use rieko_findings::ActionType;
+        let action_type = match row.get::<_, String>(3)?.as_str() {
+            "update_fee_policy" => ActionType::UpdateFeePolicy,
+            "restart_service" => ActionType::RestartService,
+            "custom" => ActionType::Custom,
+            _ => ActionType::RebalanceChannel,
+        };
+        let projection = serde_json::from_str(&row.get::<_, String>(4)?)
+            .unwrap_or(rieko_findings::SimulationProjection {
+                local_ratio_before: 0.0,
+                local_ratio_after: 0.0,
+                local_balance_msat_after: 0,
+                remote_balance_msat_after: 0,
+                delta_msat: 0,
+                clears_finding: false,
+                summary: "corrupt projection".into(),
+            });
+        Ok(Simulation {
+            id: row.get(0)?,
+            action_id: row.get(1)?,
+            finding_id: row.get(2)?,
+            action_type,
+            projection,
+            created_at: parse_ts(&row.get::<_, String>(5)?),
+        })
     }
 }
 

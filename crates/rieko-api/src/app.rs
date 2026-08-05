@@ -44,6 +44,7 @@ impl RiekoApi {
                 axum::routing::get(crate::routes::findings_for_channel),
             )
             .route("/recommendations", axum::routing::get(crate::routes::recommendations))
+            .route("/simulations", axum::routing::get(crate::routes::recent_simulations))
             .route("/audit", axum::routing::get(crate::routes::audit))
             .route(
                 "/snapshots/channel/:channel_id",

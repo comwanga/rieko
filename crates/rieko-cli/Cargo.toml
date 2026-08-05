@@ -19,6 +19,7 @@ rieko-storage.workspace = true
 rieko-findings.workspace = true
 rieko-detectors.workspace = true
 rieko-recommendations.workspace = true
+rieko-simulation.workspace = true
 rieko-alerts.workspace = true
 rieko-llm.workspace = true
 rieko-ingest-lnd.workspace = true
@@ -32,6 +33,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]

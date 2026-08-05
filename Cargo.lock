@@ -1079,6 +1079,7 @@ dependencies = [
  "chrono",
  "http-body-util",
  "rieko-domain",
+ "rieko-findings",
  "rieko-storage",
  "serde",
  "serde_json",
@@ -1105,6 +1106,7 @@ dependencies = [
  "rieko-ingest-lnd",
  "rieko-llm",
  "rieko-recommendations",
+ "rieko-simulation",
  "rieko-storage",
  "serde",
  "serde_json",
@@ -1112,6 +1114,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1202,6 +1205,19 @@ dependencies = [
  "rieko-findings",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "rieko-simulation"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rieko-domain",
+ "rieko-findings",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{AuditEntry, Finding, Recommendation};
+use rieko_findings::{AuditEntry, Finding, Recommendation, Simulation};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -41,6 +41,11 @@ pub trait Storage: Send {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError>;
+
+    /// Record a what-if simulation of a recommended action (D7 Simulate).
+    fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError>;
+    fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError>;
+    fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError>;
 }
 
 /// In-memory implementation for tests and fixtures.
@@ -51,6 +56,7 @@ pub struct MemoryStorage {
     audit: Vec<AuditEntry>,
     source_ledger: Vec<(String, DateTime<Utc>)>,
     channel_snapshots: Vec<ChannelSnapshot>,
+    simulations: Vec<Simulation>,
 }
 
 impl MemoryStorage {
@@ -149,6 +155,31 @@ impl Storage for MemoryStorage {
             .filter(|s| s.channel_id == channel_id)
             .rev()
             .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError> {
+        self.simulations.push(sim.clone());
+        Ok(())
+    }
+
+    fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError> {
+        Ok(self
+            .simulations
+            .iter()
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError> {
+        Ok(self
+            .simulations
+            .iter()
+            .filter(|s| s.action_id == action_id)
+            .rev()
             .cloned()
             .collect())
     }

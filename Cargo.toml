@@ -9,6 +9,7 @@ members = [
     "crates/rieko-ingest-core",
     "crates/rieko-detectors",
     "crates/rieko-recommendations",
+    "crates/rieko-simulation",
     "crates/rieko-alerts",
     "crates/rieko-llm",
     "crates/rieko-api",
@@ -37,6 +38,7 @@ rieko-ingest-lnd = { path = "crates/rieko-ingest-lnd", version = "0.1.0" }
 rieko-ingest-core = { path = "crates/rieko-ingest-core", version = "0.1.0" }
 rieko-detectors = { path = "crates/rieko-detectors", version = "0.1.0" }
 rieko-recommendations = { path = "crates/rieko-recommendations", version = "0.1.0" }
+rieko-simulation = { path = "crates/rieko-simulation", version = "0.1.0" }
 rieko-alerts = { path = "crates/rieko-alerts", version = "0.1.0" }
 rieko-llm = { path = "crates/rieko-llm", version = "0.1.0" }
 
