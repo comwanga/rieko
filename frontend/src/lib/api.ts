@@ -29,6 +29,15 @@ export interface Status {
   engine: string;
   version: string;
   read_only: boolean;
+  counts: {
+    findings: number;
+    findings_by_severity: Record<string, number>;
+    recommendations: number;
+    recommendations_by_stage: Record<string, number>;
+    simulations: number;
+    audit: number;
+    channel_snapshots: number;
+  };
 }
 
 export interface Finding {

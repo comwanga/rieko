@@ -3,15 +3,17 @@
   import Snapshots from "./pages/Snapshots.svelte";
   import Simulations from "./pages/Simulations.svelte";
   import Actions from "./pages/Actions.svelte";
+  import Status from "./pages/Status.svelte";
 
-  type Tab = "findings" | "snapshots" | "simulations" | "actions";
-  let tab: Tab = "findings";
+  type Tab = "status" | "findings" | "snapshots" | "simulations" | "actions";
+  let tab: Tab = "status";
 </script>
 
 <main>
   <header>
     <h1>Rieko</h1>
     <nav>
+      <button class:active={tab === "status"} on:click={() => (tab = "status")}>Overview</button>
       <button class:active={tab === "findings"} on:click={() => (tab = "findings")}>Findings</button>
       <button class:active={tab === "snapshots"} on:click={() => (tab = "snapshots")}>Channels</button>
       <button class:active={tab === "simulations"} on:click={() => (tab = "simulations")}>Simulations</button>
@@ -19,7 +21,9 @@
     </nav>
   </header>
 
-  {#if tab === "findings"}
+  {#if tab === "status"}
+    <Status />
+  {:else if tab === "findings"}
     <Findings />
   {:else if tab === "snapshots"}
     <Snapshots />
