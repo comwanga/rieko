@@ -20,6 +20,7 @@ rieko-findings.workspace = true
 rieko-detectors.workspace = true
 rieko-recommendations.workspace = true
 rieko-simulation.workspace = true
+rieko-execution.workspace = true
 rieko-alerts.workspace = true
 rieko-llm.workspace = true
 rieko-ingest-lnd.workspace = true

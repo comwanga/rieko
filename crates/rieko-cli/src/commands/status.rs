@@ -22,6 +22,7 @@ pub fn run(args: StatusArgs) -> Result<()> {
     let findings = storage.latest_findings(1_000_000)?;
     let recommendations = storage.latest_recommendations(1_000_000)?;
     let audit = storage.recent_audit(1_000_000)?;
+    let simulations = storage.recent_simulations(1_000_000)?;
 
     let critical = findings
         .iter()
@@ -32,11 +33,43 @@ pub fn run(args: StatusArgs) -> Result<()> {
         .filter(|f| f.severity == rieko_findings::Severity::Warning)
         .count();
 
+    let stage_counts = |stage: rieko_findings::ActionStage| {
+        recommendations
+            .iter()
+            .filter(|r| r.action.stage == stage)
+            .count()
+    };
+
     println!("Rieko status (db: {})", db_path.display());
     println!("  findings:        {}", findings.len());
     println!("    critical:      {critical}");
     println!("    warning:       {warnings}");
     println!("  recommendations: {}", recommendations.len());
+    println!(
+        "    recommended:   {}",
+        stage_counts(rieko_findings::ActionStage::Recommended)
+    );
+    println!(
+        "    simulated:     {}",
+        stage_counts(rieko_findings::ActionStage::Simulated)
+    );
+    println!(
+        "    approved:      {}",
+        stage_counts(rieko_findings::ActionStage::Approved)
+    );
+    println!(
+        "    executed:      {}",
+        stage_counts(rieko_findings::ActionStage::Executed)
+    );
+    println!(
+        "    rejected:      {}",
+        stage_counts(rieko_findings::ActionStage::Rejected)
+    );
+    println!(
+        "    failed:        {}",
+        stage_counts(rieko_findings::ActionStage::Failed)
+    );
+    println!("  simulations:     {}", simulations.len());
     println!("  audit entries:   {}", audit.len());
 
     if let Some(last) = audit.first() {
