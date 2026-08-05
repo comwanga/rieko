@@ -55,7 +55,7 @@ impl RiekoApi {
     }
 
     fn router_with_state(&self, state: RiekoApi) -> axum::Router {
-        axum::Router::new()
+        let router = axum::Router::new()
             .route("/status", axum::routing::get(crate::routes::status))
             .route("/findings", axum::routing::get(crate::routes::findings))
             .route(
@@ -66,10 +66,6 @@ impl RiekoApi {
                 "/recommendations",
                 axum::routing::get(crate::routes::recommendations),
             )
-            .route(
-                "/simulations",
-                axum::routing::get(crate::routes::recent_simulations),
-            )
             .route("/audit", axum::routing::get(crate::routes::audit))
             .route(
                 "/snapshots",
@@ -78,7 +74,12 @@ impl RiekoApi {
             .route(
                 "/snapshots/channel/:channel_id",
                 axum::routing::get(crate::routes::channel_snapshots),
-            )
-            .with_state(state)
+            );
+        #[cfg(feature = "future")]
+        let router = router.route(
+            "/simulations",
+            axum::routing::get(crate::routes::recent_simulations),
+        );
+        router.with_state(state)
     }
 }

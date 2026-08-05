@@ -19,6 +19,12 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
+# Matches rieko-cli's `future` feature. Post-v1 simulation surface, disabled
+# by default so the v1 API exposes no simulation entry point.
+[features]
+default = []
+future = []
+
 [dev-dependencies]
 http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
