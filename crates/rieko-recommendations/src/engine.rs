@@ -58,10 +58,13 @@ impl RecommendationEngine {
                         ActionType::UpdateFeePolicy,
                         ActionStage::Recommended,
                         Some(channel.clone()),
-                        serde_json::json!({
-                            "reason": "inbound liquidity drained",
-                            "suggested": "reduce fee_rate_ppm to attract inbound liquidity",
-                        }),
+serde_json::json!({
+                        "reason": "inbound liquidity drained",
+                        "suggested": "reduce fee_rate_ppm to attract inbound liquidity",
+                        "fee_rate_ppm": 1,
+                        "base_fee_msat": 0,
+                        "cltv_delta": 40,
+                    }),
                         format!("Lower fees on channel {channel} to attract inbound liquidity"),
                     ),
                 });

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use rieko_execution::{
-    ExecutionError, Executor, RecordingExecutor, SYSTEM_ACTOR, transition,
+    ExecutionError, Executor, LndExecutor, RecordingExecutor, SYSTEM_ACTOR, transition,
 };
 use rieko_findings::{Action, ActionStage, AuditEntry};
 use rieko_storage::{SqliteStorage, Storage};
@@ -157,7 +157,20 @@ fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
     };
     let _graph = source.build()?;
 
-    let executor: Box<dyn Executor> = Box::new(RecordingExecutor);
+    // Pick the executor: live node when one is configured, recording otherwise.
+    let macaroon = args
+        .macaroon
+        .as_ref()
+        .map(|p| std::fs::read_to_string(p).map(|s| s.trim().to_string()))
+        .transpose()
+        .context("reading macaroon")?;
+    let executor: Box<dyn Executor> = match &args.lnd_rest {
+        Some(rest) => Box::new(LndExecutor::new(rest.clone(), macaroon)),
+        None => {
+            info!("no --lnd-rest configured; using recording executor");
+            Box::new(RecordingExecutor)
+        }
+    };
     let report = executor.execute(&rec.action).map_err(|e| anyhow::anyhow!(e))?;
 
     let next = if report.success {
