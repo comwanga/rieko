@@ -53,6 +53,31 @@ impl LndClient {
         Ok(resp.text()?)
     }
 
+    fn put(&self, path: &str, body: &str) -> Result<String, LndClientError> {
+        use reqwest::header;
+        let url = format!("{}{}", self.rest_base.trim_end_matches('/'), path);
+        let mut req = self
+            .client
+            .put(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        if let Some(mac) = &self.macaroon {
+            req = req.header("Grpc-Metadata-macaroon", mac);
+        }
+        let resp = req.send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(LndClientError::Status(status));
+        }
+        Ok(resp.text()?)
+    }
+
+    /// Update channel routing fee policy. body is the JSON for
+    /// `UpdateChanPolicyRequest` (from the params on an UpdateFeePolicy action).
+    pub fn update_chan_policy(&self, body: &str) -> Result<String, LndClientError> {
+        self.put("/v1/chanpolicy", body)
+    }
+
     pub fn channels(&self, local_node: &NodeId) -> Result<Vec<Channel>, LndClientError> {
         let body = self.get("/v1/channels")?;
         let parsed: LndChannelResponse = serde_json::from_str(&body)?;

@@ -11,5 +11,6 @@ repository.workspace = true
 [dependencies]
 rieko-domain.workspace = true
 rieko-findings.workspace = true
+rieko-ingest-lnd.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

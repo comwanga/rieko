@@ -1,6 +1,10 @@
 use rieko_findings::{Action, ActionStage};
 use thiserror::Error;
 
+pub mod lnd;
+
+pub use lnd::LndExecutor;
+
 #[derive(Debug, Error)]
 pub enum ExecutionError {
     #[error("illegal transition {from:?} -> {to:?}")]
@@ -12,6 +16,12 @@ pub enum ExecutionError {
     NeedsHuman(String),
     #[error("action {0} is not in a stage that can be executed")]
     NotExecutable(String),
+    #[error("action type {0} has no node-backed executor")]
+    Unsupported(String),
+    #[error("missing execution params: {0}")]
+    MissingParams(String),
+    #[error("node execution failed: {0}")]
+    Node(String),
 }
 
 /// The `system` actor reserved for autonomous transitions. Humans must approve
