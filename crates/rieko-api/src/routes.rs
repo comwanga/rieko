@@ -12,14 +12,59 @@ pub struct Status {
     pub engine: &'static str,
     pub version: &'static str,
     pub read_only: bool,
+    pub counts: StatusCounts,
 }
 
-pub async fn status(State(_api): State<RiekoApi>) -> Json<Status> {
-    Json(Status {
+#[derive(Serialize)]
+pub struct StatusCounts {
+    pub findings: usize,
+    pub findings_by_severity: std::collections::BTreeMap<String, usize>,
+    pub recommendations: usize,
+    pub recommendations_by_stage: std::collections::BTreeMap<String, usize>,
+    pub simulations: usize,
+    pub audit: usize,
+    pub channel_snapshots: usize,
+}
+
+pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (StatusCode, String)> {
+    let mut storage = api
+        .state
+        .storage
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+    let findings = storage.latest_findings(1_000_000).map_err(api_err)?;
+    let recommendations = storage.latest_recommendations(1_000_000).map_err(api_err)?;
+    let simulations = storage.recent_simulations(1_000_000).map_err(api_err)?;
+    let audit = storage.recent_audit(1_000_000).map_err(api_err)?;
+    let snapshots = storage.recent_snapshots_all(1_000_000).map_err(api_err)?;
+
+    let mut findings_by_severity = std::collections::BTreeMap::new();
+    for f in &findings {
+        *findings_by_severity
+            .entry(format!("{:?}", f.severity))
+            .or_insert(0) += 1;
+    }
+    let mut recommendations_by_stage = std::collections::BTreeMap::new();
+    for r in &recommendations {
+        *recommendations_by_stage
+            .entry(format!("{:?}", r.action.stage))
+            .or_insert(0) += 1;
+    }
+
+    Ok(Json(Status {
         engine: "rieko",
         version: VERSION,
         read_only: true,
-    })
+        counts: StatusCounts {
+            findings: findings.len(),
+            findings_by_severity,
+            recommendations: recommendations.len(),
+            recommendations_by_stage,
+            simulations: simulations.len(),
+            audit: audit.len(),
+            channel_snapshots: snapshots.len(),
+        },
+    }))
 }
 
 #[derive(Deserialize)]

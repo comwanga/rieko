@@ -4,6 +4,9 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use rieko_api::RiekoApi;
 use rieko_domain::{ChannelSnapshot, ChannelStatus};
+use rieko_findings::{
+    Action, ActionStage, ActionType, Evidence, Finding, Recommendation, Severity,
+};
 use rieko_storage::{MemoryStorage, Storage};
 use tower::ServiceExt;
 
@@ -106,4 +109,92 @@ async fn simulations_route_returns_persisted_sims() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["action_id"], sim.action_id);
     assert!(arr[0]["projection"]["clears_finding"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn status_reports_operational_counts() {
+    let mut mem = MemoryStorage::new();
+
+    let warning = Finding {
+        id: "f-warn".into(),
+        detector: "channel_liquidity".into(),
+        severity: Severity::Warning,
+        node: None,
+        channel: Some("abc123x0".into()),
+        evidence: vec![Evidence::string("local_ratio", "0.9")],
+        explanation: None,
+        timestamp: Utc::now(),
+    };
+    mem.save_finding(&warning).unwrap();
+    mem.save_finding(&Finding {
+        id: "f-crit".into(),
+        severity: Severity::Critical,
+        evidence: Vec::new(),
+        ..warning
+    })
+    .unwrap();
+
+    let action = Action::new(
+        ActionType::RebalanceChannel,
+        ActionStage::Recommended,
+        Some("abc123x0".into()),
+        serde_json::json!({ "desired_ratio": 0.5 }),
+        "rebalance",
+    );
+    mem.save_recommendation(&Recommendation {
+        finding_id: "f-warn".into(),
+        action: action.clone(),
+    })
+    .unwrap();
+    mem.save_recommendation(&Recommendation {
+        finding_id: "f-warn".into(),
+        action: Action::new(
+            ActionType::RebalanceChannel,
+            ActionStage::Executed,
+            None,
+            serde_json::json!({}),
+            "noop",
+        ),
+    })
+    .unwrap();
+
+    mem.save_channel_snapshot(&ChannelSnapshot {
+        channel_id: "abc123x0".into(),
+        local_ratio: 0.5,
+        local_balance_msat: 500_000,
+        remote_balance_msat: 500_000,
+        capacity_msat: 1_000_000,
+        status: ChannelStatus::Active,
+        ts: Utc::now(),
+    })
+    .unwrap();
+
+    let app = RiekoApi::new(Box::new(mem)).unwrap().router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["counts"]["findings"], 2);
+    assert_eq!(json["counts"]["findings_by_severity"]["Warning"], 1);
+    assert_eq!(json["counts"]["findings_by_severity"]["Critical"], 1);
+    assert_eq!(json["counts"]["recommendations"], 2);
+    assert_eq!(json["counts"]["recommendations_by_stage"]["Recommended"], 1);
+    assert!(
+        json["counts"]["recommendations_by_stage"]
+            .get("Executed")
+            .is_some(),
+        "second recommendation staged Executed"
+    );
+    assert_eq!(json["counts"]["simulations"], 0);
+    assert_eq!(json["counts"]["channel_snapshots"], 1);
+    assert_eq!(json["counts"]["audit"], 0);
 }
