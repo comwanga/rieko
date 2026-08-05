@@ -95,6 +95,39 @@ pub fn persist_and_recommend<S: Storage>(
     node: &str,
     findings: &[Finding],
 ) -> Result<Vec<Recommendation>> {
+    // One detector cycle is one logical unit: findings, explanations,
+    // recommendations and audit transitions all commit together or roll back
+    // together (D9, invariant #8). A failure mid-cycle leaves no half-written
+    // recommendation/audit state behind.
+    storage
+        .begin_transaction()
+        .context("beginning persistence transaction")?;
+
+    let result = persist_cycle_locked(storage, llm, engine, node, findings);
+
+    match result {
+        Ok(all) => {
+            storage
+                .commit_transaction()
+                .context("committing persistence transaction")?;
+            Ok(all)
+        }
+        Err(e) => {
+            let _ = storage.rollback_transaction();
+            Err(e)
+        }
+    }
+}
+
+/// The body of a cycle, run inside the transaction opened by
+/// [`persist_and_recommend`].
+fn persist_cycle_locked<S: Storage>(
+    storage: &mut S,
+    llm: &dyn LlmClient,
+    engine: &RecommendationEngine,
+    node: &str,
+    findings: &[Finding],
+) -> Result<Vec<Recommendation>> {
     let mut all = Vec::new();
     for finding in findings {
         storage.save_finding(finding)?;

@@ -45,6 +45,15 @@ pub fn run(args: StatusArgs) -> Result<()> {
         "  schema version:  {} (current {CURRENT_SCHEMA_VERSION})",
         storage.schema_version()?
     );
+    // Deterministically confirm the database is intact; refuse to claim it's
+    // healthy if integrity checks fail (D9, invariant #8).
+    match storage.integrity_check() {
+        Ok(()) => println!("  integrity:      ok"),
+        Err(e) => {
+            println!("  integrity:      FAILED ({e})");
+            anyhow::bail!("refusing to report healthy: {e}");
+        }
+    }
     println!("  findings:        {}", findings.len());
     println!("    critical:      {critical}");
     println!("    warning:       {warnings}");

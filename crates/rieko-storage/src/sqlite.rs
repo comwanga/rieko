@@ -14,27 +14,74 @@ use crate::Storage;
 /// pipeline; the API holds it behind a `Mutex`.
 pub struct SqliteStorage {
     conn: Connection,
+    in_transaction: bool,
 }
 
+/// WAL checkpoint / busy wait: how long a writer waits for a competing reader
+/// or writer before giving up with `SQLITE_BUSY`.
+const BUSY_TIMEOUT_MS: u64 = 5000;
+/// WAL mode with `synchronous=NORMAL` commits via the WAL without forcing an
+/// fsync on every transaction. Data may be lost only on OS-level crash, which
+/// is acceptable and is the documented operational model. See README.
+const SYNCHRONOUS_MODE: &str = "NORMAL";
+
+/// Sync strategy for opening connections; ensures reproducible connection state.
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let mut conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        crate::migrations::migrate(&mut conn)?;
-        Ok(Self { conn })
+        let path = path.as_ref();
+        let conn = Connection::open(path).map_err(|e| {
+            StorageError::Backend(format!("opening sqlite db {}: {e}", path.display()))
+        })?;
+        apply_operational_settings(&conn)?;
+        let mut s = Self {
+            conn,
+            in_transaction: false,
+        };
+        crate::migrations::migrate(&mut s.conn)
+            .map_err(|e| StorageError::Backend(format!("migrating {}: {e}", path.display())))?;
+        Ok(s)
     }
 
     pub fn in_memory() -> Result<Self, StorageError> {
-        let mut conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        crate::migrations::migrate(&mut conn)?;
-        Ok(Self { conn })
+        let conn = Connection::open_in_memory()
+            .map_err(|e| StorageError::Backend(format!("opening in-memory sqlite: {e}")))?;
+        apply_operational_settings(&conn)?;
+        let mut s = Self {
+            conn,
+            in_transaction: false,
+        };
+        crate::migrations::migrate(&mut s.conn)?;
+        Ok(s)
     }
 
     /// Current persisted schema version for diagnostics.
     pub fn schema_version(&self) -> Result<i64, StorageError> {
         crate::migrations::schema_version(&self.conn)
+    }
+
+    /// Run `PRAGMA quick_check` and report database integrity. Returns
+    /// `Ok(())` when the database is intact; otherwise an error naming the
+    /// first problem found. Callers must not claim the database is healthy
+    /// when this fails.
+    pub fn integrity_check(&self) -> Result<(), StorageError> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
+        if result.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(StorageError::Corrupt(format!(
+                "database integrity check failed: {result}"
+            )))
+        }
+    }
+
+    /// Obtain the exclusive advisory writer lock for this database. Only one
+    /// writing process may hold it at a time; a second monitor gets an error
+    /// instead of racing (see [`WriterLock`]).
+    pub fn writer_lock(&self, db_path: &Path) -> Result<WriterLock, StorageError> {
+        WriterLock::acquire(db_path)
     }
 
     fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<Finding> {
@@ -65,6 +112,39 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
+    fn begin_transaction(&mut self) -> Result<(), StorageError> {
+        if self.in_transaction {
+            return Err(StorageError::Backend("nested transaction attempted".into()));
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StorageError::Backend(format!("beginning transaction: {e}")))?;
+        self.in_transaction = true;
+        Ok(())
+    }
+
+    fn commit_transaction(&mut self) -> Result<(), StorageError> {
+        if !self.in_transaction {
+            return Err(StorageError::Backend(
+                "commit with no open transaction".into(),
+            ));
+        }
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| StorageError::Backend(format!("committing transaction: {e}")))?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self) -> Result<(), StorageError> {
+        if !self.in_transaction {
+            return Ok(());
+        }
+        let _ = self.conn.execute_batch("ROLLBACK");
+        self.in_transaction = false;
+        Ok(())
+    }
+
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
         let severity = finding.severity as i64;
         let evidence = serde_json::to_string(&finding.evidence)
@@ -465,6 +545,87 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+/// Apply the documented, intentional per-connection operational settings. These
+/// are deliberate choices (RIEKO-AUDIT-006), not arbitrary tuning:
+/// * WAL journal mode (DEK: durable concurrent reader/writer workload).
+/// * Foreign keys enforced.
+/// * A finite busy timeout so a transient lock never fails immediately.
+/// * `synchronous=NORMAL` — see [`SYNCHRONOUS_MODE`].
+fn apply_operational_settings(conn: &Connection) -> Result<(), StorageError> {
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .and_then(|_| conn.pragma_update(None, "foreign_keys", "ON"))
+        .and_then(|_| conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS as i64))
+        .and_then(|_| conn.pragma_update(None, "synchronous", SYNCHRONOUS_MODE))
+        .map_err(|e| StorageError::Backend(format!("configuring sqlite connection: {e}")))
+}
+
+/// An exclusive advisory lock guarding one SQLite database so that at most one
+/// writing process (the monitor) holds it at a time. Implementation uses a
+/// separate `<db>.lock` file. Multiple readers keep working under WAL; this
+/// only rejects a *second writer*. Dropping the guard releases the lock.
+pub struct WriterLock {
+    file: std::fs::File,
+}
+
+impl WriterLock {
+    pub fn acquire(db_path: &Path) -> Result<Self, StorageError> {
+        let lock_path = db_path.with_extension(
+            db_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{e}.lock"))
+                .unwrap_or_else(|| "lock".into()),
+        );
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                StorageError::Backend(format!("opening lock file {}: {e}", lock_path.display()))
+            })?;
+        lock(&file).map_err(|e| {
+            StorageError::Backend(format!(
+                "another process already holds the {} writer lock: {e}",
+                db_path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+}
+
+/// Flock-based exclusive lock. Returns a backend error when the lock is held
+/// by another process (non-blocking attempt).
+#[cfg(target_family = "unix")]
+fn lock(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Non-unix fallback: real writers are still serialized by SQLite's own
+/// locking; this only weakens the advisory guard. Kept for portability.
+#[cfg(not(target_family = "unix"))]
+fn lock(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl AlertStateStore for SqliteStorage {
     fn read(&self, key: &str) -> Result<Option<rieko_alerts::AlertState>, AlertError> {
         let mut stmt = self
@@ -760,5 +921,195 @@ mod tests {
         let got3 = AlertStateStore::read(&s2, "k1").unwrap().unwrap();
         assert_eq!(got3.last_severity, Some(Severity::Warning));
         assert_eq!(got3.last_status, DeliveryStatus::Skipped);
+    }
+
+    #[test]
+    fn transaction_commit_makes_cycle_visible_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("tx.db");
+        let mut w = SqliteStorage::open(&db).unwrap();
+        let f = sample_finding();
+        let rec = Recommendation {
+            finding_id: f.id.clone(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                f.channel.clone(),
+                serde_json::json!({}),
+                "rebalance",
+            ),
+        };
+        let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
+
+        w.begin_transaction().unwrap();
+        w.save_finding(&f).unwrap();
+        w.save_recommendation(&rec).unwrap();
+        w.append_audit(&audit).unwrap();
+
+        // A separate reader connection must not see the uncommitted cycle.
+        let mut r = SqliteStorage::open(&db).unwrap();
+        assert_eq!(r.latest_findings(10).unwrap().len(), 0);
+        assert_eq!(r.latest_recommendations(10).unwrap().len(), 0);
+        assert_eq!(r.recent_audit(10).unwrap().len(), 0);
+
+        w.commit_transaction().unwrap();
+
+        // After commit the whole cycle is visible together.
+        let mut r2 = SqliteStorage::open(&db).unwrap();
+        assert_eq!(r2.latest_findings(10).unwrap().len(), 1);
+        assert_eq!(r2.latest_recommendations(10).unwrap().len(), 1);
+        assert_eq!(r2.recent_audit(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rollback_leaves_no_half_written_state() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let f = sample_finding();
+        let rec = Recommendation {
+            finding_id: f.id.clone(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                f.channel.clone(),
+                serde_json::json!({}),
+                "rebalance",
+            ),
+        };
+
+        // Simulate the cycle failing partway through: some writes succeed,
+        // then an error aborts before commit.
+        let result = (|| -> Result<(), StorageError> {
+            s.begin_transaction()?;
+            s.save_finding(&f)?;
+            s.save_recommendation(&rec)?;
+            // ...failure before audit and before commit.
+            Err(StorageError::Backend("mid-cycle failure".into()))
+        })();
+        assert!(result.is_err());
+        s.rollback_transaction().unwrap();
+
+        // No partial finding/recommendation survives the rollback.
+        assert_eq!(s.latest_findings(10).unwrap().len(), 0);
+        assert_eq!(s.latest_recommendations(10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn transaction_cannot_be_nested_or_orphan_committed() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        s.begin_transaction().unwrap();
+        assert!(s.begin_transaction().is_err(), "nested begin must fail");
+        s.commit_transaction().unwrap();
+        assert!(
+            s.commit_transaction().is_err(),
+            "commit with no open transaction must fail"
+        );
+        // rollback with none open is a safe no-op
+        assert!(s.rollback_transaction().is_ok());
+    }
+
+    #[test]
+    fn two_writers_are_rejected_not_raced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("w.db");
+        let s = SqliteStorage::open(&db).unwrap();
+        let first = s.writer_lock(&db).unwrap();
+        // A second process attempting to lock the same database must be refused.
+        let s2 = SqliteStorage::open(&db).unwrap();
+        assert!(
+            s2.writer_lock(&db).is_err(),
+            "second writer must be rejected"
+        );
+        // Dropping the guard releases the lock.
+        drop(first);
+        let s3 = SqliteStorage::open(&db).unwrap();
+        assert!(s3.writer_lock(&db).is_ok());
+    }
+
+    #[test]
+    fn integrity_check_reports_healthy_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("int.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            s.save_finding(&sample_finding()).unwrap();
+            // Intact database reports healthy.
+            s.integrity_check().unwrap();
+        }
+
+        // Corrupt the file (destroy the SQLite header magic). Reopening and
+        // checking integrity must refuse to claim health rather than silently
+        // reading garbage.
+        let bytes = std::fs::read(&db).unwrap();
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&db, &corrupted).unwrap();
+
+        let reopened = SqliteStorage::open(&db);
+        // Either the open itself reports the corruption, or integrity_check does;
+        // in no case may it silently claim a healthy database.
+        let refuses_health = match reopened {
+            Ok(s) => s.integrity_check().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            refuses_health,
+            "corrupt database must be reported, not ignored"
+        );
+    }
+
+    #[test]
+    fn busy_timeout_is_set_and_applied() {
+        let s = SqliteStorage::in_memory().unwrap();
+        let timeout: i64 = s
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, BUSY_TIMEOUT_MS as i64);
+
+        // `synchronous` is exposed as an integer: NORMAL == 1.
+        let sync: i64 = s
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL must be configured");
+    }
+
+    #[test]
+    fn concurrent_reader_and_writer_do_not_fail_with_busy() {
+        use std::thread;
+        // One writer committing inside a transaction while another connection
+        // reads. Under WAL + busy_timeout the reader/writer must not fail.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("conc.db");
+        let f = sample_finding();
+
+        let writer = {
+            let db = db.clone();
+            thread::spawn(move || {
+                let mut w = SqliteStorage::open(&db).unwrap();
+                for _ in 0..20 {
+                    w.begin_transaction().unwrap();
+                    // Different id each iteration so we actually write rows.
+                    let mut f = f.clone();
+                    f.id = format!("f{}", std::time::Instant::now().elapsed().as_nanos());
+                    w.save_finding(&f).unwrap();
+                    w.commit_transaction().unwrap();
+                }
+            })
+        };
+
+        let reader = {
+            let db = db.clone();
+            thread::spawn(move || {
+                let mut r = SqliteStorage::open(&db).unwrap();
+                for _ in 0..200 {
+                    // Reading must not error out with SQLITE_BUSY.
+                    let _ = r.latest_findings(100).unwrap();
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 }

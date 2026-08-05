@@ -24,6 +24,22 @@ impl From<rusqlite::Error> for StorageError {
 /// Durable storage behind a trait (D6). v1 ships the SQLite implementation;
 /// the trait keeps the DuckDB/Postgres progression possible.
 pub trait Storage: Send {
+    /// Begin a write transaction covering one logical unit (e.g. a detector
+    /// cycle: findings + recommendations + audit). Backends that don't support
+    /// transactions return `Ok(())` and persist immediately.
+    fn begin_transaction(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// Commit the transaction opened by [`Storage::begin_transaction`].
+    fn commit_transaction(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// Abort the transaction opened by [`Storage::begin_transaction`],
+    /// discarding everything written since it began.
+    fn rollback_transaction(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError>;
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError>;
     fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError>;

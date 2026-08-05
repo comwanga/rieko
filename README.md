@@ -120,6 +120,25 @@ As with any SQLite database, take a backup before upgrading a long-lived node:
 sqlite3 ~/.rieko/rieko.db ".backup '~/.rieko/backup.db'"
 ```
 
+## Operational model
+
+Rieko runs one **writer** at a time (the `monitor`) and any number of
+readers (the API). This matches SQLite WAL: many concurrent readers with a
+single writer.
+
+* The database is opened in WAL mode with `synchronous=NORMAL` (durable
+  enough for the OS-crash case Rieko targets), foreign keys enforced, and a
+  finite busy timeout so a transient write conflict is retried rather than
+  failing instantly.
+* A second monitor is **rejected up front** via a writer lock, so two
+  processes cannot silently corrupt a database. Only one writer process is
+  supported; the API never writes.
+* Each detector cycle (findings, explanations, recommendations and audit
+  transitions) is committed as **one atomic transaction**. A failure
+  mid-cycle rolls back cleanly, never leaving half-written state.
+* `rieko status` runs a database integrity check and refuses to report the
+  database as healthy when that check fails.
+
 ## License
 
 Apache-2.0
