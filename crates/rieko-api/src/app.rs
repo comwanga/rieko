@@ -76,7 +76,9 @@ impl RiekoApi {
 
     pub fn router(&self) -> axum::Router {
         let mut router = self.router_with_state(self.clone());
+
         if let Some(dir) = &self.static_dir {
+            // Dev mode: serve a filesystem build (the optional --static-dir).
             let dir = dir.as_path();
             router = router
                 .nest_service(
@@ -86,6 +88,22 @@ impl RiekoApi {
                 .fallback_service(
                     tower_http::services::ServeDir::new(dir).append_index_html_on_directories(true),
                 );
+        } else if crate::ui::embedded::available() {
+            // Single binary: the frontend was embedded at compile time
+            // (WP5.1 / RIEKO-AUDIT-009).
+            #[cfg(rieko_ui_embedded)]
+            {
+                router = router
+                    .route(
+                        "/assets/*path",
+                        axum::routing::get(crate::ui::embedded::asset),
+                    )
+                    .route("/", axum::routing::get(crate::ui::embedded::index))
+                    // Embedding extends the router after `with_state()` which
+                    // freezes the middleware layers; re-apply security headers so
+                    // asset responses also receive the required headers.
+                    .layer(axum::middleware::from_fn(security_headers));
+            }
         }
         router
     }
