@@ -4,4 +4,4 @@ pub mod normalize;
 
 pub use client::{LndClient, LndClientError, LndMutator};
 pub use model::{LndChannel, LndChannelResponse, LndForward, LndForwardResponse};
-pub use normalize::{Normalizer, NormalizerError};
+pub use normalize::{Normalizer, NormalizerError, ShortChanResolver};

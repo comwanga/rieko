@@ -91,6 +91,15 @@ cargo run -- monitor --fixture fixtures/channels.json --interval 300
 # or against a live node: --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert --macaroon read-only.macaroon
 ```
 
+The LND client targets the 0.17+ REST schema: 64-bit fields are read as
+strings, and `chan_status_flags` is parsed as LND's ChannelStatus string
+(`ChanStatusDefault` is open; `ChanStatusBorked`/`ChanStatus*Close*` map to a
+closing state; any unrecognised or malformed combination maps to `Unknown`,
+never `Active`). Forwarding-event channel ids are resolved to channel points
+where a channel is known; unresolvable ids are preserved verbatim (`scid:…`)
+and not correlated. Event timestamps come from the source (`timestamp_ns` when
+present), never from processing time.
+
 Snapshot history is bounded: the monitor prunes stale rows on a schedule so
 the database cannot grow without limit. Tune it with `--retention-days`
 (default 30; older active-channel history is deleted), `--closed-retention-days`

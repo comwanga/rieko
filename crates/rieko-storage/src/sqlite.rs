@@ -747,7 +747,8 @@ fn status_from_i64(v: u32) -> rieko_domain::ChannelStatus {
         4 => ChannelStatus::Closed,
         5 => ChannelStatus::PendingOpen,
         6 => ChannelStatus::WaitingClose,
-        _ => ChannelStatus::ForceClosing,
+        7 => ChannelStatus::ForceClosing,
+        _ => ChannelStatus::Unknown,
     }
 }
 
