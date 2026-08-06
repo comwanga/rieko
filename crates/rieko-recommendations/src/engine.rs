@@ -24,6 +24,7 @@ impl RecommendationEngine {
     ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
         match finding.detector.as_str() {
             "channel_liquidity" => self.recommend_liquidity(finding),
+            "liquidity_trend" => self.recommend_liquidity_trend(finding),
             other => Err(RecommendationEngineError::UnsupportedDetector(
                 other.to_string(),
             )),
@@ -79,6 +80,91 @@ impl RecommendationEngine {
             _ => {}
         }
         Ok(out)
+    }
+
+    fn recommend_liquidity_trend(
+        &self,
+        finding: &Finding,
+    ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
+        let channel = finding
+            .channel
+            .clone()
+            .ok_or_else(|| RecommendationEngineError::MissingChannel(finding.id.clone()))?;
+
+        let decline = finding
+            .evidence_value("decline")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let start_ratio = finding
+            .evidence_value("start_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let current_ratio = finding
+            .evidence_value("current_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let window = finding
+            .evidence_value("window")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        let evidence_refs: Vec<String> = finding
+            .evidence
+            .iter()
+            .map(|e| format!("{}={}", e.key, e.value))
+            .collect();
+
+        Ok(vec![Recommendation {
+            finding_id: finding.id.clone(),
+            action: Action::for_recommendation(
+                &finding.id,
+                ActionType::RebalanceChannel,
+                Some(channel.clone()),
+                serde_json::json!({
+                    "reason": "channel liquidity is trending down",
+                    "decline": decline,
+                    "start_ratio": start_ratio,
+                    "current_ratio": current_ratio,
+                    "window": window as u64,
+                }),
+                format!(
+                    "Channel {channel} is trending toward outbound drain: local ratio declined \
+                     from {:.4} to {:.4} over the last {} snapshots. \
+                     Inspect recent forwarding activity to confirm whether the trend \
+                     is expected.",
+                    start_ratio, current_ratio, window as u64,
+                ),
+            ),
+            rationale: Rationale {
+                evidence: evidence_refs,
+                preconditions: vec![
+                    format!(
+                        "Confirm channel {channel} is meant to route outbound; if it is a \
+                         pure sink (revenue) channel the decline is expected."
+                    ),
+                    "Confirm the decline is not caused by a single large payment.".into(),
+                    "Validate the trend by comparing with forwarding history.".into(),
+                ],
+                expected_effect: "If the decline is unexpected, investigating routing demand and \
+                                  peer behaviour can help decide whether rebalancing is needed."
+                    .into(),
+                risks: vec![
+                    "Any decline in a revenue channel is normal — do not rebalance without \
+                     confirming the channel's role."
+                        .into(),
+                    "Rebalancing costs may exceed the benefit if the decline is temporary.".into(),
+                ],
+                limitations: vec![
+                    "The trend is based on snapshot ratios alone, not forwarding volume.".into(),
+                    format!(
+                        "The window covers only the last {} snapshots; longer-term trends \
+                             may look different.",
+                        window as u64
+                    ),
+                ],
+                actionability: Actionability::OperatorActionable,
+            },
+        }])
     }
 }
 
@@ -342,6 +428,46 @@ mod tests {
             recs[0].action.params.get("desired_ratio").is_none()
                 && recs[0].action.params.get("fee_rate_ppm").is_none(),
             "LLM text must not smuggle in execution parameters"
+        );
+    }
+
+    #[test]
+    fn drift_trend_produces_modest_investigation_recommendation() {
+        let now = chrono::Utc::now();
+        let finding = Finding {
+            id: "f2".into(),
+            detector: "liquidity_trend".into(),
+            detector_version: "2".into(),
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
+            severity: Severity::Warning,
+            node: Some("local-node".into()),
+            channel: Some("c2".into()),
+            evidence: vec![
+                Evidence::text("direction", "draining"),
+                Evidence::number("start_ratio", 0.35),
+                Evidence::number("current_ratio", 0.24),
+                Evidence::number("decline", 0.11),
+                Evidence::number("window", 12.0),
+                Evidence::text("peer", "peer-1"),
+            ],
+            explanation: None,
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: rieko_findings::FindingLifecycle::Active,
+        };
+        let engine = RecommendationEngine;
+        let recs = engine.recommend(&finding).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].action.action_type, ActionType::RebalanceChannel);
+        assert_eq!(recs[0].action.stage, ActionStage::Recommended);
+        assert_eq!(recs[0].action.target.as_deref(), Some("c2"));
+        let summary = &recs[0].action.summary;
+        assert!(summary.contains("c2"), "summary must mention channel");
+        assert!(summary.contains("0.35"), "summary must include start ratio");
+        assert!(
+            summary.contains("0.24"),
+            "summary must include current ratio"
         );
     }
 }

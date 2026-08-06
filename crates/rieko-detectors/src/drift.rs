@@ -112,6 +112,7 @@ impl Detector for DriftDetector {
             ];
 
             let now = Utc::now();
+            let first_seen = snaps.last().map(|s| s.ts).unwrap_or(now);
             findings.push(Finding {
                 id: finding_identity(
                     self.id(),
@@ -130,7 +131,7 @@ impl Detector for DriftDetector {
                 evidence,
                 explanation: None,
                 timestamp: now,
-                first_seen_at: now,
+                first_seen_at: first_seen,
                 last_seen_at: now,
                 lifecycle: rieko_findings::FindingLifecycle::Active,
             });
