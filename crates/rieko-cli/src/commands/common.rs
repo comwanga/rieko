@@ -264,4 +264,60 @@ mod tests {
         );
         assert_eq!(n1, findings.len(), "one audit entry per new finding");
     }
+
+    #[cfg(feature = "future")]
+    #[test]
+    fn simulation_does_not_create_a_false_audit_transition() {
+        // RIEKO-AUDIT-007: simulating a recommended action is read-only. It
+        // must not append a `Simulated` audit entry, because the
+        // recommendation's stage never actually changes to Simulated (v1 ends
+        // at Recommend). The only audit rows allowed are the `Recommended`
+        // creation entries from persist_and_recommend.
+        use rieko_graph::GraphView;
+        use rieko_simulation::Simulator;
+        use rieko_storage::{MemoryStorage, Storage};
+
+        let engine = rieko_recommendations::RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let findings = detect(&graph);
+        let mut storage = MemoryStorage::new();
+        let recs =
+            persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings)
+                .unwrap();
+        assert!(!recs.is_empty(), "expected at least one recommendation");
+
+        // Simulate each recommended action exactly as the `simulate` command
+        // does, persisting the projection but never an audit transition.
+        for rec in &recs {
+            let Some(target) = rec.action.target.as_deref() else {
+                continue;
+            };
+            let Some(channel) = graph.channel(&rieko_domain::ChannelId::new(target)) else {
+                continue;
+            };
+            let sim = Simulator
+                .project(channel, &rec.action, &rec.finding_id)
+                .unwrap();
+            storage.save_simulation(&sim).unwrap();
+        }
+        assert!(!storage.recent_simulations(100).unwrap().is_empty());
+
+        let audit = storage.recent_audit(1000).unwrap();
+        assert_eq!(
+            audit.len(),
+            recs.len(),
+            "one audit entry per recommendation"
+        );
+        for entry in &audit {
+            assert_eq!(
+                entry.stage,
+                rieko_findings::ActionStage::Recommended,
+                "no audit row may claim a Simulated transition from a read-only simulation"
+            );
+            assert_eq!(
+                entry.previous_stage, None,
+                "creation entries have no previous stage"
+            );
+        }
+    }
 }

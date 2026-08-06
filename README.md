@@ -136,6 +136,13 @@ single writer.
 * Each detector cycle (findings, explanations, recommendations and audit
   transitions) is committed as **one atomic transaction**. A failure
   mid-cycle rolls back cleanly, never leaving half-written state.
+* The audit log is **append-only through the application**: every state
+  transition is written together with its audit entry in one transaction, and
+  the database rejects normal `UPDATE`/`DELETE` on audit rows via triggers.
+  This is a guarantee of *application and database-level* append-onlyness, not
+  cryptographic immutability: a local administrator with raw filesystem access
+  to the database file can still alter it. Cryptographic tamper evidence is
+  not implemented.
 * `rieko status` runs a database integrity check and refuses to report the
   database as healthy when that check fails.
 

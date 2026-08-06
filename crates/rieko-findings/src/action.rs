@@ -119,13 +119,18 @@ pub struct Recommendation {
     pub action: Action,
 }
 
-/// One row of the immutable audit log. Written for every action, including
-/// read-only recommendations (D7).
+/// One row of the append-only audit log. Written for every action, including
+/// read-only recommendations (D7). Records the state transition that actually
+/// happened: `previous_stage` -> `stage`, or `None` when the object was just
+/// created (RIEKO-AUDIT-007).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
     pub action_id: String,
     pub action_type: ActionType,
+    /// State the object was in before this entry, if any.
+    pub previous_stage: Option<ActionStage>,
+    /// State the object is in after this entry.
     pub stage: ActionStage,
     /// Who/what triggered this: `system` or a human actor id.
     pub actor: String,
@@ -134,6 +139,7 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
+    /// An audit entry for the creation of `action` (no previous state).
     pub fn from_action(
         action: &Action,
         actor: impl Into<String>,
@@ -143,6 +149,26 @@ impl AuditEntry {
             id: Uuid::new_v4().to_string(),
             action_id: action.id.clone(),
             action_type: action.action_type,
+            previous_stage: None,
+            stage: action.stage,
+            actor: actor.into(),
+            details,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// An audit entry for a real transition `from` -> `action.stage`.
+    pub fn from_transition(
+        action: &Action,
+        from: ActionStage,
+        actor: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            action_id: action.id.clone(),
+            action_type: action.action_type,
+            previous_stage: Some(from),
             stage: action.stage,
             actor: actor.into(),
             details,

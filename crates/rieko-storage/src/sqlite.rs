@@ -389,12 +389,13 @@ impl Storage for SqliteStorage {
         let details = serde_json::to_string(&entry.details)
             .map_err(|e| StorageError::Corrupt(format!("audit details: {e}")))?;
         self.conn.execute(
-            "INSERT INTO audit (id, action_id, action_type, stage, actor, details, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO audit (id, action_id, action_type, previous_stage, stage, actor, details, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.id,
                 entry.action_id,
                 entry.action_type.as_str(),
+                entry.previous_stage.map(|s| format!("{:?}", s)),
                 format!("{:?}", entry.stage),
                 entry.actor,
                 details,
@@ -405,18 +406,31 @@ impl Storage for SqliteStorage {
     }
 
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, action_id, action_type, stage, actor, details, ts FROM audit ORDER BY ts DESC LIMIT ?")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, action_type, previous_stage, stage, actor, details, ts
+             FROM audit ORDER BY ts DESC LIMIT ?",
+        )?;
         let rows = stmt.query_map([limit], |row| {
             use rieko_findings::{ActionStage, ActionType};
-            let stage = match row.get::<_, String>(3)?.as_str() {
+            let stage = match row.get::<_, String>(4)?.as_str() {
                 "Simulated" => ActionStage::Simulated,
                 "Approved" => ActionStage::Approved,
                 "Executed" => ActionStage::Executed,
                 "Rejected" => ActionStage::Rejected,
                 "Failed" => ActionStage::Failed,
                 _ => ActionStage::Recommended,
+            };
+            let previous_stage = match row.get::<_, Option<String>>(3)? {
+                Some(ref s) => match s.as_str() {
+                    "Recommended" => Some(ActionStage::Recommended),
+                    "Simulated" => Some(ActionStage::Simulated),
+                    "Approved" => Some(ActionStage::Approved),
+                    "Executed" => Some(ActionStage::Executed),
+                    "Rejected" => Some(ActionStage::Rejected),
+                    "Failed" => Some(ActionStage::Failed),
+                    _ => None,
+                },
+                None => None,
             };
             let action_type = match row.get::<_, String>(2)?.as_str() {
                 "update_fee_policy" => ActionType::UpdateFeePolicy,
@@ -425,15 +439,16 @@ impl Storage for SqliteStorage {
                 _ => ActionType::RebalanceChannel,
             };
             let details: Value =
-                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(Value::Null);
             Ok(AuditEntry {
                 id: row.get(0)?,
                 action_id: row.get(1)?,
                 action_type,
+                previous_stage,
                 stage,
-                actor: row.get(4)?,
+                actor: row.get(5)?,
                 details,
-                timestamp: parse_ts(&row.get::<_, String>(6)?),
+                timestamp: parse_ts(&row.get::<_, String>(7)?),
             })
         })?;
         let mut out = Vec::new();
@@ -837,6 +852,10 @@ mod tests {
         let audit_rows = s.recent_audit(10).unwrap();
         assert_eq!(audit_rows.len(), 1);
         assert_eq!(audit_rows[0].action_id, rec.action.id);
+        assert_eq!(
+            audit_rows[0].previous_stage, None,
+            "creation audit entry has no previous stage"
+        );
     }
 
     #[test]
@@ -1308,6 +1327,10 @@ mod tests {
                     node_id TEXT, channel_id TEXT, evidence TEXT NOT NULL,
                     explanation TEXT, ts TEXT NOT NULL, last_seen TEXT
                  );
+                 CREATE TABLE audit (
+                    id TEXT PRIMARY KEY, action_id TEXT NOT NULL, action_type TEXT NOT NULL,
+                    stage TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL, ts TEXT NOT NULL
+                 );
                  INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
                  VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
                          '2021-05-01T00:00:00Z');",
@@ -1322,5 +1345,153 @@ mod tests {
         assert_eq!(got[0].detector_version, "1", "default detector version");
         assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
         assert_eq!(got[0].first_seen_at, got[0].last_seen_at);
+    }
+
+    #[test]
+    fn audit_state_transition_and_entry_commit_together() {
+        // RIEKO-AUDIT-007: a stage transition and its audit entry must be
+        // visible atomically — never a stage change without the audit row.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("atomic-audit.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.save_recommendation(&rec).unwrap();
+        let action_id = rec.action.id.clone();
+
+        // A reader before the transition sees Recommended and no audit row.
+        let mut before = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            before
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Recommended
+        );
+        assert!(before.recent_audit(10).unwrap().is_empty());
+
+        // Transition to Approved inside one transaction.
+        let approved = rieko_findings::Action {
+            stage: ActionStage::Approved,
+            ..rec.action
+        };
+        s.begin_transaction().unwrap();
+        s.set_action_stage(&action_id, ActionStage::Approved)
+            .unwrap();
+        s.append_audit(&AuditEntry::from_transition(
+            &approved,
+            ActionStage::Recommended,
+            "alice",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        s.commit_transaction().unwrap();
+
+        // After commit both the stage change and the audit row are visible.
+        let mut after = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            after
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Approved
+        );
+        let audit = after.recent_audit(10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action_id, action_id);
+        assert_eq!(audit[0].previous_stage, Some(ActionStage::Recommended));
+        assert_eq!(audit[0].stage, ActionStage::Approved);
+    }
+
+    #[test]
+    fn failed_transition_commits_neither_state_nor_audit() {
+        // RIEKO-AUDIT-007: a failed transition must leave no stage change and
+        // no audit entry behind. The audit table is append-only, so a write
+        // that is rejected mid-transaction (here: attempting to UPDATE a stage
+        // that is illegal) must roll back the whole unit.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rollback-audit.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.save_recommendation(&rec).unwrap();
+        let action_id = rec.action.id.clone();
+
+        s.begin_transaction().unwrap();
+        s.set_action_stage(&action_id, ActionStage::Approved)
+            .unwrap();
+        // A change is made, then the unit fails (the audit append errors). The
+        // caller rolls back the whole thing, so neither the stage change nor
+        // any audit row survives.
+        s.rollback_transaction().unwrap();
+
+        // Nothing must have been committed.
+        let mut after = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            after
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Recommended,
+            "stage must remain Recommended after rollback"
+        );
+        assert!(after.recent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_rows_are_append_only() {
+        // RIEKO-AUDIT-007: the audit table denies normal UPDATE and DELETE via
+        // triggers; the application API is the only writer.
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.append_audit(&AuditEntry::from_action(
+            &rec.action,
+            "system",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        assert_eq!(s.recent_audit(10).unwrap().len(), 1);
+
+        // Both an UPDATE and a DELETE on the audit table must be rejected.
+        for sql in ["UPDATE audit SET actor = 'intruder'", "DELETE FROM audit"] {
+            let err = s.conn.execute(sql, []).unwrap_err();
+            assert!(
+                err.to_string().contains("append-only"),
+                "expected append-only rejection for `{sql}`, got: {err}"
+            );
+        }
+        // The row is still there after both attempts.
+        assert_eq!(s.recent_audit(10).unwrap().len(), 1);
     }
 }

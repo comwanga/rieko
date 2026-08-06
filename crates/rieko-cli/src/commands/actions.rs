@@ -122,15 +122,31 @@ fn run_transition(args: &ActionsArgs, action_id: &str, actor: &str, to: ActionSt
     let next =
         transition(&rec.action, to, actor).map_err(|e: ExecutionError| anyhow::anyhow!(e))?;
 
-    storage.set_action_stage(action_id, next)?;
-    storage.append_audit(&AuditEntry::from_action(
-        &Action {
-            stage: next,
-            ..rec.action.clone()
-        },
-        actor,
-        serde_json::json!({ "previous_stage": format!("{:?}", rec.action.stage) }),
-    ))?;
+    // State transition and its audit entry commit together (RIEKO-AUDIT-007):
+    // never record a stage change without the audit row, and never write an
+    // audit row for a transition that failed.
+    storage.begin_transaction()?;
+    let result = (|| {
+        storage.set_action_stage(action_id, next)?;
+        let audit = AuditEntry::from_transition(
+            &Action {
+                stage: next,
+                ..rec.action.clone()
+            },
+            rec.action.stage,
+            actor,
+            serde_json::json!({}),
+        );
+        storage.append_audit(&audit)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    match result {
+        Ok(()) => storage.commit_transaction()?,
+        Err(e) => {
+            let _ = storage.rollback_transaction();
+            return Err(e);
+        }
+    }
 
     info!(
         action_id,
@@ -193,16 +209,30 @@ fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
     } else {
         ActionStage::Failed
     };
-    storage.set_action_stage(action_id, next)?;
-    storage.append_audit(&AuditEntry {
-        id: uuid::Uuid::new_v4().to_string(),
-        action_id: action_id.to_string(),
-        action_type: rec.action.action_type,
-        stage: next,
-        actor: actor.to_string(),
-        details: serde_json::json!({ "result": report.detail }),
-        timestamp: chrono::Utc::now(),
-    })?;
+
+    // State transition and its audit entry commit together (RIEKO-AUDIT-007).
+    storage.begin_transaction()?;
+    let result = (|| {
+        storage.set_action_stage(action_id, next)?;
+        let audit = AuditEntry::from_transition(
+            &Action {
+                stage: next,
+                ..rec.action.clone()
+            },
+            rec.action.stage,
+            actor,
+            serde_json::json!({ "result": report.detail }),
+        );
+        storage.append_audit(&audit)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    match result {
+        Ok(()) => storage.commit_transaction()?,
+        Err(e) => {
+            let _ = storage.rollback_transaction();
+            return Err(e);
+        }
+    }
 
     info!(action_id, actor, stage = format!("{:?}", next), detail = %report.detail, "action executed");
     println!("{action_id}: Executed ({})", report.detail);

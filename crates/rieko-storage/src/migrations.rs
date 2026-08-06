@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -29,6 +29,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: V2_FINDING_METADATA,
+    },
+    Migration {
+        version: 3,
+        sql: V3_AUDIT_TRANSITIONS,
     },
 ];
 
@@ -117,6 +121,28 @@ ALTER TABLE findings ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE findings ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
 UPDATE findings SET last_seen_at = COALESCE(last_seen_at, last_seen, ts) WHERE last_seen_at IS NULL;
 UPDATE findings SET first_seen_at = COALESCE(first_seen_at, ts) WHERE first_seen_at IS NULL;
+"#;
+
+/// v3: audit transitions (RIEKO-AUDIT-007). Add the `previous_stage` column so
+/// every audit entry records the transition that actually occurred, and make
+/// the audit table append-only: normal `UPDATE`/`DELETE` is denied by triggers
+/// so the application API is the only way rows are written. This is a truthful
+/// guarantee — a local administrator with raw filesystem access can still
+/// modify the database; cryptographic tamper evidence is not implemented.
+const V3_AUDIT_TRANSITIONS: &str = r#"
+ALTER TABLE audit ADD COLUMN previous_stage TEXT;
+
+CREATE TRIGGER IF NOT EXISTS audit_append_only_update
+BEFORE UPDATE ON audit
+BEGIN
+    SELECT RAISE(ABORT, 'audit rows are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_append_only_delete
+BEFORE DELETE ON audit
+BEGIN
+    SELECT RAISE(ABORT, 'audit rows are append-only');
+END;
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).
