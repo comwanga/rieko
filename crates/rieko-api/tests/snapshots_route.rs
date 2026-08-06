@@ -240,17 +240,11 @@ async fn status_reports_operational_counts() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["counts"]["findings"], 2);
-    assert_eq!(json["counts"]["findings_by_severity"]["Warning"], 1);
-    assert_eq!(json["counts"]["findings_by_severity"]["Critical"], 1);
     assert_eq!(json["counts"]["recommendations"], 2);
-    assert_eq!(json["counts"]["recommendations_by_stage"]["Recommended"], 1);
-    assert!(
-        json["counts"]["recommendations_by_stage"]
-            .get("Executed")
-            .is_some(),
-        "second recommendation staged Executed"
-    );
     assert_eq!(json["counts"]["simulations"], 0);
     assert_eq!(json["counts"]["channel_snapshots"], 1);
     assert_eq!(json["counts"]["audit"], 0);
+    assert_eq!(json["engine"], "rieko");
+    assert_eq!(json["read_only"], cfg!(not(feature = "future")));
+    assert_eq!(json["overall"], "not_initialized");
 }

@@ -61,6 +61,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
         node: args.node.clone(),
     };
     let graph = source.build()?;
+    super::common::record_source_ingestion(&mut storage, &source)?;
     let (n_nodes, n_channels) = graph.len();
     info!(n_nodes, n_channels, "graph loaded");
 
@@ -68,23 +69,51 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let findings = detector.run(&graph, &rieko_detectors::DetectorContext::no_context());
     info!(findings = findings.len(), "detection complete");
 
-    let llm: Box<dyn LlmClient> = OpenAiCompatibleClient::from_env()
-        .map(|c| Box::new(c) as Box<dyn LlmClient>)
-        .unwrap_or_else(|| Box::new(NullClient));
+    let (llm, llm_configured): (Box<dyn LlmClient>, bool) = match OpenAiCompatibleClient::from_env()
+    {
+        Some(c) => (Box::new(c) as Box<dyn LlmClient>, true),
+        None => (Box::new(NullClient), false),
+    };
+    super::common::record_component(
+        &mut storage,
+        super::common::ComponentKind::Llm,
+        if llm_configured {
+            rieko_status::ComponentState::Healthy
+        } else {
+            rieko_status::ComponentState::NotConfigured
+        },
+    )?;
     let engine = rieko_recommendations::RecommendationEngine;
 
     let mut alert_sink = if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
-            Ok(sink) => Some(DedupingSink::new(
-                sink,
-                Duration::from_secs(args.alert_cooldown),
-            )),
+            Ok(sink) => {
+                super::common::record_component(
+                    &mut storage,
+                    super::common::ComponentKind::AlertSink,
+                    rieko_status::ComponentState::Healthy,
+                )?;
+                Some(DedupingSink::new(
+                    sink,
+                    Duration::from_secs(args.alert_cooldown),
+                ))
+            }
             Err(e) => {
+                super::common::record_component(
+                    &mut storage,
+                    super::common::ComponentKind::AlertSink,
+                    rieko_status::ComponentState::Failing,
+                )?;
                 warn!("telegram configured but unusable: {e}");
                 None
             }
         }
     } else {
+        super::common::record_component(
+            &mut storage,
+            super::common::ComponentKind::AlertSink,
+            rieko_status::ComponentState::NotConfigured,
+        )?;
         None
     };
 

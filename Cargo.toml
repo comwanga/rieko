@@ -13,6 +13,7 @@ members = [
     "crates/rieko-execution",
     "crates/rieko-alerts",
     "crates/rieko-llm",
+    "crates/rieko-status",
     "crates/rieko-api",
     "crates/rieko-cli",
 ]
@@ -43,6 +44,7 @@ rieko-simulation = { path = "crates/rieko-simulation", version = "0.1.0" }
 rieko-execution = { path = "crates/rieko-execution", version = "0.1.0" }
 rieko-alerts = { path = "crates/rieko-alerts", version = "0.1.0" }
 rieko-llm = { path = "crates/rieko-llm", version = "0.1.0" }
+rieko-status = { path = "crates/rieko-status", version = "0.1.0" }
 
 # API + CLI
 rieko-api = { path = "crates/rieko-api", version = "0.1.0" }

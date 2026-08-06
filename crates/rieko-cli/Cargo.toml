@@ -23,6 +23,7 @@ rieko-simulation = { workspace = true, optional = true }
 rieko-execution = { workspace = true, optional = true }
 rieko-alerts.workspace = true
 rieko-llm.workspace = true
+rieko-status.workspace = true
 rieko-ingest-lnd.workspace = true
 rieko-api.workspace = true
 

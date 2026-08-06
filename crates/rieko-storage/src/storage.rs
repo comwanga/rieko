@@ -23,7 +23,7 @@ impl From<rusqlite::Error> for StorageError {
 
 /// Durable storage behind a trait (D6). v1 ships the SQLite implementation;
 /// the trait keeps the DuckDB/Postgres progression possible.
-pub trait Storage: Send {
+pub trait Storage: rieko_status::OperationalStateStore + Send {
     /// Begin a write transaction covering one logical unit (e.g. a detector
     /// cycle: findings + recommendations + audit). Backends that don't support
     /// transactions return `Ok(())` and persist immediately.
@@ -37,6 +37,16 @@ pub trait Storage: Send {
     /// Abort the transaction opened by [`Storage::begin_transaction`],
     /// discarding everything written since it began.
     fn rollback_transaction(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Current persisted schema version for diagnostics.
+    fn schema_version(&mut self) -> Result<i64, StorageError> {
+        Ok(crate::CURRENT_SCHEMA_VERSION)
+    }
+
+    /// Verify database integrity. `Ok(())` when intact; an error otherwise.
+    fn integrity_check(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -73,6 +83,29 @@ pub trait Storage: Send {
     fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError>;
     fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError>;
     fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError>;
+
+    /// Constant-size table counts for `/status` and the `status` command.
+    /// Backends must compute these without scanning entire tables into memory
+    /// (RIEKO-AUDIT-008: no million-row status queries).
+    fn counts(&mut self) -> Result<StorageCounts, StorageError> {
+        Ok(StorageCounts {
+            findings: self.latest_findings(crate::COUNT_CAP)?.len(),
+            recommendations: self.latest_recommendations(crate::COUNT_CAP)?.len(),
+            simulations: self.recent_simulations(crate::COUNT_CAP)?.len(),
+            audit: self.recent_audit(crate::COUNT_CAP)?.len(),
+            channel_snapshots: self.recent_snapshots_all(crate::COUNT_CAP)?.len(),
+        })
+    }
+}
+
+/// Table row counts for status reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageCounts {
+    pub findings: usize,
+    pub recommendations: usize,
+    pub simulations: usize,
+    pub audit: usize,
+    pub channel_snapshots: usize,
 }
 
 /// In-memory implementation for tests and fixtures.
@@ -84,6 +117,7 @@ pub struct MemoryStorage {
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
     alert_state: HashMap<String, AlertState>,
+    operational_state: Option<rieko_status::OperationalState>,
 }
 
 impl MemoryStorage {
@@ -257,6 +291,22 @@ impl AlertStateStore for MemoryStorage {
 
     fn write(&mut self, key: &str, state: &AlertState) -> Result<(), AlertError> {
         self.alert_state.insert(key.to_string(), *state);
+        Ok(())
+    }
+}
+
+impl rieko_status::OperationalStateStore for MemoryStorage {
+    fn read_operational_state(
+        &self,
+    ) -> Result<Option<rieko_status::OperationalState>, rieko_status::OperationalStateError> {
+        Ok(self.operational_state.clone())
+    }
+
+    fn write_operational_state(
+        &mut self,
+        state: &rieko_status::OperationalState,
+    ) -> Result<(), rieko_status::OperationalStateError> {
+        self.operational_state = Some(state.clone());
         Ok(())
     }
 }

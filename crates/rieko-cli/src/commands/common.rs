@@ -84,11 +84,62 @@ fn load_fixture(path: &Path, local: &NodeId) -> Result<Vec<rieko_domain::Channel
         .collect()
 }
 
+/// A successful source build reflects a reachable data source; record it so
+/// `/status` and `status` know what feeds the pipeline and when it last worked.
+/// Called right after [`GraphSource::build`] succeeds.
+pub fn record_source_ingestion<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    source: &GraphSource,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let mut state = storage
+        .read_operational_state()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    if source.lnd_rest.is_some() {
+        state.source = rieko_status::SourceState::LndRest { connected: true };
+    } else {
+        state.source = rieko_status::SourceState::Fixture;
+    }
+    state.last_ingestion_attempt = Some(now);
+    state.last_ingestion_success = Some(now);
+    storage
+        .write_operational_state(&state)
+        .context("recording source ingestion")?;
+    Ok(())
+}
+
+/// Record the state of an optional component (LLM or alert sink). Presence and
+/// health are derived from configuration/behaviour, never from secrets.
+pub fn record_component<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    kind: ComponentKind,
+    state: rieko_status::ComponentState,
+) -> Result<()> {
+    let mut op = storage
+        .read_operational_state()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    match kind {
+        ComponentKind::Llm => op.llm = state,
+        ComponentKind::AlertSink => op.alert_sink = state,
+    }
+    storage
+        .write_operational_state(&op)
+        .context("recording operational state")?;
+    Ok(())
+}
+
+pub enum ComponentKind {
+    Llm,
+    AlertSink,
+}
+
 /// Shared per-finding pipeline used by scan and monitor: persist, ask the LLM
 /// for a plain-language explanation (optional), turn the finding into auditable
 /// recommendations. Returns everything that was recommended so callers can
 /// alert/report.
-pub fn persist_and_recommend<S: Storage>(
+pub fn persist_and_recommend<S: Storage + rieko_status::OperationalStateStore>(
     storage: &mut S,
     llm: &dyn LlmClient,
     engine: &RecommendationEngine,
@@ -110,6 +161,7 @@ pub fn persist_and_recommend<S: Storage>(
             storage
                 .commit_transaction()
                 .context("committing persistence transaction")?;
+            record_cycle_success(storage)?;
             Ok(all)
         }
         Err(e) => {
@@ -117,6 +169,25 @@ pub fn persist_and_recommend<S: Storage>(
             Err(e)
         }
     }
+}
+
+/// A completed, committed detector cycle. Updated outside the transaction so a
+/// rolled-back cycle does not falsely look successful.
+fn record_cycle_success<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let mut state = storage
+        .read_operational_state()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    state.last_cycle_attempt = Some(now);
+    state.last_cycle_success = Some(now);
+    state.last_persist_success = Some(now);
+    storage
+        .write_operational_state(&state)
+        .context("recording cycle completion")?;
+    Ok(())
 }
 
 /// The body of a cycle, run inside the transaction opened by

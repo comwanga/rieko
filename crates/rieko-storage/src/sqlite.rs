@@ -10,7 +10,7 @@ use rieko_findings::{
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::storage::StorageError;
+use crate::storage::{StorageCounts, StorageError};
 use crate::Storage;
 
 /// SQLite-backed storage, WAL mode (D6). Synchronous — used by the CLI scan
@@ -55,29 +55,6 @@ impl SqliteStorage {
         };
         crate::migrations::migrate(&mut s.conn)?;
         Ok(s)
-    }
-
-    /// Current persisted schema version for diagnostics.
-    pub fn schema_version(&self) -> Result<i64, StorageError> {
-        crate::migrations::schema_version(&self.conn)
-    }
-
-    /// Run `PRAGMA quick_check` and report database integrity. Returns
-    /// `Ok(())` when the database is intact; otherwise an error naming the
-    /// first problem found. Callers must not claim the database is healthy
-    /// when this fails.
-    pub fn integrity_check(&self) -> Result<(), StorageError> {
-        let result: String = self
-            .conn
-            .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
-        if result.trim() == "ok" {
-            Ok(())
-        } else {
-            Err(StorageError::Corrupt(format!(
-                "database integrity check failed: {result}"
-            )))
-        }
     }
 
     /// Obtain the exclusive advisory writer lock for this database. Only one
@@ -169,6 +146,24 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
+    fn schema_version(&mut self) -> Result<i64, StorageError> {
+        crate::migrations::schema_version(&self.conn)
+    }
+
+    fn integrity_check(&mut self) -> Result<(), StorageError> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
+        if result.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(StorageError::Corrupt(format!(
+                "database integrity check failed: {result}"
+            )))
+        }
+    }
+
     fn begin_transaction(&mut self) -> Result<(), StorageError> {
         if self.in_transaction {
             return Err(StorageError::Backend("nested transaction attempted".into()));
@@ -573,6 +568,22 @@ impl Storage for SqliteStorage {
         }
         Ok(out)
     }
+
+    fn counts(&mut self) -> Result<StorageCounts, StorageError> {
+        let count = |table: &str| -> Result<usize, StorageError> {
+            let n: i64 =
+                self.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            Ok(n as usize)
+        };
+        Ok(StorageCounts {
+            findings: count("findings")?,
+            recommendations: count("recommendations")?,
+            simulations: count("simulations")?,
+            audit: count("audit")?,
+            channel_snapshots: count("channel_snapshots")?,
+        })
+    }
 }
 
 impl SqliteStorage {
@@ -754,6 +765,132 @@ impl AlertStateStore for SqliteStorage {
     }
 }
 
+impl rieko_status::OperationalStateStore for SqliteStorage {
+    fn read_operational_state(
+        &self,
+    ) -> Result<Option<rieko_status::OperationalState>, rieko_status::OperationalStateError> {
+        use rieko_status::OperationalStateError;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source, source_connected, last_ingestion_attempt,
+                        last_ingestion_success, last_cycle_attempt, last_cycle_success,
+                        last_persist_success, source_data_at, llm, alert_sink
+                 FROM operational_state WHERE id = 'current'",
+            )
+            .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (
+            source,
+            connected,
+            ingest_attempt,
+            ingest_success,
+            cycle_attempt,
+            cycle_success,
+            persist_success,
+            data_at,
+            llm,
+            alert,
+        ) = row.map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        Ok(Some(rieko_status::OperationalState {
+            source: parse_source(&source, connected),
+            last_ingestion_attempt: ingest_attempt.map(|s| parse_ts(&s)),
+            last_ingestion_success: ingest_success.map(|s| parse_ts(&s)),
+            last_cycle_attempt: cycle_attempt.map(|s| parse_ts(&s)),
+            last_cycle_success: cycle_success.map(|s| parse_ts(&s)),
+            last_persist_success: persist_success.map(|s| parse_ts(&s)),
+            source_data_at: data_at.map(|s| parse_ts(&s)),
+            llm: parse_component(&llm),
+            alert_sink: parse_component(&alert),
+        }))
+    }
+
+    fn write_operational_state(
+        &mut self,
+        state: &rieko_status::OperationalState,
+    ) -> Result<(), rieko_status::OperationalStateError> {
+        use rieko_status::OperationalStateError;
+        let connected = match state.source {
+            rieko_status::SourceState::Fixture => None,
+            rieko_status::SourceState::LndRest { connected } => Some(connected as i64),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO operational_state
+                    (id, source, source_connected, last_ingestion_attempt, last_ingestion_success,
+                     last_cycle_attempt, last_cycle_success, last_persist_success, source_data_at,
+                     llm, alert_sink)
+                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    source = excluded.source,
+                    source_connected = excluded.source_connected,
+                    last_ingestion_attempt = excluded.last_ingestion_attempt,
+                    last_ingestion_success = excluded.last_ingestion_success,
+                    last_cycle_attempt = excluded.last_cycle_attempt,
+                    last_cycle_success = excluded.last_cycle_success,
+                    last_persist_success = excluded.last_persist_success,
+                    source_data_at = excluded.source_data_at,
+                    llm = excluded.llm,
+                    alert_sink = excluded.alert_sink",
+                params![
+                    state.source.as_str(),
+                    connected,
+                    state.last_ingestion_attempt.map(|t| t.to_rfc3339()),
+                    state.last_ingestion_success.map(|t| t.to_rfc3339()),
+                    state.last_cycle_attempt.map(|t| t.to_rfc3339()),
+                    state.last_cycle_success.map(|t| t.to_rfc3339()),
+                    state.last_persist_success.map(|t| t.to_rfc3339()),
+                    state.source_data_at.map(|t| t.to_rfc3339()),
+                    component_str(state.llm),
+                    component_str(state.alert_sink),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| OperationalStateError::Store(e.to_string()))
+    }
+}
+
+fn parse_source(s: &str, connected: Option<i64>) -> rieko_status::SourceState {
+    use rieko_status::SourceState;
+    match s {
+        "lnd_rest" => SourceState::LndRest {
+            connected: connected == Some(1),
+        },
+        _ => SourceState::Fixture,
+    }
+}
+
+fn parse_component(s: &str) -> rieko_status::ComponentState {
+    use rieko_status::ComponentState;
+    match s {
+        "healthy" => ComponentState::Healthy,
+        "failing" => ComponentState::Failing,
+        _ => ComponentState::NotConfigured,
+    }
+}
+
+fn component_str(s: rieko_status::ComponentState) -> &'static str {
+    s.as_str()
+}
+
 fn severity_from_int(v: i64) -> Option<rieko_findings::Severity> {
     match v {
         0 => Some(rieko_findings::Severity::Info),
@@ -928,6 +1065,43 @@ mod tests {
         assert_eq!(s.latest_findings(10).unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c1").unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c2").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn operational_state_roundtrips_in_sqlite_and_memory() {
+        use rieko_status::OperationalStateStore as _;
+
+        let state = rieko_status::OperationalState {
+            source: rieko_status::SourceState::LndRest { connected: true },
+            last_ingestion_attempt: Some(Utc::now()),
+            last_ingestion_success: Some(Utc::now()),
+            last_cycle_attempt: Some(Utc::now()),
+            last_cycle_success: Some(Utc::now()),
+            last_persist_success: Some(Utc::now()),
+            source_data_at: Some(Utc::now()),
+            llm: rieko_status::ComponentState::Healthy,
+            alert_sink: rieko_status::ComponentState::Failing,
+        };
+
+        let mut sqlite = SqliteStorage::in_memory().unwrap();
+        assert!(sqlite.read_operational_state().unwrap().is_none());
+        sqlite.write_operational_state(&state).unwrap();
+        let read = sqlite.read_operational_state().unwrap().unwrap();
+        assert_eq!(read, state);
+        sqlite
+            .write_operational_state(&rieko_status::OperationalState {
+                llm: rieko_status::ComponentState::NotConfigured,
+                ..state.clone()
+            })
+            .unwrap();
+        // Upsert keeps a single row.
+        let again = sqlite.read_operational_state().unwrap().unwrap();
+        assert_eq!(again.llm, rieko_status::ComponentState::NotConfigured);
+
+        let mut mem = MemoryStorage::new();
+        assert!(mem.read_operational_state().unwrap().is_none());
+        mem.write_operational_state(&state).unwrap();
+        assert_eq!(mem.read_operational_state().unwrap().unwrap(), state);
     }
 
     #[test]
@@ -1151,7 +1325,7 @@ mod tests {
         // Either the open itself reports the corruption, or integrity_check does;
         // in no case may it silently claim a healthy database.
         let refuses_health = match reopened {
-            Ok(s) => s.integrity_check().is_err(),
+            Ok(mut s) => s.integrity_check().is_err(),
             Err(_) => true,
         };
         assert!(
