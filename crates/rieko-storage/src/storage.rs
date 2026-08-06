@@ -3,7 +3,29 @@ use std::collections::HashMap;
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// A v2 simulation record (ADR-0005). Stored in the `simulations` table with
+/// the V8 migration columns. The `projection` contains the serialized
+/// `SimulationResult` from `rieko_simulation::model`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationRecord {
+    pub id: String,
+    pub action_id: String,
+    pub finding_id: String,
+    pub action_type: String,
+    pub status: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub input_hash: String,
+    pub confidence: String,
+    pub assumptions: serde_json::Value,
+    pub warnings: serde_json::Value,
+    pub explanation: String,
+    pub projection: serde_json::Value,
+    pub created_at: String,
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -88,6 +110,16 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError>;
     fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError>;
 
+    /// v2 simulation persistence (ADR-0005). Stores the full SimulationResult
+    /// along with its provenance metadata. The `projection` JSON is the
+    /// serialized [`crate::SimulationRecord`].
+    fn save_simulation_v2(&mut self, rec: &SimulationRecord) -> Result<(), StorageError>;
+    fn recent_simulations_v2(&mut self, limit: u32) -> Result<Vec<SimulationRecord>, StorageError>;
+    fn simulations_v2_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Vec<SimulationRecord>, StorageError>;
+
     /// Apply the retention policy to `channel_snapshots`, transactionally and in
     /// bounded chunks. Only snapshots are ever removed — findings and
     /// recommendations are never touched, so active finding evidence survives
@@ -130,6 +162,7 @@ pub struct MemoryStorage {
     audit: Vec<AuditEntry>,
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
+    simulation_records: Vec<SimulationRecord>,
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
 }
@@ -348,6 +381,38 @@ impl Storage for MemoryStorage {
     fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError> {
         Ok(self
             .simulations
+            .iter()
+            .filter(|s| s.action_id == action_id)
+            .rev()
+            .cloned()
+            .collect())
+    }
+
+    fn save_simulation_v2(&mut self, rec: &SimulationRecord) -> Result<(), StorageError> {
+        if let Some(existing) = self.simulation_records.iter_mut().find(|s| s.id == rec.id) {
+            *existing = rec.clone();
+        } else {
+            self.simulation_records.push(rec.clone());
+        }
+        Ok(())
+    }
+
+    fn recent_simulations_v2(&mut self, limit: u32) -> Result<Vec<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
+            .iter()
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn simulations_v2_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Vec<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
             .iter()
             .filter(|s| s.action_id == action_id)
             .rev()
