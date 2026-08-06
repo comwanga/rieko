@@ -1,3 +1,15 @@
+//! What-if simulation of recommended actions (D7 Simulate).
+//!
+//! This crate is **future-facing and deliberately isolated from the v1
+//! product** (RIEKO-AUDIT-022): the default build never links it, and it is
+//! only pulled in through the `future` feature of `rieko-cli`.
+//!
+//! The projections are pure functions over explicit inputs (a [`Channel`], an
+//! [`Action`], a finding id). They never ingest, never detect, never persist
+//! findings, and never append audit transitions — callers decide persistence.
+//! The crate has no storage, SQLite, or LND dependencies, so its tests stay
+//! independent of any database or live node.
+
 use rieko_domain::{Channel, ChannelId, LiquidityImbalance, LiquidityProfile};
 use rieko_findings::{Action, ActionType, Simulation, SimulationProjection};
 use thiserror::Error;

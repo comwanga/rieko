@@ -56,7 +56,6 @@
       {/each}
     </div>
     <div class="card">
-      <div class="kv"><span>Simulations</span><span>{counts.simulations}</span></div>
       <div class="kv"><span>Channels tracked</span><span>{counts.channel_snapshots}</span></div>
       <div class="kv"><span>Audit entries</span><span>{counts.audit}</span></div>
     </div>
