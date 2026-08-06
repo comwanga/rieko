@@ -240,6 +240,44 @@ pub async fn recent_simulations(
     Ok(Json(out))
 }
 
+/// v2 simulation listing (ADR-0005). Returns SimulationRecords with full metadata.
+#[cfg(feature = "simulate")]
+pub async fn recent_simulations_v2(
+    State(api): State<RiekoApi>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let rows = block_read(api.state.storage.clone(), move |s| {
+        s.recent_simulations_v2(limit(&q))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
+        .collect();
+    Ok(Json(out))
+}
+
+/// v2 simulation detail by ID.
+#[cfg(feature = "simulate")]
+pub async fn simulation_v2_by_id(
+    State(api): State<RiekoApi>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+
+    let rows = block_read(api.state.storage.clone(), move |s| {
+        s.recent_simulations_v2(1000).map_err(|e| e.to_string())
+    })
+    .await?;
+    let rec = rows
+        .into_iter()
+        .find(|r| r.id == simulation_id)
+        .ok_or((StatusCode::NOT_FOUND, "simulation not found".into()))?;
+    let v = serde_json::to_value(&rec)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(v))
+}
+
 /// Newest-first liquidity history across all channels.
 pub async fn all_snapshots(
     State(api): State<RiekoApi>,
