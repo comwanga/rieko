@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use clap::Args;
 use rieko_detectors::Detector;
 use rieko_domain::ChannelId;
-use rieko_findings::{ActionStage, AuditEntry};
 use rieko_graph::GraphView;
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
 use rieko_simulation::Simulator;
@@ -91,17 +90,10 @@ pub fn run(args: SimulateArgs) -> Result<()> {
         storage.save_simulation(&sim)?;
         n_simulated += 1;
 
-        // Record the action's progression Recommend → Simulated in the audit log.
-        let audit = AuditEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            action_id: rec.action.id.clone(),
-            action_type: rec.action.action_type,
-            stage: ActionStage::Simulated,
-            actor: "system".into(),
-            details: serde_json::to_value(&sim.projection).unwrap_or(serde_json::Value::Null),
-            timestamp: chrono::Utc::now(),
-        };
-        storage.append_audit(&audit)?;
+        // The simulation itself is persisted above. Do NOT write a `Simulated`
+        // audit entry here: the recommendation's stage never actually changes
+        // to Simulated (v1 ends at Recommend), so claiming that transition in
+        // the audit log would be a false record (RIEKO-AUDIT-007).
     }
 
     info!(

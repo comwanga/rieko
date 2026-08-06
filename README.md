@@ -102,6 +102,50 @@ cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080 \
 #     /audit, /snapshots, /snapshots/channel/{id}
 ```
 
+## Database upgrades
+
+The SQLite database is versioned internally (`PRAGMA user_version`) and
+migrated automatically and transactionally when a newer binary opens it.
+`rieko status` reports the schema version applied to your database.
+
+* A database created by an older version is upgraded in place on first open.
+* Data is preserved across these upgrades; each step runs inside a
+  transaction, so a failed step rolls back cleanly.
+* A database from a **newer** version than this binary understands is
+  rejected rather than risked.
+
+As with any SQLite database, take a backup before upgrading a long-lived node:
+
+```sh
+sqlite3 ~/.rieko/rieko.db ".backup '~/.rieko/backup.db'"
+```
+
+## Operational model
+
+Rieko runs one **writer** at a time (the `monitor`) and any number of
+readers (the API). This matches SQLite WAL: many concurrent readers with a
+single writer.
+
+* The database is opened in WAL mode with `synchronous=NORMAL` (durable
+  enough for the OS-crash case Rieko targets), foreign keys enforced, and a
+  finite busy timeout so a transient write conflict is retried rather than
+  failing instantly.
+* A second monitor is **rejected up front** via a writer lock, so two
+  processes cannot silently corrupt a database. Only one writer process is
+  supported; the API never writes.
+* Each detector cycle (findings, explanations, recommendations and audit
+  transitions) is committed as **one atomic transaction**. A failure
+  mid-cycle rolls back cleanly, never leaving half-written state.
+* The audit log is **append-only through the application**: every state
+  transition is written together with its audit entry in one transaction, and
+  the database rejects normal `UPDATE`/`DELETE` on audit rows via triggers.
+  This is a guarantee of *application and database-level* append-onlyness, not
+  cryptographic immutability: a local administrator with raw filesystem access
+  to the database file can still alter it. Cryptographic tamper evidence is
+  not implemented.
+* `rieko status` runs a database integrity check and refuses to report the
+  database as healthy when that check fails.
+
 ## License
 
 Apache-2.0

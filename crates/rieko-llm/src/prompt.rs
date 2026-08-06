@@ -35,12 +35,17 @@ mod tests {
         let f = Finding {
             id: "f".into(),
             detector: "channel_liquidity".into(),
+            detector_version: "1".into(),
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
             severity: Severity::Critical,
             node: Some("n".into()),
             channel: Some("c".into()),
             evidence: vec![Evidence::number("local_ratio", 0.5)],
             explanation: None,
             timestamp: chrono::Utc::now(),
+            first_seen_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            lifecycle: rieko_findings::FindingLifecycle::Active,
         };
         let a = build_explanation_prompt(&f, Some("ctx"));
         let b = build_explanation_prompt(&f, Some("ctx"));

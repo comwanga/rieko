@@ -147,6 +147,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_distinguishes_detector_version() {
+        // Same detector + input, but a new detector version, must be
+        // distinguishable (WP2.3: changed detector version is distinguishable).
+        let v1 = finding_identity(
+            "channel_liquidity",
+            "1",
+            Severity::Critical,
+            Some("node1"),
+            Some("c1"),
+            &[Evidence::number("local_ratio", 0.02)],
+        );
+        let v2 = finding_identity(
+            "channel_liquidity",
+            "2",
+            Severity::Critical,
+            Some("node1"),
+            Some("c1"),
+            &[Evidence::number("local_ratio", 0.02)],
+        );
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
     fn identity_distinguishes_meaningful_changes() {
         let a = finding_identity(
             "channel_liquidity",

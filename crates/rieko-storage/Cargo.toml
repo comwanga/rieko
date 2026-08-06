@@ -17,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

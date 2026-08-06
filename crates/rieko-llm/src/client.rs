@@ -108,9 +108,12 @@ mod tests {
     use rieko_findings::{Evidence, Severity};
 
     fn finding() -> Finding {
+        let now = chrono::Utc::now();
         Finding {
             id: "f".into(),
             detector: "channel_liquidity".into(),
+            detector_version: "1".into(),
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
             severity: Severity::Critical,
             node: Some("local".into()),
             channel: Some("c1".into()),
@@ -119,7 +122,10 @@ mod tests {
                 Evidence::number("local_ratio", 0.02),
             ],
             explanation: None,
-            timestamp: chrono::Utc::now(),
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: rieko_findings::FindingLifecycle::Active,
         }
     }
 

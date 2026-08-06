@@ -104,15 +104,21 @@ mod tests {
     use super::*;
 
     fn finding(channel: &str, direction: &str, severity: Severity) -> Finding {
+        let now = chrono::Utc::now();
         Finding {
             id: "f1".into(),
             detector: "channel_liquidity".into(),
+            detector_version: "1".into(),
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
             severity,
             node: Some("local-node".into()),
             channel: Some(channel.into()),
             evidence: vec![Evidence::text("direction", direction)],
             explanation: None,
-            timestamp: chrono::Utc::now(),
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: rieko_findings::FindingLifecycle::Active,
         }
     }
 

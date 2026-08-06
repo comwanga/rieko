@@ -57,6 +57,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let mut storage = SqliteStorage::open(&db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
 
+    // Guard against two monitors writing the same database. A second writer is
+    // rejected up front rather than silently racing (D9, invariant #8).
+    let _writer = storage
+        .writer_lock(&db_path)
+        .with_context(|| format!("locking db {}", db_path.display()))?;
+
     let source = GraphSource {
         fixture: args.fixture.clone(),
         lnd_rest: args.lnd_rest.clone(),

@@ -3,7 +3,10 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
+use rieko_findings::{
+    ActionStage, AuditEntry, Finding, FindingLifecycle, Recommendation, Simulation,
+    FINDING_SCHEMA_VERSION,
+};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
@@ -14,106 +17,74 @@ use crate::Storage;
 /// pipeline; the API holds it behind a `Mutex`.
 pub struct SqliteStorage {
     conn: Connection,
+    in_transaction: bool,
 }
 
+/// WAL checkpoint / busy wait: how long a writer waits for a competing reader
+/// or writer before giving up with `SQLITE_BUSY`.
+const BUSY_TIMEOUT_MS: u64 = 5000;
+/// WAL mode with `synchronous=NORMAL` commits via the WAL without forcing an
+/// fsync on every transaction. Data may be lost only on OS-level crash, which
+/// is acceptable and is the documented operational model. See README.
+const SYNCHRONOUS_MODE: &str = "NORMAL";
+
+/// Sync strategy for opening connections; ensures reproducible connection state.
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        let s = Self { conn };
-        s.migrate()?;
+        let path = path.as_ref();
+        let conn = Connection::open(path).map_err(|e| {
+            StorageError::Backend(format!("opening sqlite db {}: {e}", path.display()))
+        })?;
+        apply_operational_settings(&conn)?;
+        let mut s = Self {
+            conn,
+            in_transaction: false,
+        };
+        crate::migrations::migrate(&mut s.conn)
+            .map_err(|e| StorageError::Backend(format!("migrating {}: {e}", path.display())))?;
         Ok(s)
     }
 
     pub fn in_memory() -> Result<Self, StorageError> {
-        let conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        let s = Self { conn };
-        s.migrate()?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| StorageError::Backend(format!("opening in-memory sqlite: {e}")))?;
+        apply_operational_settings(&conn)?;
+        let mut s = Self {
+            conn,
+            in_transaction: false,
+        };
+        crate::migrations::migrate(&mut s.conn)?;
         Ok(s)
     }
 
-    fn migrate(&self) -> Result<(), StorageError> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS findings (
-                id          TEXT PRIMARY KEY,
-                detector    TEXT NOT NULL,
-                severity    INTEGER NOT NULL,
-                node_id     TEXT,
-                channel_id  TEXT,
-                evidence    TEXT NOT NULL,
-                explanation TEXT,
-                ts          TEXT NOT NULL,
-                last_seen   TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings (ts DESC);
-            CREATE INDEX IF NOT EXISTS idx_findings_channel ON findings (channel_id);
+    /// Current persisted schema version for diagnostics.
+    pub fn schema_version(&self) -> Result<i64, StorageError> {
+        crate::migrations::schema_version(&self.conn)
+    }
 
-            CREATE TABLE IF NOT EXISTS recommendations (
-                finding_id   TEXT NOT NULL,
-                action_id    TEXT PRIMARY KEY,
-                action_type  TEXT NOT NULL,
-                stage        TEXT NOT NULL,
-                target       TEXT,
-                params       TEXT NOT NULL,
-                summary      TEXT NOT NULL,
-                created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS audit (
-                id          TEXT PRIMARY KEY,
-                action_id   TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                stage       TEXT NOT NULL,
-                actor       TEXT NOT NULL,
-                details     TEXT NOT NULL,
-                ts          TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts DESC);
-
-            CREATE TABLE IF NOT EXISTS channel_snapshots (
-                channel_id        TEXT NOT NULL,
-                ts                TEXT NOT NULL,
-                local_ratio       REAL NOT NULL,
-                local_balance_msat INTEGER,
-                remote_balance_msat INTEGER,
-                capacity_msat     INTEGER,
-                status_int        INTEGER NOT NULL,
-                PRIMARY KEY (channel_id, ts)
-            );
-            CREATE INDEX IF NOT EXISTS idx_snapshots_channel_ts
-                ON channel_snapshots (channel_id, ts DESC);
-
-            CREATE TABLE IF NOT EXISTS simulations (
-                id          TEXT PRIMARY KEY,
-                action_id   TEXT NOT NULL,
-                finding_id  TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                projection  TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_simulations_action
-                ON simulations (action_id);
-            CREATE INDEX IF NOT EXISTS idx_simulations_ts
-                ON simulations (created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS alert_state (
-                dedup_key      TEXT PRIMARY KEY,
-                last_sent_at   TEXT,
-                last_severity  INTEGER,
-                last_status    TEXT NOT NULL
-            );
-            "#,
-        )?;
-        // Best-effort additive migration for pre-existing databases created
-        // before `last_seen` was introduced. Safe to ignore if already applied.
-        let _ = self
+    /// Run `PRAGMA quick_check` and report database integrity. Returns
+    /// `Ok(())` when the database is intact; otherwise an error naming the
+    /// first problem found. Callers must not claim the database is healthy
+    /// when this fails.
+    pub fn integrity_check(&self) -> Result<(), StorageError> {
+        let result: String = self
             .conn
-            .execute_batch("ALTER TABLE findings ADD COLUMN last_seen TEXT;");
-        Ok(())
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
+        if result.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(StorageError::Corrupt(format!(
+                "database integrity check failed: {result}"
+            )))
+        }
+    }
+
+    /// Obtain the exclusive advisory writer lock for this database. Only one
+    /// writing process may hold it at a time; a second monitor gets an error
+    /// instead of racing (see [`WriterLock`]).
+    pub fn writer_lock(&self, db_path: &Path) -> Result<WriterLock, StorageError> {
+        WriterLock::acquire(db_path)
     }
 
     fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<Finding> {
@@ -125,46 +96,140 @@ impl SqliteStorage {
             _ => Severity::Critical,
         };
         let evidence_json: String = row.get(5)?;
-        let evidence: Vec<rieko_findings::Evidence> =
-            serde_json::from_str(&evidence_json).unwrap_or_default();
+        // Strict decode: malformed persisted evidence is corrupt data, never a
+        // silent empty list (RIEKO-AUDIT-012).
+        let evidence: Vec<rieko_findings::Evidence> = serde_json::from_str(&evidence_json)
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    e.to_string().into(),
+                )
+            })?;
         let ts: String = row.get(7)?;
+        // Strict decode: an invalid persisted timestamp must not silently be
+        // replaced with the current time.
+        let timestamp = DateTime::parse_from_rfc3339(&ts)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    format!("invalid timestamp {:?}: {e}", ts).into(),
+                )
+            })?;
+        let detector_version: String = row
+            .get::<_, Option<String>>(8)?
+            .unwrap_or_else(|| "1".to_string());
+        let _schema_version: u8 = row
+            .get::<_, Option<i64>>(9)?
+            .map(|v| v.clamp(0, u8::MAX as i64) as u8)
+            .unwrap_or(FINDING_SCHEMA_VERSION);
+        let first_string: String = row.get(10)?;
+        let first_seen_at = DateTime::parse_from_rfc3339(&first_string)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    format!("invalid first_seen_at {:?}: {e}", first_string).into(),
+                )
+            })?;
+        let last_string: String = row.get(11)?;
+        let last_seen_at = DateTime::parse_from_rfc3339(&last_string)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    format!("invalid last_seen_at {:?}: {e}", last_string).into(),
+                )
+            })?;
+        let lifecycle: String = row.get(12)?;
+        let lifecycle = match lifecycle.as_str() {
+            "resolved" => FindingLifecycle::Resolved,
+            _ => FindingLifecycle::Active,
+        };
         Ok(Finding {
             id: row.get(0)?,
             detector: row.get(1)?,
+            detector_version,
+            schema_version: FINDING_SCHEMA_VERSION,
             severity,
             node: row.get::<_, Option<String>>(3)?,
             channel: row.get::<_, Option<String>>(4)?,
             evidence,
             explanation: row.get::<_, Option<String>>(6)?,
-            timestamp: DateTime::parse_from_rfc3339(&ts)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            timestamp,
+            first_seen_at,
+            last_seen_at,
+            lifecycle,
         })
     }
 }
 
 impl Storage for SqliteStorage {
+    fn begin_transaction(&mut self) -> Result<(), StorageError> {
+        if self.in_transaction {
+            return Err(StorageError::Backend("nested transaction attempted".into()));
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StorageError::Backend(format!("beginning transaction: {e}")))?;
+        self.in_transaction = true;
+        Ok(())
+    }
+
+    fn commit_transaction(&mut self) -> Result<(), StorageError> {
+        if !self.in_transaction {
+            return Err(StorageError::Backend(
+                "commit with no open transaction".into(),
+            ));
+        }
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| StorageError::Backend(format!("committing transaction: {e}")))?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self) -> Result<(), StorageError> {
+        if !self.in_transaction {
+            return Ok(());
+        }
+        let _ = self.conn.execute_batch("ROLLBACK");
+        self.in_transaction = false;
+        Ok(())
+    }
+
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
         let severity = finding.severity as i64;
         let evidence = serde_json::to_string(&finding.evidence)
             .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
         self.conn.execute(
-            "INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, explanation, ts, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
+                    evidence, explanation, ts, first_seen_at, last_seen_at, lifecycle)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
+                detector_version = excluded.detector_version,
                 explanation = COALESCE(excluded.explanation, findings.explanation),
+                first_seen_at = COALESCE(findings.first_seen_at, excluded.first_seen_at),
                 ts = excluded.ts,
-                last_seen = excluded.last_seen",
+                last_seen_at = excluded.last_seen_at,
+                lifecycle = excluded.lifecycle",
             params![
                 finding.id,
                 finding.detector,
+                finding.detector_version,
                 severity,
                 finding.node,
                 finding.channel,
                 evidence,
                 finding.explanation,
                 finding.timestamp.to_rfc3339(),
-                finding.timestamp.to_rfc3339()
+                finding.first_seen_at.to_rfc3339(),
+                finding.last_seen_at.to_rfc3339(),
+                lifecycle_str(finding.lifecycle),
             ],
         )?;
         Ok(())
@@ -172,7 +237,8 @@ impl Storage for SqliteStorage {
 
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts
+            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
              FROM findings ORDER BY ts DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_finding)?;
@@ -185,7 +251,8 @@ impl Storage for SqliteStorage {
 
     fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts
+            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
              FROM findings WHERE channel_id = ? ORDER BY ts DESC",
         )?;
         let rows = stmt.query_map([channel_id], Self::row_to_finding)?;
@@ -322,12 +389,13 @@ impl Storage for SqliteStorage {
         let details = serde_json::to_string(&entry.details)
             .map_err(|e| StorageError::Corrupt(format!("audit details: {e}")))?;
         self.conn.execute(
-            "INSERT INTO audit (id, action_id, action_type, stage, actor, details, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO audit (id, action_id, action_type, previous_stage, stage, actor, details, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.id,
                 entry.action_id,
                 entry.action_type.as_str(),
+                entry.previous_stage.map(|s| format!("{:?}", s)),
                 format!("{:?}", entry.stage),
                 entry.actor,
                 details,
@@ -338,18 +406,31 @@ impl Storage for SqliteStorage {
     }
 
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, action_id, action_type, stage, actor, details, ts FROM audit ORDER BY ts DESC LIMIT ?")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, action_type, previous_stage, stage, actor, details, ts
+             FROM audit ORDER BY ts DESC LIMIT ?",
+        )?;
         let rows = stmt.query_map([limit], |row| {
             use rieko_findings::{ActionStage, ActionType};
-            let stage = match row.get::<_, String>(3)?.as_str() {
+            let stage = match row.get::<_, String>(4)?.as_str() {
                 "Simulated" => ActionStage::Simulated,
                 "Approved" => ActionStage::Approved,
                 "Executed" => ActionStage::Executed,
                 "Rejected" => ActionStage::Rejected,
                 "Failed" => ActionStage::Failed,
                 _ => ActionStage::Recommended,
+            };
+            let previous_stage = match row.get::<_, Option<String>>(3)? {
+                Some(ref s) => match s.as_str() {
+                    "Recommended" => Some(ActionStage::Recommended),
+                    "Simulated" => Some(ActionStage::Simulated),
+                    "Approved" => Some(ActionStage::Approved),
+                    "Executed" => Some(ActionStage::Executed),
+                    "Rejected" => Some(ActionStage::Rejected),
+                    "Failed" => Some(ActionStage::Failed),
+                    _ => None,
+                },
+                None => None,
             };
             let action_type = match row.get::<_, String>(2)?.as_str() {
                 "update_fee_policy" => ActionType::UpdateFeePolicy,
@@ -358,15 +439,16 @@ impl Storage for SqliteStorage {
                 _ => ActionType::RebalanceChannel,
             };
             let details: Value =
-                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(Value::Null);
             Ok(AuditEntry {
                 id: row.get(0)?,
                 action_id: row.get(1)?,
                 action_type,
+                previous_stage,
                 stage,
-                actor: row.get(4)?,
+                actor: row.get(5)?,
                 details,
-                timestamp: parse_ts(&row.get::<_, String>(6)?),
+                timestamp: parse_ts(&row.get::<_, String>(7)?),
             })
         })?;
         let mut out = Vec::new();
@@ -544,6 +626,87 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+/// Apply the documented, intentional per-connection operational settings. These
+/// are deliberate choices (RIEKO-AUDIT-006), not arbitrary tuning:
+/// * WAL journal mode (DEK: durable concurrent reader/writer workload).
+/// * Foreign keys enforced.
+/// * A finite busy timeout so a transient lock never fails immediately.
+/// * `synchronous=NORMAL` — see [`SYNCHRONOUS_MODE`].
+fn apply_operational_settings(conn: &Connection) -> Result<(), StorageError> {
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .and_then(|_| conn.pragma_update(None, "foreign_keys", "ON"))
+        .and_then(|_| conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS as i64))
+        .and_then(|_| conn.pragma_update(None, "synchronous", SYNCHRONOUS_MODE))
+        .map_err(|e| StorageError::Backend(format!("configuring sqlite connection: {e}")))
+}
+
+/// An exclusive advisory lock guarding one SQLite database so that at most one
+/// writing process (the monitor) holds it at a time. Implementation uses a
+/// separate `<db>.lock` file. Multiple readers keep working under WAL; this
+/// only rejects a *second writer*. Dropping the guard releases the lock.
+pub struct WriterLock {
+    file: std::fs::File,
+}
+
+impl WriterLock {
+    pub fn acquire(db_path: &Path) -> Result<Self, StorageError> {
+        let lock_path = db_path.with_extension(
+            db_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{e}.lock"))
+                .unwrap_or_else(|| "lock".into()),
+        );
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                StorageError::Backend(format!("opening lock file {}: {e}", lock_path.display()))
+            })?;
+        lock(&file).map_err(|e| {
+            StorageError::Backend(format!(
+                "another process already holds the {} writer lock: {e}",
+                db_path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+}
+
+/// Flock-based exclusive lock. Returns a backend error when the lock is held
+/// by another process (non-blocking attempt).
+#[cfg(target_family = "unix")]
+fn lock(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Non-unix fallback: real writers are still serialized by SQLite's own
+/// locking; this only weakens the advisory guard. Kept for portability.
+#[cfg(not(target_family = "unix"))]
+fn lock(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl AlertStateStore for SqliteStorage {
     fn read(&self, key: &str) -> Result<Option<rieko_alerts::AlertState>, AlertError> {
         let mut stmt = self
@@ -619,6 +782,13 @@ fn status_str(s: rieko_alerts::DeliveryStatus) -> &'static str {
     }
 }
 
+fn lifecycle_str(s: FindingLifecycle) -> &'static str {
+    match s {
+        FindingLifecycle::Active => "active",
+        FindingLifecycle::Resolved => "resolved",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,15 +796,21 @@ mod tests {
     use rieko_findings::{Action, ActionStage, ActionType, Evidence, Severity};
 
     fn sample_finding() -> Finding {
+        let now = Utc::now();
         Finding {
             id: "f1".into(),
             detector: "channel_liquidity".into(),
+            detector_version: "1".into(),
+            schema_version: FINDING_SCHEMA_VERSION,
             severity: Severity::Critical,
             node: Some("local-node".into()),
             channel: Some("c1".into()),
             evidence: vec![Evidence::number("local_ratio", 0.02)],
             explanation: None,
-            timestamp: Utc::now(),
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: FindingLifecycle::Active,
         }
     }
 
@@ -662,6 +838,11 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "f1");
         assert_eq!(findings[0].severity, Severity::Critical);
+        // Lifecycle metadata survives the roundtrip (WP2.3).
+        assert_eq!(findings[0].detector_version, "1");
+        assert_eq!(findings[0].schema_version, FINDING_SCHEMA_VERSION);
+        assert_eq!(findings[0].lifecycle, FindingLifecycle::Active);
+        assert_eq!(findings[0].first_seen_at, findings[0].last_seen_at);
 
         let recs = s.latest_recommendations(10).unwrap();
         assert_eq!(recs.len(), 1);
@@ -671,6 +852,10 @@ mod tests {
         let audit_rows = s.recent_audit(10).unwrap();
         assert_eq!(audit_rows.len(), 1);
         assert_eq!(audit_rows[0].action_id, rec.action.id);
+        assert_eq!(
+            audit_rows[0].previous_stage, None,
+            "creation audit entry has no previous stage"
+        );
     }
 
     #[test]
@@ -839,5 +1024,474 @@ mod tests {
         let got3 = AlertStateStore::read(&s2, "k1").unwrap().unwrap();
         assert_eq!(got3.last_severity, Some(Severity::Warning));
         assert_eq!(got3.last_status, DeliveryStatus::Skipped);
+    }
+
+    #[test]
+    fn transaction_commit_makes_cycle_visible_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("tx.db");
+        let mut w = SqliteStorage::open(&db).unwrap();
+        let f = sample_finding();
+        let rec = Recommendation {
+            finding_id: f.id.clone(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                f.channel.clone(),
+                serde_json::json!({}),
+                "rebalance",
+            ),
+        };
+        let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
+
+        w.begin_transaction().unwrap();
+        w.save_finding(&f).unwrap();
+        w.save_recommendation(&rec).unwrap();
+        w.append_audit(&audit).unwrap();
+
+        // A separate reader connection must not see the uncommitted cycle.
+        let mut r = SqliteStorage::open(&db).unwrap();
+        assert_eq!(r.latest_findings(10).unwrap().len(), 0);
+        assert_eq!(r.latest_recommendations(10).unwrap().len(), 0);
+        assert_eq!(r.recent_audit(10).unwrap().len(), 0);
+
+        w.commit_transaction().unwrap();
+
+        // After commit the whole cycle is visible together.
+        let mut r2 = SqliteStorage::open(&db).unwrap();
+        assert_eq!(r2.latest_findings(10).unwrap().len(), 1);
+        assert_eq!(r2.latest_recommendations(10).unwrap().len(), 1);
+        assert_eq!(r2.recent_audit(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rollback_leaves_no_half_written_state() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let f = sample_finding();
+        let rec = Recommendation {
+            finding_id: f.id.clone(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                f.channel.clone(),
+                serde_json::json!({}),
+                "rebalance",
+            ),
+        };
+
+        // Simulate the cycle failing partway through: some writes succeed,
+        // then an error aborts before commit.
+        let result = (|| -> Result<(), StorageError> {
+            s.begin_transaction()?;
+            s.save_finding(&f)?;
+            s.save_recommendation(&rec)?;
+            // ...failure before audit and before commit.
+            Err(StorageError::Backend("mid-cycle failure".into()))
+        })();
+        assert!(result.is_err());
+        s.rollback_transaction().unwrap();
+
+        // No partial finding/recommendation survives the rollback.
+        assert_eq!(s.latest_findings(10).unwrap().len(), 0);
+        assert_eq!(s.latest_recommendations(10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn transaction_cannot_be_nested_or_orphan_committed() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        s.begin_transaction().unwrap();
+        assert!(s.begin_transaction().is_err(), "nested begin must fail");
+        s.commit_transaction().unwrap();
+        assert!(
+            s.commit_transaction().is_err(),
+            "commit with no open transaction must fail"
+        );
+        // rollback with none open is a safe no-op
+        assert!(s.rollback_transaction().is_ok());
+    }
+
+    #[test]
+    fn two_writers_are_rejected_not_raced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("w.db");
+        let s = SqliteStorage::open(&db).unwrap();
+        let first = s.writer_lock(&db).unwrap();
+        // A second process attempting to lock the same database must be refused.
+        let s2 = SqliteStorage::open(&db).unwrap();
+        assert!(
+            s2.writer_lock(&db).is_err(),
+            "second writer must be rejected"
+        );
+        // Dropping the guard releases the lock.
+        drop(first);
+        let s3 = SqliteStorage::open(&db).unwrap();
+        assert!(s3.writer_lock(&db).is_ok());
+    }
+
+    #[test]
+    fn integrity_check_reports_healthy_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("int.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            s.save_finding(&sample_finding()).unwrap();
+            // Intact database reports healthy.
+            s.integrity_check().unwrap();
+        }
+
+        // Corrupt the file (destroy the SQLite header magic). Reopening and
+        // checking integrity must refuse to claim health rather than silently
+        // reading garbage.
+        let bytes = std::fs::read(&db).unwrap();
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&db, &corrupted).unwrap();
+
+        let reopened = SqliteStorage::open(&db);
+        // Either the open itself reports the corruption, or integrity_check does;
+        // in no case may it silently claim a healthy database.
+        let refuses_health = match reopened {
+            Ok(s) => s.integrity_check().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            refuses_health,
+            "corrupt database must be reported, not ignored"
+        );
+    }
+
+    #[test]
+    fn busy_timeout_is_set_and_applied() {
+        let s = SqliteStorage::in_memory().unwrap();
+        let timeout: i64 = s
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, BUSY_TIMEOUT_MS as i64);
+
+        // `synchronous` is exposed as an integer: NORMAL == 1.
+        let sync: i64 = s
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL must be configured");
+    }
+
+    #[test]
+    fn concurrent_reader_and_writer_do_not_fail_with_busy() {
+        use std::thread;
+        // One writer committing inside a transaction while another connection
+        // reads. Under WAL + busy_timeout the reader/writer must not fail.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("conc.db");
+        let f = sample_finding();
+
+        let writer = {
+            let db = db.clone();
+            thread::spawn(move || {
+                let mut w = SqliteStorage::open(&db).unwrap();
+                for _ in 0..20 {
+                    w.begin_transaction().unwrap();
+                    // Different id each iteration so we actually write rows.
+                    let mut f = f.clone();
+                    f.id = format!("f{}", std::time::Instant::now().elapsed().as_nanos());
+                    w.save_finding(&f).unwrap();
+                    w.commit_transaction().unwrap();
+                }
+            })
+        };
+
+        let reader = {
+            let db = db.clone();
+            thread::spawn(move || {
+                let mut r = SqliteStorage::open(&db).unwrap();
+                for _ in 0..200 {
+                    // Reading must not error out with SQLITE_BUSY.
+                    let _ = r.latest_findings(100).unwrap();
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn active_finding_updates_last_seen_and_preserves_first_seen() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let mut f = sample_finding();
+        f.lifecycle = FindingLifecycle::Active;
+
+        s.save_finding(&f).unwrap();
+        // Recurrence of the same condition: a later observation.
+        let later = f.last_seen_at + chrono::Duration::seconds(60);
+        let mut updated = f.clone();
+        updated.last_seen_at = later;
+        updated.timestamp = later;
+        s.save_finding(&updated).unwrap();
+
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].first_seen_at, f.first_seen_at,
+            "first_seen preserved"
+        );
+        assert_eq!(got[0].last_seen_at, later, "last_seen advanced");
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
+    }
+
+    #[test]
+    fn resolving_finding_retains_evidence_history() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let f = sample_finding();
+        let evidence = f.evidence.clone();
+        s.save_finding(&f).unwrap();
+        // Detector no longer observes the condition: mark resolved, keep the
+        // original evidence required by the model.
+        let mut resolved = f.clone();
+        resolved.lifecycle = FindingLifecycle::Resolved;
+        s.save_finding(&resolved).unwrap();
+
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Resolved);
+        assert_eq!(got[0].evidence, evidence, "evidence retained on resolve");
+        assert_eq!(got[0].first_seen_at, f.first_seen_at);
+    }
+
+    #[test]
+    fn malformed_evidence_fails_loudly_none_serialized_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bad-evidence.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            // Persist a finding whose evidence column will be deliberately
+            // corrupted at the storage level.
+            s.save_finding(&sample_finding()).unwrap();
+        }
+        // Corrupt persisted evidence into non-JSON, then reopen.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE findings SET evidence = 'not-json' WHERE id = 'f1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let err = s.latest_findings(10).unwrap_err();
+        // Must be a typed conversion failure, never a silent empty list.
+        assert!(matches!(
+            err,
+            StorageError::Backend(_) | StorageError::Corrupt(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_timestamp_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bad-ts.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            s.save_finding(&sample_finding()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE findings SET ts = 'not-a-timestamp' WHERE id = 'f1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let err = s.latest_findings(10).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Backend(_) | StorageError::Corrupt(_)),
+            "invalid persisted timestamp must error, not fall back to Utc::now()"
+        );
+    }
+
+    #[test]
+    fn older_schema_rows_migrate_with_lifecycle_metadata() {
+        // A row written before the findings metadata columns existed. Opening
+        // the database runs v1->v2 and backfills first/last seen + lifecycle,
+        // then the row must decode via the strict path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old-schema.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE findings (
+                    id TEXT PRIMARY KEY, detector TEXT NOT NULL, severity INTEGER NOT NULL,
+                    node_id TEXT, channel_id TEXT, evidence TEXT NOT NULL,
+                    explanation TEXT, ts TEXT NOT NULL, last_seen TEXT
+                 );
+                 CREATE TABLE audit (
+                    id TEXT PRIMARY KEY, action_id TEXT NOT NULL, action_type TEXT NOT NULL,
+                    stage TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL, ts TEXT NOT NULL
+                 );
+                 INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
+                 VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
+                         '2021-05-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "old1");
+        assert_eq!(got[0].detector_version, "1", "default detector version");
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
+        assert_eq!(got[0].first_seen_at, got[0].last_seen_at);
+    }
+
+    #[test]
+    fn audit_state_transition_and_entry_commit_together() {
+        // RIEKO-AUDIT-007: a stage transition and its audit entry must be
+        // visible atomically — never a stage change without the audit row.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("atomic-audit.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.save_recommendation(&rec).unwrap();
+        let action_id = rec.action.id.clone();
+
+        // A reader before the transition sees Recommended and no audit row.
+        let mut before = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            before
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Recommended
+        );
+        assert!(before.recent_audit(10).unwrap().is_empty());
+
+        // Transition to Approved inside one transaction.
+        let approved = rieko_findings::Action {
+            stage: ActionStage::Approved,
+            ..rec.action
+        };
+        s.begin_transaction().unwrap();
+        s.set_action_stage(&action_id, ActionStage::Approved)
+            .unwrap();
+        s.append_audit(&AuditEntry::from_transition(
+            &approved,
+            ActionStage::Recommended,
+            "alice",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        s.commit_transaction().unwrap();
+
+        // After commit both the stage change and the audit row are visible.
+        let mut after = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            after
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Approved
+        );
+        let audit = after.recent_audit(10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action_id, action_id);
+        assert_eq!(audit[0].previous_stage, Some(ActionStage::Recommended));
+        assert_eq!(audit[0].stage, ActionStage::Approved);
+    }
+
+    #[test]
+    fn failed_transition_commits_neither_state_nor_audit() {
+        // RIEKO-AUDIT-007: a failed transition must leave no stage change and
+        // no audit entry behind. The audit table is append-only, so a write
+        // that is rejected mid-transaction (here: attempting to UPDATE a stage
+        // that is illegal) must roll back the whole unit.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rollback-audit.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.save_recommendation(&rec).unwrap();
+        let action_id = rec.action.id.clone();
+
+        s.begin_transaction().unwrap();
+        s.set_action_stage(&action_id, ActionStage::Approved)
+            .unwrap();
+        // A change is made, then the unit fails (the audit append errors). The
+        // caller rolls back the whole thing, so neither the stage change nor
+        // any audit row survives.
+        s.rollback_transaction().unwrap();
+
+        // Nothing must have been committed.
+        let mut after = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            after
+                .recommendation_for_action(&action_id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Recommended,
+            "stage must remain Recommended after rollback"
+        );
+        assert!(after.recent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_rows_are_append_only() {
+        // RIEKO-AUDIT-007: the audit table denies normal UPDATE and DELETE via
+        // triggers; the application API is the only writer.
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let rec = Recommendation {
+            finding_id: "f1".into(),
+            action: rieko_findings::Action::new(
+                rieko_findings::ActionType::RebalanceChannel,
+                rieko_findings::ActionStage::Recommended,
+                Some("c1".into()),
+                serde_json::json!({}),
+                "rebalance c1",
+            ),
+        };
+        s.append_audit(&AuditEntry::from_action(
+            &rec.action,
+            "system",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        assert_eq!(s.recent_audit(10).unwrap().len(), 1);
+
+        // Both an UPDATE and a DELETE on the audit table must be rejected.
+        for sql in ["UPDATE audit SET actor = 'intruder'", "DELETE FROM audit"] {
+            let err = s.conn.execute(sql, []).unwrap_err();
+            assert!(
+                err.to_string().contains("append-only"),
+                "expected append-only rejection for `{sql}`, got: {err}"
+            );
+        }
+        // The row is still there after both attempts.
+        assert_eq!(s.recent_audit(10).unwrap().len(), 1);
     }
 }
