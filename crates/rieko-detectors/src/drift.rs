@@ -55,6 +55,12 @@ impl Detector for DriftDetector {
         "liquidity_trend"
     }
 
+    fn version(&self) -> &'static str {
+        // v2: channels with unclassifiable liquidity are skipped; semantics
+        // changed so identities bump.
+        "2"
+    }
+
     fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding> {
         let Some(history) = ctx.history else {
             return Vec::new();
@@ -63,6 +69,12 @@ impl Detector for DriftDetector {
         let mut findings = Vec::new();
         for channel in view.channels() {
             if !channel.status.is_open() {
+                continue;
+            }
+            // Unknown/invalid liquidity (zero capacity, balance > capacity,
+            // missing balance) must never look like a drain trend
+            // (RIEKO-AUDIT-011).
+            if channel.liquidity.imbalance == rieko_domain::LiquidityImbalance::Unknown {
                 continue;
             }
             let snaps = history.recent_channel_snapshots(&channel.id, self.thresholds.window);
