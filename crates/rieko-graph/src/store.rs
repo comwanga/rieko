@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use rieko_domain::{Channel, ChannelId, ForwardEvent, Node, NodeId, PaymentEvent};
 use thiserror::Error;
 
+use crate::path::{self, Path};
+
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("node {0} not found")]
@@ -51,6 +53,10 @@ pub struct InMemoryGraph {
     forwards: Vec<ForwardEvent>,
     payments: Vec<PaymentEvent>,
     source_ledger: HashMap<String, DateTime<Utc>>,
+    /// Adjacency index mapping each node (local and peers) to its channel IDs.
+    /// Maintained by `upsert_channel`; enables O(1) `channels_for_peer` and
+    /// Dijkstra path-finding (Phase 7.2).
+    peer_channels: HashMap<NodeId, Vec<ChannelId>>,
 }
 
 impl InMemoryGraph {
@@ -64,6 +70,48 @@ impl InMemoryGraph {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty() && self.channels.is_empty()
+    }
+
+    /// Find the cheapest path from `source` to `target` for `amount_msat`
+    /// through the channel graph. Returns `None` if no route exists.
+    pub fn find_path(&self, source: &NodeId, target: &NodeId, amount_msat: u64) -> Option<Path> {
+        path::find_path(
+            source,
+            target,
+            amount_msat,
+            &self.channels,
+            &self.peer_channels,
+        )
+    }
+
+    /// Total capacity across all channels with a given peer.
+    pub fn total_capacity_with_peer(&self, peer: &NodeId) -> u64 {
+        self.peer_channels
+            .get(peer)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|cid| self.channels.get(cid))
+                    .map(|c| c.capacity_msat)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Number of open channels with a given peer.
+    pub fn channel_count_with_peer(&self, peer: &NodeId) -> usize {
+        self.peer_channels
+            .get(peer)
+            .map(|ids| {
+                ids.iter()
+                    .filter(|cid| {
+                        self.channels
+                            .get(cid)
+                            .map(|c| c.status.is_open())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -85,7 +133,14 @@ impl GraphView for InMemoryGraph {
     }
 
     fn channels_for_peer(&self, peer: &NodeId) -> Vec<&Channel> {
-        self.channels.values().filter(|c| &c.peer == peer).collect()
+        self.peer_channels
+            .get(peer)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|cid| self.channels.get(cid))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn recent_forwards(&self, limit: usize) -> Vec<&ForwardEvent> {
@@ -104,6 +159,18 @@ impl GraphStore for InMemoryGraph {
     }
 
     fn upsert_channel(&mut self, channel: Channel) -> GraphResult<()> {
+        // Remove old entry from adjacency index if the channel is being replaced.
+        if let Some(old) = self.channels.get(&channel.id) {
+            if old.peer != channel.peer {
+                if let Some(list) = self.peer_channels.get_mut(&old.peer) {
+                    list.retain(|cid| cid != &channel.id);
+                }
+                if let Some(list) = self.peer_channels.get_mut(&channel.node) {
+                    list.retain(|cid| cid != &channel.id);
+                }
+            }
+        }
+
         self.nodes
             .entry(channel.peer.clone())
             .or_insert_with(|| Node {
@@ -113,6 +180,17 @@ impl GraphStore for InMemoryGraph {
                 status: rieko_domain::NodeStatus::Unknown,
                 last_seen: channel.last_seen,
             });
+
+        // Track in adjacency: peer → channel, node → channel (bidirectional).
+        self.peer_channels
+            .entry(channel.peer.clone())
+            .or_default()
+            .push(channel.id.clone());
+        self.peer_channels
+            .entry(channel.node.clone())
+            .or_default()
+            .push(channel.id.clone());
+
         self.channels.insert(channel.id.clone(), channel);
         Ok(())
     }
