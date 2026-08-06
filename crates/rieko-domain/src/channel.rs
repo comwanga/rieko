@@ -30,8 +30,12 @@ impl ChannelStatus {
 }
 
 /// Which side of the channel the operator's liquidity has eroded toward.
+///
+/// This is a *structural condition*, not a directive: an imbalance is a risk
+/// signal, never proof that rebalancing is required (RIEKO-AUDIT-011).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiquidityImbalance {
+    /// Liquidity is broadly even between the two sides.
     Balanced,
     /// Local balance is low: we cannot send (outbound capacity drained).
     OutboundDrained,
@@ -39,13 +43,20 @@ pub enum LiquidityImbalance {
     InboundDrained,
     /// Either side below a critical floor.
     SeverelyDrained,
+    /// The channel's liquidity cannot be classified: zero capacity, a balance
+    /// exceeding capacity, or missing balance data. Never treated as healthy
+    /// *or* drained.
+    Unknown,
 }
 
 /// Derived, operationally meaningful view of a channel's liquidity.
 /// Computed at normalization time (D4: semantics live in domain objects).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LiquidityProfile {
-    /// local_balance / capacity, in `0.0..=1.0`.
+    /// `local_balance / capacity`, normally in `0.0..=1.0`. May be `0.0` for a
+    /// zero-capacity channel or exceed `1.0` when a balance exceeds capacity;
+    /// such profiles carry [`LiquidityImbalance::Unknown`] and are never
+    /// classified as healthy or drained.
     pub local_ratio: f64,
     pub local_balance_msat: u64,
     pub remote_balance_msat: u64,
@@ -57,12 +68,42 @@ pub struct LiquidityProfile {
 }
 
 impl LiquidityProfile {
+    /// v1 classification thresholds (RIEKO-AUDIT-011). These are documented
+    /// heuristics, not universal truth:
+    ///
+    /// * `0.03` — outbound floor below which the channel is
+    ///   `SeverelyDrained`; mirrored at `0.97` for inbound. Unit: fraction of
+    ///   capacity (`0.0..=1.0`). Boundary: strictly below `0.03` (strictly
+    ///   above `0.97`). Configuration status: fixed for v1, not operator
+    ///   tunable.
+    /// * `0.10` — outbound floor below which the channel is
+    ///   `OutboundDrained`; mirrored at `0.90` for inbound. Boundary: the
+    ///   `0.03..0.10` band is `OutboundDrained`; `0.90..0.97` is
+    ///   `InboundDrained`. A ratio exactly at `0.10`/`0.90` is `Balanced`.
+    ///
+    /// Invalid input never produces a liquidity class: zero capacity, or a
+    /// balance exceeding capacity, yields [`LiquidityImbalance::Unknown`].
+    /// Negative balances are rejected earlier at ingestion
+    /// (`NormalizerError::NegativeBalance`).
     pub fn compute(capacity_msat: u64, local_balance_msat: u64, remote_balance_msat: u64) -> Self {
-        let local_ratio = if capacity_msat == 0 {
-            0.0
-        } else {
-            local_balance_msat as f64 / capacity_msat as f64
-        };
+        if capacity_msat == 0
+            || local_balance_msat > capacity_msat
+            || remote_balance_msat > capacity_msat
+        {
+            return Self {
+                local_ratio: if capacity_msat == 0 {
+                    0.0
+                } else {
+                    local_balance_msat as f64 / capacity_msat as f64
+                },
+                local_balance_msat,
+                remote_balance_msat,
+                inbound_capacity_msat: remote_balance_msat,
+                outbound_capacity_msat: local_balance_msat,
+                imbalance: LiquidityImbalance::Unknown,
+            };
+        }
+        let local_ratio = local_balance_msat as f64 / capacity_msat as f64;
         let imbalance = match local_ratio {
             r if r < 0.03 => LiquidityImbalance::SeverelyDrained,
             r if r > 0.97 => LiquidityImbalance::SeverelyDrained,
@@ -77,6 +118,19 @@ impl LiquidityProfile {
             inbound_capacity_msat: remote_balance_msat,
             outbound_capacity_msat: local_balance_msat,
             imbalance,
+        }
+    }
+
+    /// A profile whose balance data is absent or unclassifiable. Distinct from
+    /// `Balanced`: missing data is not proof of health.
+    pub fn unknown() -> Self {
+        Self {
+            local_ratio: 0.0,
+            local_balance_msat: 0,
+            remote_balance_msat: 0,
+            inbound_capacity_msat: 0,
+            outbound_capacity_msat: 0,
+            imbalance: LiquidityImbalance::Unknown,
         }
     }
 }
@@ -121,5 +175,92 @@ pub struct Channel {
 impl Channel {
     pub fn healthy(&self) -> bool {
         self.liquidity.imbalance == LiquidityImbalance::Balanced
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_capacity_is_unknown_not_drained() {
+        let p = LiquidityProfile::compute(0, 0, 0);
+        assert_eq!(p.imbalance, LiquidityImbalance::Unknown);
+        assert_eq!(p.local_ratio, 0.0);
+    }
+
+    #[test]
+    fn balance_exceeding_capacity_is_unknown_not_a_liquidity_class() {
+        // local > capacity must never decode as InboundDrained (RIEKO-AUDIT-011).
+        let p = LiquidityProfile::compute(100, 120, 0);
+        assert_eq!(p.imbalance, LiquidityImbalance::Unknown);
+        assert!(p.local_ratio > 1.0);
+        let p2 = LiquidityProfile::compute(100, 0, 120);
+        assert_eq!(p2.imbalance, LiquidityImbalance::Unknown);
+    }
+
+    #[test]
+    fn unknown_is_distinct_from_balanced() {
+        assert_ne!(
+            LiquidityProfile::unknown().imbalance,
+            LiquidityImbalance::Balanced
+        );
+        assert!(!LiquidityProfile::unknown()
+            .imbalance
+            .eq(&LiquidityImbalance::Balanced));
+    }
+
+    #[test]
+    fn drain_classification_boundaries() {
+        // Strict lower bounds: exactly 0.03 and 0.10 are NOT Severely/OutboundDrained.
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 3_000, 97_000).imbalance,
+            LiquidityImbalance::OutboundDrained
+        );
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 2_999, 97_001).imbalance,
+            LiquidityImbalance::SeverelyDrained
+        );
+        // Exactly 0.10 is Balanced (drain floor is strict).
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 10_000, 90_000).imbalance,
+            LiquidityImbalance::Balanced
+        );
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 9_999, 90_001).imbalance,
+            LiquidityImbalance::OutboundDrained
+        );
+        // Mirrored inbound band.
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 95_000, 5_000).imbalance,
+            LiquidityImbalance::InboundDrained
+        );
+        assert_eq!(
+            LiquidityProfile::compute(100_000, 98_000, 2_000).imbalance,
+            LiquidityImbalance::SeverelyDrained
+        );
+    }
+
+    #[test]
+    fn balanced_band_is_silent_and_healthy() {
+        let c = Channel {
+            id: ChannelId::new("c1"),
+            node: NodeId::new("n"),
+            peer: NodeId::new("p"),
+            capacity_msat: 100_000,
+            fee_policy: FeePolicy::default(),
+            status: ChannelStatus::Active,
+            liquidity: LiquidityProfile::compute(100_000, 50_000, 50_000),
+            last_seen: Utc::now(),
+            opening_height: Some(1),
+        };
+        assert_eq!(c.liquidity.imbalance, LiquidityImbalance::Balanced);
+        assert!(c.healthy());
+        // Unknown is never "healthy" even though it is not drained.
+        let c = Channel {
+            liquidity: LiquidityProfile::unknown(),
+            ..c
+        };
+        assert!(!c.healthy());
     }
 }

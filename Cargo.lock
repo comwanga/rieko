@@ -1291,6 +1291,7 @@ dependencies = [
  "rieko-domain",
  "rieko-findings",
  "rieko-graph",
+ "rieko-recommendations",
  "serde_json",
  "thiserror",
  "uuid",
