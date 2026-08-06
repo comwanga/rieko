@@ -264,7 +264,6 @@ pub async fn simulation_v2_by_id(
     State(api): State<RiekoApi>,
     Path(simulation_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-
     let rows = block_read(api.state.storage.clone(), move |s| {
         s.recent_simulations_v2(1000).map_err(|e| e.to_string())
     })
