@@ -765,9 +765,12 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
 /// * A finite busy timeout so a transient lock never fails immediately.
 /// * `synchronous=NORMAL` — see [`SYNCHRONOUS_MODE`].
 fn apply_operational_settings(conn: &Connection) -> Result<(), StorageError> {
-    conn.pragma_update(None, "journal_mode", "WAL")
+    // busy_timeout must be installed *before* any pragma that can take a lock
+    // (journal_mode=WAL needs the write lock on a fresh database): a concurrent
+    // open otherwise fails immediately with SQLITE_BUSY instead of waiting.
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS as i64)
+        .and_then(|_| conn.pragma_update(None, "journal_mode", "WAL"))
         .and_then(|_| conn.pragma_update(None, "foreign_keys", "ON"))
-        .and_then(|_| conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS as i64))
         .and_then(|_| conn.pragma_update(None, "synchronous", SYNCHRONOUS_MODE))
         .map_err(|e| StorageError::Backend(format!("configuring sqlite connection: {e}")))
 }
@@ -1730,35 +1733,39 @@ mod tests {
         use std::thread;
         // One writer committing inside a transaction while another connection
         // reads. Under WAL + busy_timeout the reader/writer must not fail.
+        //
+        // The connections are opened *before* the threads split off:
+        // `PRAGMA journal_mode=WAL` needs exclusive access to convert a fresh
+        // database and — per SQLite — does not honour the busy handler, so two
+        // threads racing the very first open would flake on SQLITE_BUSY
+        // regardless of busy_timeout. The concurrency under test is the read
+        // vs. write workload, not the open race.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("conc.db");
+
+        let w = SqliteStorage::open(&db).unwrap();
+        let r = SqliteStorage::open(&db).unwrap();
         let f = sample_finding();
 
-        let writer = {
-            let db = db.clone();
-            thread::spawn(move || {
-                let mut w = SqliteStorage::open(&db).unwrap();
-                for _ in 0..20 {
-                    w.begin_transaction().unwrap();
-                    // Different id each iteration so we actually write rows.
-                    let mut f = f.clone();
-                    f.id = format!("f{}", std::time::Instant::now().elapsed().as_nanos());
-                    w.save_finding(&f).unwrap();
-                    w.commit_transaction().unwrap();
-                }
-            })
-        };
+        let writer = thread::spawn(move || {
+            let mut w = w;
+            for _ in 0..20 {
+                w.begin_transaction().unwrap();
+                // Different id each iteration so we actually write rows.
+                let mut f = f.clone();
+                f.id = format!("f{}", std::time::Instant::now().elapsed().as_nanos());
+                w.save_finding(&f).unwrap();
+                w.commit_transaction().unwrap();
+            }
+        });
 
-        let reader = {
-            let db = db.clone();
-            thread::spawn(move || {
-                let mut r = SqliteStorage::open(&db).unwrap();
-                for _ in 0..200 {
-                    // Reading must not error out with SQLITE_BUSY.
-                    let _ = r.latest_findings(100).unwrap();
-                }
-            })
-        };
+        let reader = thread::spawn(move || {
+            let mut r = r;
+            for _ in 0..200 {
+                // Reading must not error out with SQLITE_BUSY.
+                let _ = r.latest_findings(100).unwrap();
+            }
+        });
 
         writer.join().unwrap();
         reader.join().unwrap();
