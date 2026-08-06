@@ -52,7 +52,11 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError>;
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError>;
-    fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError>;
+    fn findings_for_channel(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Finding>, StorageError>;
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError>;
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError>;
@@ -154,11 +158,17 @@ impl Storage for MemoryStorage {
             .collect())
     }
 
-    fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError> {
+    fn findings_for_channel(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Finding>, StorageError> {
         Ok(self
             .findings
             .iter()
+            .rev()
             .filter(|f| f.channel.as_deref() == Some(channel_id))
+            .take(limit as usize)
             .cloned()
             .collect())
     }

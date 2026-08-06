@@ -13,13 +13,13 @@ rieko-storage.workspace = true
 rieko-status.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
-tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+subtle = "2"
 
 # Matches rieko-cli's `future` feature. Post-v1 simulation surface, disabled
 # by default so the v1 API exposes no simulation entry point.
@@ -29,6 +29,7 @@ future = []
 
 [dev-dependencies]
 http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 chrono = { version = "0.4", features = ["serde"] }
 rieko-domain.workspace = true
 rieko-findings.workspace = true

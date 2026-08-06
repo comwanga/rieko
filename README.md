@@ -102,6 +102,17 @@ cargo run -- serve --db ~/.rieko/rieko.db --addr 127.0.0.1:8080 \
 #     /audit, /snapshots, /snapshots/channel/{id}
 ```
 
+By default the API binds loopback only. Binding a non-loopback address is
+refused unless you pass `--allow-external` *and* provide a bearer token
+(`--token-file FILE` or the `RIEKO_API_TOKEN` env var); the API then requires
+`Authorization: Bearer <token>` on every JSON route. The API serves only GET
+(read-only) routes and honours request-size, timeout, and security headers
+(CSP, `X-Content-Type-Options`, frame/referrer protection) on all responses.
+
+```sh
+cargo run -- serve --addr 0.0.0.0:8080 --allow-external --token-file /run/secrets/rieko-token
+```
+
 ## Database upgrades
 
 The SQLite database is versioned internally (`PRAGMA user_version`) and
