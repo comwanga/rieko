@@ -536,6 +536,115 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    fn prune_channel_snapshots(
+        &mut self,
+        policy: &crate::RetentionPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::PruneSummary, StorageError> {
+        // Runs in one transaction so the pass is atomic (RIEKO-AUDIT-016).
+        // Work is bounded: each statement deletes at most CHUNK rows, looped
+        // until nothing remains, so a very large table is pruned without a
+        // single unbounded statement. Only channel_snapshots is ever touched.
+        const CHUNK: usize = 2000;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| StorageError::Backend(format!("starting cleanup: {e}")))?;
+        let mut deleted = 0usize;
+
+        let active_cutoff = now
+            - chrono::Duration::from_std(policy.snapshot_max_age)
+                .unwrap_or(chrono::Duration::zero());
+        let closed_cutoff = now
+            - chrono::Duration::from_std(policy.closed_channel_max_age)
+                .unwrap_or(chrono::Duration::zero());
+        // Closed/terminated status ints: Closed=4, Closing=3, WaitingClose=6,
+        // ForceClosing=7 (see rieko_domain::ChannelStatus). Each statement
+        // deletes at most CHUNK rows via a bounded rowid subquery (SQLite has
+        // no `LIMIT` on DELETE).
+        loop {
+            let n = tx
+                .execute(
+                    "DELETE FROM channel_snapshots
+                     WHERE rowid IN (
+                        SELECT rowid FROM channel_snapshots
+                        WHERE ts < ?1 AND status_int NOT IN (3, 4, 6, 7)
+                           OR ts < ?2 AND status_int IN (3, 4, 6, 7)
+                        LIMIT ?3
+                     )",
+                    params![
+                        active_cutoff.to_rfc3339(),
+                        closed_cutoff.to_rfc3339(),
+                        CHUNK as i64
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(format!("pruning stale snapshots: {e}")))?;
+            deleted += n;
+            if n == 0 {
+                break;
+            }
+        }
+
+        // Per-channel cap: keep the newest `cap` per channel.
+        if let Some(cap) = policy.max_snapshots_per_channel {
+            if cap > 0 {
+                loop {
+                    let n = tx
+                        .execute(
+                            "DELETE FROM channel_snapshots
+                             WHERE rowid IN (
+                                SELECT rowid FROM (
+                                    SELECT rowid,
+                                           ROW_NUMBER() OVER (
+                                               PARTITION BY channel_id ORDER BY ts DESC
+                                           ) AS rn
+                                    FROM channel_snapshots
+                                ) WHERE rn > ?1
+                                LIMIT ?2
+                             )",
+                            params![cap as i64, CHUNK as i64],
+                        )
+                        .map_err(|e| {
+                            StorageError::Backend(format!("pruning per-channel cap: {e}"))
+                        })?;
+                    deleted += n;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Absolute total cap: keep the newest `total` rows overall.
+        if let Some(total) = policy.max_total_snapshots {
+            if total > 0 {
+                loop {
+                    let n = tx
+                        .execute(
+                            "DELETE FROM channel_snapshots
+                             WHERE rowid IN (
+                                SELECT rowid FROM channel_snapshots
+                                ORDER BY ts DESC LIMIT ?1 OFFSET ?2
+                             )",
+                            params![CHUNK as i64, total as i64],
+                        )
+                        .map_err(|e| StorageError::Backend(format!("pruning total cap: {e}")))?;
+                    deleted += n;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| StorageError::Backend(format!("committing cleanup: {e}")))?;
+        Ok(crate::PruneSummary {
+            deleted_snapshots: deleted,
+            complete: true,
+        })
+    }
+
     fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError> {
         let projection = serde_json::to_string(&sim.projection)
             .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
@@ -786,7 +895,8 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             .prepare(
                 "SELECT source, source_connected, last_ingestion_attempt,
                         last_ingestion_success, last_cycle_attempt, last_cycle_success,
-                        last_persist_success, source_data_at, llm, alert_sink
+                        last_persist_success, source_data_at, llm, alert_sink,
+                        cleanup, last_cleanup_attempt, last_cleanup_success
                  FROM operational_state WHERE id = 'current'",
             )
             .map_err(|e| OperationalStateError::Store(e.to_string()))?;
@@ -803,6 +913,9 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             })
             .map_err(|e| OperationalStateError::Store(e.to_string()))?;
@@ -820,6 +933,9 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             data_at,
             llm,
             alert,
+            cleanup,
+            cleanup_attempt,
+            cleanup_success,
         ) = row.map_err(|e| OperationalStateError::Store(e.to_string()))?;
         Ok(Some(rieko_status::OperationalState {
             source: parse_source(&source, connected),
@@ -831,6 +947,9 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             source_data_at: data_at.map(|s| parse_ts(&s)),
             llm: parse_component(&llm),
             alert_sink: parse_component(&alert),
+            cleanup: parse_component(&cleanup),
+            last_cleanup_attempt: cleanup_attempt.map(|s| parse_ts(&s)),
+            last_cleanup_success: cleanup_success.map(|s| parse_ts(&s)),
         }))
     }
 
@@ -848,8 +967,8 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                 "INSERT INTO operational_state
                     (id, source, source_connected, last_ingestion_attempt, last_ingestion_success,
                      last_cycle_attempt, last_cycle_success, last_persist_success, source_data_at,
-                     llm, alert_sink)
-                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     llm, alert_sink, cleanup, last_cleanup_attempt, last_cleanup_success)
+                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                     source = excluded.source,
                     source_connected = excluded.source_connected,
@@ -860,7 +979,10 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     last_persist_success = excluded.last_persist_success,
                     source_data_at = excluded.source_data_at,
                     llm = excluded.llm,
-                    alert_sink = excluded.alert_sink",
+                    alert_sink = excluded.alert_sink,
+                    cleanup = excluded.cleanup,
+                    last_cleanup_attempt = excluded.last_cleanup_attempt,
+                    last_cleanup_success = excluded.last_cleanup_success",
                 params![
                     state.source.as_str(),
                     connected,
@@ -872,6 +994,9 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     state.source_data_at.map(|t| t.to_rfc3339()),
                     component_str(state.llm),
                     component_str(state.alert_sink),
+                    component_str(state.cleanup),
+                    state.last_cleanup_attempt.map(|t| t.to_rfc3339()),
+                    state.last_cleanup_success.map(|t| t.to_rfc3339()),
                 ],
             )
             .map(|_| ())
@@ -945,6 +1070,7 @@ fn lifecycle_str(s: FindingLifecycle) -> &'static str {
 mod tests {
     use super::*;
     use crate::MemoryStorage;
+    use rieko_domain::ChannelStatus;
     use rieko_findings::{Action, ActionStage, ActionType, Evidence, Rationale, Severity};
 
     fn test_rec(finding_id: &str, action: Action) -> Recommendation {
@@ -1124,6 +1250,193 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn snapshot_at(id: &str, status: ChannelStatus, ts: DateTime<Utc>) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel_id: id.to_string(),
+            local_ratio: 0.5,
+            local_balance_msat: 500_000,
+            remote_balance_msat: 500_000,
+            capacity_msat: 1_000_000,
+            status,
+            ts,
+        }
+    }
+
+    #[test]
+    fn retention_removes_old_snapshots_and_keeps_recent() {
+        let dir = std::env::temp_dir().join(format!("rieko-ret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ret.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        for days in [0, 2, 40] {
+            s.save_channel_snapshot(&snapshot_at(
+                "c1",
+                ChannelStatus::Active,
+                now - chrono::Duration::days(days),
+            ))
+            .unwrap();
+        }
+        let policy = crate::RetentionPolicy {
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            ..Default::default()
+        };
+        let summary = s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(summary.deleted_snapshots, 1, "only the 40-day row expires");
+        let kept = s.recent_channel_snapshots("c1", 10).unwrap();
+        assert_eq!(kept.len(), 2, "recent snapshots remain");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_handles_closed_channels_with_shorter_grace() {
+        let dir = std::env::temp_dir().join(format!("rieko-retc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("retc.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        // 10 days old: fine for an active channel (30d), stale for a closed one (3d).
+        s.save_channel_snapshot(&snapshot_at(
+            "open",
+            ChannelStatus::Active,
+            now - chrono::Duration::days(10),
+        ))
+        .unwrap();
+        s.save_channel_snapshot(&snapshot_at(
+            "closed",
+            ChannelStatus::Closed,
+            now - chrono::Duration::days(10),
+        ))
+        .unwrap();
+        s.save_channel_snapshot(&snapshot_at(
+            "closed",
+            ChannelStatus::Closed,
+            now - chrono::Duration::hours(1),
+        ))
+        .unwrap();
+        let policy = crate::RetentionPolicy {
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            closed_channel_max_age: std::time::Duration::from_secs(3 * 24 * 3600),
+            ..Default::default()
+        };
+        let summary = s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(summary.deleted_snapshots, 1);
+        // The closed channel keeps only its recent snapshot; the open channel is untouched.
+        assert_eq!(s.recent_channel_snapshots("open", 10).unwrap().len(), 1);
+        assert_eq!(s.recent_channel_snapshots("closed", 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_caps_snapshots_per_channel() {
+        let dir = std::env::temp_dir().join(format!("rieko-retcap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("retcap.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        for i in 0..10 {
+            s.save_channel_snapshot(&snapshot_at(
+                "c1",
+                ChannelStatus::Active,
+                now - chrono::Duration::minutes(i as i64),
+            ))
+            .unwrap();
+        }
+        let policy = crate::RetentionPolicy {
+            max_snapshots_per_channel: Some(3),
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            ..Default::default()
+        };
+        let summary = s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(summary.deleted_snapshots, 7);
+        assert_eq!(s.recent_channel_snapshots("c1", 100).unwrap().len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_caps_total_snapshots() {
+        let dir = std::env::temp_dir().join(format!("rieko-rettot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("rettot.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        for (id, days) in [("c1", 0i64), ("c1", 1), ("c2", 0), ("c2", 1), ("c2", 2)] {
+            s.save_channel_snapshot(&snapshot_at(
+                id,
+                ChannelStatus::Active,
+                now - chrono::Duration::days(days),
+            ))
+            .unwrap();
+        }
+        let policy = crate::RetentionPolicy {
+            max_total_snapshots: Some(2),
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            ..Default::default()
+        };
+        let summary = s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(summary.deleted_snapshots, 3, "only the newest two survive");
+        assert_eq!(
+            s.counts().unwrap().channel_snapshots,
+            2,
+            "absolute cap respected"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cleanup_never_touches_findings_or_recommendations() {
+        let dir = std::env::temp_dir().join(format!("rieko-retf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("retf.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        s.save_finding(&sample_finding()).unwrap();
+        s.save_channel_snapshot(&snapshot_at(
+            "c1",
+            ChannelStatus::Active,
+            now - chrono::Duration::days(100),
+        ))
+        .unwrap();
+        let policy = crate::RetentionPolicy {
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            ..Default::default()
+        };
+        s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(s.recent_channel_snapshots("c1", 10).unwrap().len(), 0);
+        // Active finding evidence survives even though its channel history expired.
+        assert_eq!(s.latest_findings(10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn large_cleanup_is_chunked_and_completes() {
+        let dir = std::env::temp_dir().join(format!("rieko-retbig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("retbig.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let now = Utc::now();
+        // 5000 rows across two channels, all stale.
+        for i in 0..5000 {
+            s.save_channel_snapshot(&snapshot_at(
+                if i % 2 == 0 { "c1" } else { "c2" },
+                ChannelStatus::Active,
+                now - chrono::Duration::days(60) - chrono::Duration::seconds(i as i64),
+            ))
+            .unwrap();
+        }
+        let policy = crate::RetentionPolicy {
+            snapshot_max_age: std::time::Duration::from_secs(30 * 24 * 3600),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let summary = s.prune_channel_snapshots(&policy, now).unwrap();
+        assert_eq!(summary.deleted_snapshots, 5000);
+        assert_eq!(s.counts().unwrap().channel_snapshots, 0);
+        // The chunked pass must complete promptly, not block indefinitely.
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn operational_state_roundtrips_in_sqlite_and_memory() {
         use rieko_status::OperationalStateStore as _;
@@ -1138,6 +1451,9 @@ mod tests {
             source_data_at: Some(Utc::now()),
             llm: rieko_status::ComponentState::Healthy,
             alert_sink: rieko_status::ComponentState::Failing,
+            cleanup: rieko_status::ComponentState::Healthy,
+            last_cleanup_attempt: Some(Utc::now()),
+            last_cleanup_success: Some(Utc::now()),
         };
 
         let mut sqlite = SqliteStorage::in_memory().unwrap();

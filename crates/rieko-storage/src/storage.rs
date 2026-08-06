@@ -88,6 +88,16 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError>;
     fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError>;
 
+    /// Apply the retention policy to `channel_snapshots`, transactionally and in
+    /// bounded chunks. Only snapshots are ever removed — findings and
+    /// recommendations are never touched, so active finding evidence survives
+    /// (RIEKO-AUDIT-016). Returns a summary for observability.
+    fn prune_channel_snapshots(
+        &mut self,
+        policy: &crate::RetentionPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::PruneSummary, StorageError>;
+
     /// Constant-size table counts for `/status` and the `status` command.
     /// Backends must compute these without scanning entire tables into memory
     /// (RIEKO-AUDIT-008: no million-row status queries).
@@ -266,6 +276,58 @@ impl Storage for MemoryStorage {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    fn prune_channel_snapshots(
+        &mut self,
+        policy: &crate::RetentionPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::PruneSummary, StorageError> {
+        let before = self.channel_snapshots.len();
+        // Group by channel, newest first, then keep only the rows each rule
+        // preserves. Rows are never replaced by finds; this touches only the
+        // snapshot buffer, never findings/recommendations (RIEKO-AUDIT-016).
+        use std::collections::BTreeMap;
+        let mut by_channel: BTreeMap<String, Vec<&ChannelSnapshot>> = BTreeMap::new();
+        for snap in &self.channel_snapshots {
+            by_channel
+                .entry(snap.channel_id.clone())
+                .or_default()
+                .push(snap);
+        }
+        let mut kept: Vec<ChannelSnapshot> = Vec::with_capacity(before);
+        let to_chrono = |d: std::time::Duration| {
+            chrono::Duration::from_std(d).unwrap_or(chrono::Duration::zero())
+        };
+        let active_cutoff = now - to_chrono(policy.snapshot_max_age);
+        let closed_cutoff = now - to_chrono(policy.closed_channel_max_age);
+        for mut snaps in by_channel.into_values() {
+            snaps.sort_by_key(|b| std::cmp::Reverse(b.ts));
+            if let Some(cap) = policy.max_snapshots_per_channel {
+                snaps.truncate(cap);
+            }
+            for snap in snaps {
+                let cutoff = if snap.status.is_closed() {
+                    closed_cutoff
+                } else {
+                    active_cutoff
+                };
+                if snap.ts >= cutoff {
+                    kept.push(snap.clone());
+                }
+            }
+        }
+        if let Some(total) = policy.max_total_snapshots {
+            // Keep the newest `total` across all channels.
+            kept.sort_by_key(|b| std::cmp::Reverse(b.ts));
+            kept.truncate(total);
+        }
+        let before = self.channel_snapshots.len();
+        self.channel_snapshots = kept;
+        Ok(crate::PruneSummary {
+            deleted_snapshots: before - self.channel_snapshots.len(),
+            complete: true,
+        })
     }
 
     fn save_simulation(&mut self, sim: &Simulation) -> Result<(), StorageError> {
