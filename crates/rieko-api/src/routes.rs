@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -11,16 +12,28 @@ use crate::RiekoApi;
 pub struct Status {
     pub engine: &'static str,
     pub version: &'static str,
+    pub schema_version: i64,
     pub read_only: bool,
+    pub integrity: String,
+    pub overall: String,
+    pub source: Option<String>,
+    pub last_ingestion: Option<OperationTimes>,
+    pub last_cycle: Option<OperationTimes>,
+    pub llm: String,
+    pub alert_sink: String,
     pub counts: StatusCounts,
+}
+
+#[derive(Serialize)]
+pub struct OperationTimes {
+    pub attempt: Option<String>,
+    pub success: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct StatusCounts {
     pub findings: usize,
-    pub findings_by_severity: std::collections::BTreeMap<String, usize>,
     pub recommendations: usize,
-    pub recommendations_by_stage: std::collections::BTreeMap<String, usize>,
     pub simulations: usize,
     pub audit: usize,
     pub channel_snapshots: usize,
@@ -32,39 +45,103 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
         .storage
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-    let findings = storage.latest_findings(1_000_000).map_err(api_err)?;
-    let recommendations = storage.latest_recommendations(1_000_000).map_err(api_err)?;
-    let simulations = storage.recent_simulations(1_000_000).map_err(api_err)?;
-    let audit = storage.recent_audit(1_000_000).map_err(api_err)?;
-    let snapshots = storage.recent_snapshots_all(1_000_000).map_err(api_err)?;
 
-    let mut findings_by_severity = std::collections::BTreeMap::new();
-    for f in &findings {
-        *findings_by_severity
-            .entry(format!("{:?}", f.severity))
-            .or_insert(0) += 1;
-    }
-    let mut recommendations_by_stage = std::collections::BTreeMap::new();
-    for r in &recommendations {
-        *recommendations_by_stage
-            .entry(format!("{:?}", r.action.stage))
-            .or_insert(0) += 1;
-    }
+    let schema_version = storage.schema_version().map_err(api_err)?;
+    let integrity_ok = storage.integrity_check().is_ok();
+    let counts = storage.counts().map_err(api_err)?;
+    let operational = storage.read_operational_state().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            rieko_status::OperationalStateError::to_string(&e),
+        )
+    })?;
+
+    // A non-`future` build has no execution/simulation surface and is therefore
+    // read-only. Capability is derived from the build, never claimed blindly.
+    let read_only = cfg!(not(feature = "future"));
+
+    let (overall, source, last_ingestion, last_cycle, llm, alert_sink) = match operational.as_ref()
+    {
+        Some(state) => {
+            let overall = rieko_status::assess(
+                state,
+                &rieko_status::HealthPolicy::default(),
+                Utc::now(),
+                integrity_ok,
+            );
+            (
+                overall.as_str().to_string(),
+                Some(source_label(state)),
+                Some(OperationTimes {
+                    attempt: state.last_ingestion_attempt.map(|t| t.to_rfc3339()),
+                    success: state.last_ingestion_success.map(|t| t.to_rfc3339()),
+                }),
+                Some(OperationTimes {
+                    attempt: state.last_cycle_attempt.map(|t| t.to_rfc3339()),
+                    success: state.last_cycle_success.map(|t| t.to_rfc3339()),
+                }),
+                state.llm.as_str().to_string(),
+                state.alert_sink.as_str().to_string(),
+            )
+        }
+        None => {
+            let overall = rieko_status::assess(
+                &rieko_status::OperationalState::default(),
+                &rieko_status::HealthPolicy::default(),
+                Utc::now(),
+                integrity_ok,
+            );
+            (
+                overall.as_str().to_string(),
+                None,
+                None,
+                None,
+                "not_configured".into(),
+                "not_configured".into(),
+            )
+        }
+    };
 
     Ok(Json(Status {
         engine: "rieko",
         version: VERSION,
-        read_only: true,
+        schema_version,
+        read_only,
+        integrity: if integrity_ok {
+            "ok".to_string()
+        } else {
+            "failed".to_string()
+        },
+        overall,
+        source,
+        last_ingestion,
+        last_cycle,
+        llm,
+        alert_sink,
         counts: StatusCounts {
-            findings: findings.len(),
-            findings_by_severity,
-            recommendations: recommendations.len(),
-            recommendations_by_stage,
-            simulations: simulations.len(),
-            audit: audit.len(),
-            channel_snapshots: snapshots.len(),
+            findings: counts.findings,
+            recommendations: counts.recommendations,
+            simulations: counts.simulations,
+            audit: counts.audit,
+            channel_snapshots: counts.channel_snapshots,
         },
     }))
+}
+
+fn source_label(state: &rieko_status::OperationalState) -> String {
+    match state.source {
+        rieko_status::SourceState::Fixture => "fixture".to_string(),
+        rieko_status::SourceState::LndRest { connected } => {
+            format!(
+                "lnd-rest ({})",
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+            )
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -1242,6 +1242,7 @@ dependencies = [
  "http-body-util",
  "rieko-domain",
  "rieko-findings",
+ "rieko-status",
  "rieko-storage",
  "serde",
  "serde_json",
@@ -1271,6 +1272,7 @@ dependencies = [
  "rieko-llm",
  "rieko-recommendations",
  "rieko-simulation",
+ "rieko-status",
  "rieko-storage",
  "serde",
  "serde_json",
@@ -1402,6 +1404,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rieko-status"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rieko-storage"
 version = "0.1.0"
 dependencies = [
@@ -1410,6 +1422,7 @@ dependencies = [
  "rieko-alerts",
  "rieko-domain",
  "rieko-findings",
+ "rieko-status",
  "rusqlite",
  "serde",
  "serde_json",

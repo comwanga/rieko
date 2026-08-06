@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -33,6 +33,14 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: V3_AUDIT_TRANSITIONS,
+    },
+    Migration {
+        version: 4,
+        sql: V4_OPERATIONAL_STATE,
+    },
+    Migration {
+        version: 5,
+        sql: V5_RECOMMENDATION_RATIONALE,
     },
 ];
 
@@ -106,6 +114,20 @@ CREATE TABLE IF NOT EXISTS alert_state (
     last_severity  INTEGER,
     last_status    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS operational_state (
+    id                      TEXT PRIMARY KEY,
+    source                  TEXT NOT NULL,
+    source_connected        INTEGER,
+    last_ingestion_attempt  TEXT,
+    last_ingestion_success  TEXT,
+    last_cycle_attempt      TEXT,
+    last_cycle_success      TEXT,
+    last_persist_success    TEXT,
+    source_data_at          TEXT,
+    llm                     TEXT NOT NULL,
+    alert_sink              TEXT NOT NULL
+);
 "#;
 
 /// v2: add traceability and lifecycle metadata to findings. Existed in v1 when
@@ -143,6 +165,33 @@ BEFORE DELETE ON audit
 BEGIN
     SELECT RAISE(ABORT, 'audit rows are append-only');
 END;
+"#;
+
+/// v4: self-observability (RIEKO-AUDIT-008). A small, constant-size record of
+/// operational state (ingestion/cycle attempts, source, LLM and alert-sink
+/// capability) so `/status` reflects real operation without scanning data.
+const V4_OPERATIONAL_STATE: &str = r#"
+CREATE TABLE IF NOT EXISTS operational_state (
+    id                      TEXT PRIMARY KEY,
+    source                  TEXT NOT NULL,
+    source_connected        INTEGER,
+    last_ingestion_attempt  TEXT,
+    last_ingestion_success  TEXT,
+    last_cycle_attempt      TEXT,
+    last_cycle_success      TEXT,
+    last_persist_success    TEXT,
+    source_data_at          TEXT,
+    llm                     TEXT NOT NULL,
+    alert_sink              TEXT NOT NULL
+);
+"#;
+
+/// v5: conservative, evidence-backed recommendations (RIEKO-AUDIT-010). Add
+/// the structured rationale (JSON), so the deterministic reasoning that
+/// justifies each recommendation persists with it. Fresh and upgraded databases
+/// both reach it via this step.
+const V5_RECOMMENDATION_RATIONALE: &str = r#"
+ALTER TABLE recommendations ADD COLUMN rationale TEXT NOT NULL DEFAULT '{}';
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).
@@ -231,6 +280,7 @@ mod tests {
             "channel_snapshots",
             "simulations",
             "alert_state",
+            "operational_state",
         ] {
             assert!(has_table(&conn, table), "missing table {table}");
         }

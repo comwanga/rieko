@@ -10,7 +10,7 @@ use rieko_findings::{
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::storage::StorageError;
+use crate::storage::{StorageCounts, StorageError};
 use crate::Storage;
 
 /// SQLite-backed storage, WAL mode (D6). Synchronous — used by the CLI scan
@@ -55,29 +55,6 @@ impl SqliteStorage {
         };
         crate::migrations::migrate(&mut s.conn)?;
         Ok(s)
-    }
-
-    /// Current persisted schema version for diagnostics.
-    pub fn schema_version(&self) -> Result<i64, StorageError> {
-        crate::migrations::schema_version(&self.conn)
-    }
-
-    /// Run `PRAGMA quick_check` and report database integrity. Returns
-    /// `Ok(())` when the database is intact; otherwise an error naming the
-    /// first problem found. Callers must not claim the database is healthy
-    /// when this fails.
-    pub fn integrity_check(&self) -> Result<(), StorageError> {
-        let result: String = self
-            .conn
-            .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
-        if result.trim() == "ok" {
-            Ok(())
-        } else {
-            Err(StorageError::Corrupt(format!(
-                "database integrity check failed: {result}"
-            )))
-        }
     }
 
     /// Obtain the exclusive advisory writer lock for this database. Only one
@@ -169,6 +146,24 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
+    fn schema_version(&mut self) -> Result<i64, StorageError> {
+        crate::migrations::schema_version(&self.conn)
+    }
+
+    fn integrity_check(&mut self) -> Result<(), StorageError> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| StorageError::Backend(format!("running integrity check: {e}")))?;
+        if result.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(StorageError::Corrupt(format!(
+                "database integrity check failed: {result}"
+            )))
+        }
+    }
+
     fn begin_transaction(&mut self) -> Result<(), StorageError> {
         if self.in_transaction {
             return Err(StorageError::Backend("nested transaction attempted".into()));
@@ -266,10 +261,12 @@ impl Storage for SqliteStorage {
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError> {
         let params_json = serde_json::to_string(&rec.action.params)
             .map_err(|e| StorageError::Corrupt(format!("recommendation params: {e}")))?;
+        let rationale_json = serde_json::to_string(&rec.rationale)
+            .map_err(|e| StorageError::Corrupt(format!("recommendation rationale: {e}")))?;
         self.conn.execute(
             "INSERT OR REPLACE INTO recommendations
-             (finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 rec.finding_id,
                 rec.action.id,
@@ -278,6 +275,7 @@ impl Storage for SqliteStorage {
                 rec.action.target,
                 params_json,
                 rec.action.summary,
+                rationale_json,
                 rec.action.created_at.to_rfc3339(),
                 rec.action.updated_at.to_rfc3339()
             ],
@@ -287,7 +285,7 @@ impl Storage for SqliteStorage {
 
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], |row| {
@@ -308,6 +306,7 @@ impl Storage for SqliteStorage {
             };
             let params: Value =
                 serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+            let rationale = parse_rationale(&row.get::<_, String>(7)?);
             Ok(Recommendation {
                 finding_id: row.get(0)?,
                 action: Action {
@@ -317,9 +316,10 @@ impl Storage for SqliteStorage {
                     target: row.get::<_, Option<String>>(4)?,
                     params,
                     summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(7)?),
-                    updated_at: parse_ts(&row.get::<_, String>(8)?),
+                    created_at: parse_ts(&row.get::<_, String>(8)?),
+                    updated_at: parse_ts(&row.get::<_, String>(9)?),
                 },
+                rationale,
             })
         })?;
         let mut out = Vec::new();
@@ -334,7 +334,7 @@ impl Storage for SqliteStorage {
         action_id: &str,
     ) -> Result<Option<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations WHERE action_id = ?1",
         )?;
         let mut rows = stmt.query_map([action_id], |row| {
@@ -355,6 +355,7 @@ impl Storage for SqliteStorage {
             };
             let params: Value =
                 serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+            let rationale = parse_rationale(&row.get::<_, String>(7)?);
             Ok(Recommendation {
                 finding_id: row.get(0)?,
                 action: Action {
@@ -364,9 +365,10 @@ impl Storage for SqliteStorage {
                     target: row.get::<_, Option<String>>(4)?,
                     params,
                     summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(7)?),
-                    updated_at: parse_ts(&row.get::<_, String>(8)?),
+                    created_at: parse_ts(&row.get::<_, String>(8)?),
+                    updated_at: parse_ts(&row.get::<_, String>(9)?),
                 },
+                rationale,
             })
         })?;
         rows.next().transpose().map_err(Into::into)
@@ -573,6 +575,22 @@ impl Storage for SqliteStorage {
         }
         Ok(out)
     }
+
+    fn counts(&mut self) -> Result<StorageCounts, StorageError> {
+        let count = |table: &str| -> Result<usize, StorageError> {
+            let n: i64 =
+                self.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            Ok(n as usize)
+        };
+        Ok(StorageCounts {
+            findings: count("findings")?,
+            recommendations: count("recommendations")?,
+            simulations: count("simulations")?,
+            audit: count("audit")?,
+            channel_snapshots: count("channel_snapshots")?,
+        })
+    }
 }
 
 impl SqliteStorage {
@@ -754,6 +772,136 @@ impl AlertStateStore for SqliteStorage {
     }
 }
 
+impl rieko_status::OperationalStateStore for SqliteStorage {
+    fn read_operational_state(
+        &self,
+    ) -> Result<Option<rieko_status::OperationalState>, rieko_status::OperationalStateError> {
+        use rieko_status::OperationalStateError;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source, source_connected, last_ingestion_attempt,
+                        last_ingestion_success, last_cycle_attempt, last_cycle_success,
+                        last_persist_success, source_data_at, llm, alert_sink
+                 FROM operational_state WHERE id = 'current'",
+            )
+            .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (
+            source,
+            connected,
+            ingest_attempt,
+            ingest_success,
+            cycle_attempt,
+            cycle_success,
+            persist_success,
+            data_at,
+            llm,
+            alert,
+        ) = row.map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        Ok(Some(rieko_status::OperationalState {
+            source: parse_source(&source, connected),
+            last_ingestion_attempt: ingest_attempt.map(|s| parse_ts(&s)),
+            last_ingestion_success: ingest_success.map(|s| parse_ts(&s)),
+            last_cycle_attempt: cycle_attempt.map(|s| parse_ts(&s)),
+            last_cycle_success: cycle_success.map(|s| parse_ts(&s)),
+            last_persist_success: persist_success.map(|s| parse_ts(&s)),
+            source_data_at: data_at.map(|s| parse_ts(&s)),
+            llm: parse_component(&llm),
+            alert_sink: parse_component(&alert),
+        }))
+    }
+
+    fn write_operational_state(
+        &mut self,
+        state: &rieko_status::OperationalState,
+    ) -> Result<(), rieko_status::OperationalStateError> {
+        use rieko_status::OperationalStateError;
+        let connected = match state.source {
+            rieko_status::SourceState::Fixture => None,
+            rieko_status::SourceState::LndRest { connected } => Some(connected as i64),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO operational_state
+                    (id, source, source_connected, last_ingestion_attempt, last_ingestion_success,
+                     last_cycle_attempt, last_cycle_success, last_persist_success, source_data_at,
+                     llm, alert_sink)
+                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    source = excluded.source,
+                    source_connected = excluded.source_connected,
+                    last_ingestion_attempt = excluded.last_ingestion_attempt,
+                    last_ingestion_success = excluded.last_ingestion_success,
+                    last_cycle_attempt = excluded.last_cycle_attempt,
+                    last_cycle_success = excluded.last_cycle_success,
+                    last_persist_success = excluded.last_persist_success,
+                    source_data_at = excluded.source_data_at,
+                    llm = excluded.llm,
+                    alert_sink = excluded.alert_sink",
+                params![
+                    state.source.as_str(),
+                    connected,
+                    state.last_ingestion_attempt.map(|t| t.to_rfc3339()),
+                    state.last_ingestion_success.map(|t| t.to_rfc3339()),
+                    state.last_cycle_attempt.map(|t| t.to_rfc3339()),
+                    state.last_cycle_success.map(|t| t.to_rfc3339()),
+                    state.last_persist_success.map(|t| t.to_rfc3339()),
+                    state.source_data_at.map(|t| t.to_rfc3339()),
+                    component_str(state.llm),
+                    component_str(state.alert_sink),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| OperationalStateError::Store(e.to_string()))
+    }
+}
+
+fn parse_source(s: &str, connected: Option<i64>) -> rieko_status::SourceState {
+    use rieko_status::SourceState;
+    match s {
+        "lnd_rest" => SourceState::LndRest {
+            connected: connected == Some(1),
+        },
+        _ => SourceState::Fixture,
+    }
+}
+
+fn parse_component(s: &str) -> rieko_status::ComponentState {
+    use rieko_status::ComponentState;
+    match s {
+        "healthy" => ComponentState::Healthy,
+        "failing" => ComponentState::Failing,
+        _ => ComponentState::NotConfigured,
+    }
+}
+
+fn component_str(s: rieko_status::ComponentState) -> &'static str {
+    s.as_str()
+}
+
+fn parse_rationale(s: &str) -> rieko_findings::Rationale {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
 fn severity_from_int(v: i64) -> Option<rieko_findings::Severity> {
     match v {
         0 => Some(rieko_findings::Severity::Info),
@@ -793,7 +941,15 @@ fn lifecycle_str(s: FindingLifecycle) -> &'static str {
 mod tests {
     use super::*;
     use crate::MemoryStorage;
-    use rieko_findings::{Action, ActionStage, ActionType, Evidence, Severity};
+    use rieko_findings::{Action, ActionStage, ActionType, Evidence, Rationale, Severity};
+
+    fn test_rec(finding_id: &str, action: Action) -> Recommendation {
+        Recommendation {
+            finding_id: finding_id.into(),
+            action,
+            rationale: Rationale::default(),
+        }
+    }
 
     fn sample_finding() -> Finding {
         let now = Utc::now();
@@ -819,15 +975,25 @@ mod tests {
         let mut s = SqliteStorage::in_memory().unwrap();
         s.save_finding(&sample_finding()).unwrap();
 
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: Action::new(
+        let rec = test_rec(
+            "f1",
+            Action::new(
                 ActionType::RebalanceChannel,
                 ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({"desired_ratio": 0.5}),
                 "Rebalance channel c1 to 50/50",
             ),
+        );
+        // A non-default rationale must survive the SQLite roundtrip (WP3.2).
+        let mut rec = rec;
+        rec.rationale = Rationale {
+            evidence: vec!["local_ratio=0.1".into()],
+            preconditions: vec!["confirm intent".into()],
+            expected_effect: "informed decision".into(),
+            risks: vec!["fees".into()],
+            limitations: vec!["single snapshot".into()],
+            actionability: rieko_findings::Actionability::OperatorActionable,
         };
         s.save_recommendation(&rec).unwrap();
 
@@ -848,6 +1014,10 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].action.action_type, ActionType::RebalanceChannel);
         assert_eq!(recs[0].action.stage, ActionStage::Recommended);
+        assert_eq!(
+            recs[0].rationale, rec.rationale,
+            "rationale must survive the roundtrip"
+        );
 
         let audit_rows = s.recent_audit(10).unwrap();
         assert_eq!(audit_rows.len(), 1);
@@ -862,16 +1032,16 @@ mod tests {
     fn action_stage_can_be_fetched_and_transitioned() {
         use rieko_findings::{Action, ActionStage, ActionType};
         let mut s = SqliteStorage::in_memory().unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: Action::new(
+        let rec = test_rec(
+            "f1",
+            Action::new(
                 ActionType::RebalanceChannel,
                 ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({"desired_ratio": 0.5}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
 
         let fetched = s
@@ -928,6 +1098,43 @@ mod tests {
         assert_eq!(s.latest_findings(10).unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c1").unwrap().len(), 1);
         assert_eq!(s.findings_for_channel("c2").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn operational_state_roundtrips_in_sqlite_and_memory() {
+        use rieko_status::OperationalStateStore as _;
+
+        let state = rieko_status::OperationalState {
+            source: rieko_status::SourceState::LndRest { connected: true },
+            last_ingestion_attempt: Some(Utc::now()),
+            last_ingestion_success: Some(Utc::now()),
+            last_cycle_attempt: Some(Utc::now()),
+            last_cycle_success: Some(Utc::now()),
+            last_persist_success: Some(Utc::now()),
+            source_data_at: Some(Utc::now()),
+            llm: rieko_status::ComponentState::Healthy,
+            alert_sink: rieko_status::ComponentState::Failing,
+        };
+
+        let mut sqlite = SqliteStorage::in_memory().unwrap();
+        assert!(sqlite.read_operational_state().unwrap().is_none());
+        sqlite.write_operational_state(&state).unwrap();
+        let read = sqlite.read_operational_state().unwrap().unwrap();
+        assert_eq!(read, state);
+        sqlite
+            .write_operational_state(&rieko_status::OperationalState {
+                llm: rieko_status::ComponentState::NotConfigured,
+                ..state.clone()
+            })
+            .unwrap();
+        // Upsert keeps a single row.
+        let again = sqlite.read_operational_state().unwrap().unwrap();
+        assert_eq!(again.llm, rieko_status::ComponentState::NotConfigured);
+
+        let mut mem = MemoryStorage::new();
+        assert!(mem.read_operational_state().unwrap().is_none());
+        mem.write_operational_state(&state).unwrap();
+        assert_eq!(mem.read_operational_state().unwrap().unwrap(), state);
     }
 
     #[test]
@@ -1032,16 +1239,16 @@ mod tests {
         let db = dir.path().join("tx.db");
         let mut w = SqliteStorage::open(&db).unwrap();
         let f = sample_finding();
-        let rec = Recommendation {
-            finding_id: f.id.clone(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            &f.id,
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 f.channel.clone(),
                 serde_json::json!({}),
                 "rebalance",
             ),
-        };
+        );
         let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
 
         w.begin_transaction().unwrap();
@@ -1068,16 +1275,16 @@ mod tests {
     fn rollback_leaves_no_half_written_state() {
         let mut s = SqliteStorage::in_memory().unwrap();
         let f = sample_finding();
-        let rec = Recommendation {
-            finding_id: f.id.clone(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            &f.id,
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 f.channel.clone(),
                 serde_json::json!({}),
                 "rebalance",
             ),
-        };
+        );
 
         // Simulate the cycle failing partway through: some writes succeed,
         // then an error aborts before commit.
@@ -1151,7 +1358,7 @@ mod tests {
         // Either the open itself reports the corruption, or integrity_check does;
         // in no case may it silently claim a healthy database.
         let refuses_health = match reopened {
-            Ok(s) => s.integrity_check().is_err(),
+            Ok(mut s) => s.integrity_check().is_err(),
             Err(_) => true,
         };
         assert!(
@@ -1331,6 +1538,11 @@ mod tests {
                     id TEXT PRIMARY KEY, action_id TEXT NOT NULL, action_type TEXT NOT NULL,
                     stage TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL, ts TEXT NOT NULL
                  );
+                 CREATE TABLE recommendations (
+                    finding_id TEXT NOT NULL, action_id TEXT PRIMARY KEY, action_type TEXT NOT NULL,
+                    stage TEXT NOT NULL, target TEXT, params TEXT NOT NULL, summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                 );
                  INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
                  VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
                          '2021-05-01T00:00:00Z');",
@@ -1354,16 +1566,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("atomic-audit.db");
         let mut s = SqliteStorage::open(&db).unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
         let action_id = rec.action.id.clone();
 
@@ -1424,16 +1636,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rollback-audit.db");
         let mut s = SqliteStorage::open(&db).unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
         let action_id = rec.action.id.clone();
 
@@ -1465,16 +1677,16 @@ mod tests {
         // RIEKO-AUDIT-007: the audit table denies normal UPDATE and DELETE via
         // triggers; the application API is the only writer.
         let mut s = SqliteStorage::in_memory().unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.append_audit(&AuditEntry::from_action(
             &rec.action,
             "system",

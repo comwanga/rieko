@@ -71,9 +71,20 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         node: args.node.clone(),
     };
 
-    let llm: Box<dyn LlmClient> = OpenAiCompatibleClient::from_env()
-        .map(|c| Box::new(c) as Box<dyn LlmClient>)
-        .unwrap_or_else(|| Box::new(NullClient));
+    let (llm, llm_configured): (Box<dyn LlmClient>, bool) = match OpenAiCompatibleClient::from_env()
+    {
+        Some(c) => (Box::new(c) as Box<dyn LlmClient>, true),
+        None => (Box::new(NullClient), false),
+    };
+    super::common::record_component(
+        &mut storage,
+        super::common::ComponentKind::Llm,
+        if llm_configured {
+            rieko_status::ComponentState::Healthy
+        } else {
+            rieko_status::ComponentState::NotConfigured
+        },
+    )?;
     let engine = rieko_recommendations::RecommendationEngine;
 
     let mut alert_sink = if TelegramSink::is_configured() {
@@ -87,6 +98,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                     Box::new(SqliteStorage::open(&db_path).with_context(|| {
                         format!("opening alert-state db {}", db_path.display())
                     })?);
+                super::common::record_component(
+                    &mut storage,
+                    super::common::ComponentKind::AlertSink,
+                    rieko_status::ComponentState::Healthy,
+                )?;
                 Some(PersistentDedupingSink::new(
                     sink,
                     store,
@@ -94,11 +110,21 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 ))
             }
             Err(e) => {
+                super::common::record_component(
+                    &mut storage,
+                    super::common::ComponentKind::AlertSink,
+                    rieko_status::ComponentState::Failing,
+                )?;
                 warn!("telegram configured but unusable: {e}");
                 None
             }
         }
     } else {
+        super::common::record_component(
+            &mut storage,
+            super::common::ComponentKind::AlertSink,
+            rieko_status::ComponentState::NotConfigured,
+        )?;
         None
     };
 
@@ -116,6 +142,9 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
         let graph = source.build()?;
         let (n_nodes, n_channels) = graph.len();
+
+        // Ingestion reached this point, so the source is reachable and current.
+        super::common::record_source_ingestion(&mut storage, &source)?;
 
         // Record this cycle's channel states, both in-memory (for detectors)
         // and durably (for the API and future trend queries).
