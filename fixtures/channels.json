@@ -1,49 +1,54 @@
 {
   "channels": [
     {
-      "chan_point": "aaa111bbb222ccc333:0",
+      "channel_point": "aaa111bbb222ccc333:0",
       "remote_pubkey": "030000000000000000000000000000000000000000000000000000000000000001",
-      "capacity": 1000000,
-      "local_balance": 500000,
-      "remote_balance": 500000,
-      "commit_fee": 1000,
-      "chan_status_flags": "0"
+      "capacity": "1000000",
+      "local_balance": "500000",
+      "remote_balance": "500000",
+      "commit_fee": "1000",
+      "chan_status_flags": "ChanStatusDefault",
+      "chan_id": "1"
     },
     {
-      "chan_point": "ddd444eee555fff666:1",
+      "channel_point": "ddd444eee555fff666:1",
       "remote_pubkey": "030000000000000000000000000000000000000000000000000000000000000002",
-      "capacity": 2000000,
-      "local_balance": 160000,
-      "remote_balance": 1840000,
-      "commit_fee": 2000,
-      "chan_status_flags": "0"
+      "capacity": "2000000",
+      "local_balance": "160000",
+      "remote_balance": "1840000",
+      "commit_fee": "2000",
+      "chan_status_flags": "ChanStatusDefault",
+      "chan_id": "2"
     },
     {
-      "chan_point": "777888999aaabbbccc:0",
+      "channel_point": "777888999aaabbbccc:0",
       "remote_pubkey": "030000000000000000000000000000000000000000000000000000000000000003",
-      "capacity": 5000000,
-      "local_balance": 50000,
-      "remote_balance": 4950000,
-      "commit_fee": 3000,
-      "chan_status_flags": "0"
+      "capacity": "5000000",
+      "local_balance": "50000",
+      "remote_balance": "4950000",
+      "commit_fee": "3000",
+      "chan_status_flags": "ChanStatusDefault",
+      "chan_id": "3"
     },
     {
-      "chan_point": "111222333444555666:1",
+      "channel_point": "111222333444555666:1",
       "remote_pubkey": "030000000000000000000000000000000000000000000000000000000000000004",
-      "capacity": 3000000,
-      "local_balance": 2850000,
-      "remote_balance": 150000,
-      "commit_fee": 2000,
-      "chan_status_flags": "0"
+      "capacity": "3000000",
+      "local_balance": "2850000",
+      "remote_balance": "150000",
+      "commit_fee": "2000",
+      "chan_status_flags": "ChanStatusDefault",
+      "chan_id": "4"
     },
     {
-      "chan_point": "999000111222333444:0",
+      "channel_point": "999000111222333444:0",
       "remote_pubkey": "030000000000000000000000000000000000000000000000000000000000000005",
-      "capacity": 1000000,
-      "local_balance": 400000,
-      "remote_balance": 600000,
-      "commit_fee": 1000,
-      "chan_status_flags": "2"
+      "capacity": "1000000",
+      "local_balance": "400000",
+      "remote_balance": "600000",
+      "commit_fee": "1000",
+      "chan_status_flags": "ChanStatusBorked",
+      "chan_id": "5"
     }
   ]
 }

@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rieko_domain::NodeId;
 use rieko_findings::{AuditEntry, Finding, Recommendation};
 use rieko_graph::{GraphStore, InMemoryGraph};
-use rieko_ingest_lnd::{LndChannelResponse, LndClient, Normalizer};
+use rieko_ingest_lnd::{LndChannelResponse, LndClient, Normalizer, ShortChanResolver};
 use rieko_llm::{ExplainRequest, LlmClient};
 use rieko_recommendations::RecommendationEngine;
 use rieko_storage::Storage;
@@ -40,15 +40,25 @@ impl GraphSource {
                 .transpose()
                 .context("reading TLS certificate")?;
             let client = LndClient::new(rest, macaroon, tls_cert).context("building LND client")?;
-            let channels = client
-                .channels(&local)
+            let raw = client
+                .raw_channels()
                 .context("fetching channels from LND")?;
+            let channels = raw
+                .iter()
+                .map(|c| {
+                    Normalizer::channel(c, &local, chrono::Utc::now()).map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .context("normalizing channels from LND")?;
             graph
                 .upsert_channels(channels)
                 .context("loading channels into graph")?;
 
             // Best-effort: routing history sharpens later volume detectors.
-            match client.forwards(100) {
+            // Short channel ids are resolved to channel points where a channel
+            // is known; unresolvable ids are preserved explicitly.
+            let resolver = ShortChanResolver::from_channels(&raw);
+            match client.forwards(&resolver) {
                 Ok(forwards) => {
                     for f in forwards {
                         graph.record_forward(f);

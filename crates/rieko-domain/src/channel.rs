@@ -14,6 +14,10 @@ pub enum ChannelStatus {
     PendingOpen,
     WaitingClose,
     ForceClosing,
+    /// The source reported a state or flag combination we do not understand, or
+    /// the state data was malformed. Deliberately distinct from `Active`:
+    /// unknown data is never assumed healthy (RIEKO-AUDIT-021).
+    Unknown,
 }
 
 impl ChannelStatus {

@@ -3,8 +3,8 @@ use std::time::Duration;
 use rieko_domain::{Channel, NodeId};
 use thiserror::Error;
 
-use crate::model::{LndChannelResponse, LndForwardResponse};
-use crate::Normalizer;
+use crate::model::{LndChannel, LndChannelResponse, LndForwardResponse};
+use crate::{Normalizer, ShortChanResolver};
 
 #[derive(Debug, Error)]
 pub enum LndClientError {
@@ -89,26 +89,32 @@ impl LndClient {
     }
 
     pub fn channels(&self, local_node: &NodeId) -> Result<Vec<Channel>, LndClientError> {
-        let body = self.get("/v1/channels")?;
-        let parsed: LndChannelResponse = serde_json::from_str(&body)?;
         let now = chrono::Utc::now();
-        parsed
-            .channels
+        self.raw_channels()?
             .iter()
             .map(|c| Ok(Normalizer::channel(c, local_node, now)?))
             .collect()
     }
 
+    /// Fetch the raw LND channel list, before normalization. Callers that need
+    /// to correlate short channel ids to channel points (e.g. forwarding
+    /// events) use this to build a [`ShortChanResolver`].
+    pub fn raw_channels(&self) -> Result<Vec<LndChannel>, LndClientError> {
+        let body = self.get("/v1/channels")?;
+        let parsed: LndChannelResponse = serde_json::from_str(&body)?;
+        Ok(parsed.channels)
+    }
+
     pub fn forwards(
         &self,
-        _limit: usize,
+        resolver: &ShortChanResolver,
     ) -> Result<Vec<rieko_domain::ForwardEvent>, LndClientError> {
         let body = self.get("/v1/forwarding/events?num_max_events=100")?;
         let parsed: LndForwardResponse = serde_json::from_str(&body)?;
         Ok(parsed
             .forwarding_events
             .iter()
-            .map(Normalizer::forward)
+            .map(|f| Normalizer::forward(f, resolver))
             .collect())
     }
 }
