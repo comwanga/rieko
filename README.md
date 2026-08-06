@@ -174,6 +174,93 @@ single writer.
 * `rieko status` runs a database integrity check and refuses to report the
   database as healthy when that check fails.
 
+## First-time mainnet validation
+
+Mainnet observation must not be enabled until every step in this checklist
+passes (Phase 6.2 / controlled local observation validation).
+
+### Prerequisites
+
+- [ ] All CI gates are green (`cargo test --workspace --all-features`).
+- [ ] Regtest integration tests pass (see `regtest/README.md`).
+- [ ] The release binary is built and verified (Release workflow completes).
+
+### Validation procedure
+
+1. **Create a restricted read-only macaroon**
+   ```sh
+   lncli bakemacaroon --save_to read-only.macaroon \
+     uri:/lnrpc.Lightning/Channels uri:/lnrpc.Lightning/ForwardingHistory
+   ```
+   Do **not** use `admin.macaroon`. The macaroon must grant exactly the two
+   permissions above.
+
+2. **Start with a fresh, backed-up database**
+   ```sh
+   cp ~/.rieko/rieko.db ~/.rieko/backup.db   # if one exists
+   rm ~/.rieko/rieko.db                       # start clean
+   ```
+
+3. **Run ONE observation cycle with no extras**
+   ```sh
+   # No LLM, no Telegram, loopback only.
+   ./rieko scan \
+     --lnd-rest https://localhost:8080 \
+     --tls-cert ~/.lnd/tls.cert \
+     --macaroon read-only.macaroon \
+     --node <your-node-pubkey>
+   ```
+
+4. **Verify findings against LND UI**
+   ```sh
+   ./rieko status --db ~/.rieko/rieko.db
+   # Cross-check findings, channel states, and recommendations against
+   # what `lncli listchannels` and `lncli fwdinghistory` show.
+   ```
+
+5. **Replay — verify zero duplicates**
+   ```sh
+   ./rieko scan \
+     --lnd-rest https://localhost:8080 \
+     --tls-cert ~/.lnd/tls.cert \
+     --macaroon read-only.macaroon \
+     --node <your-node-pubkey>
+   # Findings, recommendations, and audit entry counts must be unchanged.
+   ```
+
+6. **Restart and verify state survives**
+   ```sh
+   ./rieko status --db ~/.rieko/rieko.db
+   # All findings, recommendations, and audit entries must still be present.
+   # Alert cooldown state must be intact.
+   ```
+
+7. **Enable Telegram only after core observation works**
+   ```sh
+   export RIEKO_TELEGRAM_TOKEN=...
+   export RIEKO_TELEGRAM_CHAT_ID=...
+   ./rieko monitor \
+     --lnd-rest https://localhost:8080 \
+     --tls-cert ~/.lnd/tls.cert \
+     --macaroon read-only.macaroon \
+     --node <your-node-pubkey> \
+     --interval 300
+   # Let it run for at least one full cycle. Verify alerts arrive.
+   ```
+
+8. **Enable LLM only after confirming data-sharing implications**
+   ```sh
+   export RIEKO_LLM_ENDPOINT=https://api.openai.com/v1/chat/completions
+   export RIEKO_LLM_API_KEY=sk-...
+   export RIEKO_LLM_MODEL=gpt-4o-mini
+   # Re-run monitor or scan. Confirm explanations appear.
+   # Understand that structured evidence is sent to the LLM endpoint.
+   ```
+
+Only after all 8 steps pass should Rieko be connected to mainnet. Rieko
+remains local, read-only, and observes only — it does not send transactions,
+update fees, or rebalance channels.
+
 ## License
 
 Apache-2.0
