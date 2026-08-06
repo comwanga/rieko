@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -21,10 +21,16 @@ pub struct Migration {
 /// The ordered migration history. Steps must appear in ascending `version`
 /// order. Do not edit or reorder past steps: a step only runs once and its
 /// effect is sticky in upgraded databases.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: V1_SCHEMA,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: V1_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        sql: V2_FINDING_METADATA,
+    },
+];
 
 const V1_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS findings (
@@ -98,6 +104,21 @@ CREATE TABLE IF NOT EXISTS alert_state (
 );
 "#;
 
+/// v2: add traceability and lifecycle metadata to findings. Existed in v1 when
+/// `first_seen`/`last_seen` were stored, and later replaced with the pair
+/// `first_seen_at`/`last_seen_at` plus detector + schema versions. New
+/// databases get the full columns via `V1_SCHEMA` above; this migration adds
+/// them to databases created on the older schema.
+const V2_FINDING_METADATA: &str = r#"
+ALTER TABLE findings ADD COLUMN last_seen_at TEXT;
+ALTER TABLE findings ADD COLUMN first_seen_at TEXT;
+ALTER TABLE findings ADD COLUMN detector_version TEXT NOT NULL DEFAULT '1';
+ALTER TABLE findings ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE findings ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
+UPDATE findings SET last_seen_at = COALESCE(last_seen_at, last_seen, ts) WHERE last_seen_at IS NULL;
+UPDATE findings SET first_seen_at = COALESCE(first_seen_at, ts) WHERE first_seen_at IS NULL;
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -118,32 +139,42 @@ pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
 /// Each step runs in its own transaction, so a failing step rolls back fully
 /// and `user_version` cannot advance past it.
 pub fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
+    // Fast path: an already current database needs no migration, so a reader
+    // opg a database concurrent with a live writer must not take a write lock.
     let current = schema_version(conn)?;
+    if current == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // A database newer than this binary is always rejected, without needing a
+    // lock: an older binary must not write to a schema it doesn't understand.
     if current > CURRENT_SCHEMA_VERSION {
         return Err(StorageError::Unsupported(format!(
             "database schema version {current} is newer than the supported \
              version {CURRENT_SCHEMA_VERSION}; upgrade rieo before opening it"
         )));
     }
-
+    // Migrations pending. Take an immediate write lock and re-read the version
+    // inside the transaction: two connections racing to open a fresh database
+    // would otherwise both run the same non-idempotent steps.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| StorageError::Backend(format!("starting migration: {e}")))?;
+    let current = schema_version(&tx)?;
     for step in MIGRATIONS.iter().filter(|s| s.version > current) {
-        apply(conn, step)?;
+        apply(&tx, step)?;
     }
-    Ok(())
+    tx.commit()
+        .map_err(|e| StorageError::Backend(format!("committing migration: {e}")))
+        .map(|_| ())
 }
 
-fn apply(conn: &mut Connection, step: &Migration) -> Result<(), StorageError> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| StorageError::Backend(format!("starting migration: {e}")))?;
+fn apply(tx: &rusqlite::Transaction, step: &Migration) -> Result<(), StorageError> {
     tx.execute_batch(step.sql).map_err(|e| {
         StorageError::Backend(format!("migration to v{} failed: {e}", step.version))
     })?;
     tx.pragma_update(None, "user_version", step.version)
         .map_err(|e| StorageError::Backend(format!("recording schema version: {e}")))?;
-    tx.commit()
-        .map_err(|e| StorageError::Backend(format!("committing migration: {e}")))
-        .map(|_| ())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -235,13 +266,19 @@ mod tests {
     fn failing_migration_rolls_back_and_does_not_advance_version() {
         let mut conn = bare_conn();
         assert_eq!(schema_version(&conn).unwrap(), 0);
-        // One valid statement followed by a deliberate syntax error.
+        // A syntax error inside one step must roll back the whole transaction
+        // and leave the schema version untouched.
+        use rusqlite::TransactionBehavior;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         let step = Migration {
             version: 99,
             sql: "CREATE TABLE ok (id INT); CREATE TABLE broken (",
         };
-        let err = apply(&mut conn, &step).unwrap_err();
+        let err = apply(&tx, &step).unwrap_err();
         assert!(matches!(err, StorageError::Backend(_)));
+        drop(tx);
         // The valid statement was rolled back with the failed transaction.
         assert!(!has_table(&conn, "ok"));
         assert_eq!(schema_version(&conn).unwrap(), 0);

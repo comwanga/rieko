@@ -3,7 +3,10 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
+use rieko_findings::{
+    ActionStage, AuditEntry, Finding, FindingLifecycle, Recommendation, Simulation,
+    FINDING_SCHEMA_VERSION,
+};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
@@ -93,20 +96,74 @@ impl SqliteStorage {
             _ => Severity::Critical,
         };
         let evidence_json: String = row.get(5)?;
-        let evidence: Vec<rieko_findings::Evidence> =
-            serde_json::from_str(&evidence_json).unwrap_or_default();
+        // Strict decode: malformed persisted evidence is corrupt data, never a
+        // silent empty list (RIEKO-AUDIT-012).
+        let evidence: Vec<rieko_findings::Evidence> = serde_json::from_str(&evidence_json)
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    e.to_string().into(),
+                )
+            })?;
         let ts: String = row.get(7)?;
+        // Strict decode: an invalid persisted timestamp must not silently be
+        // replaced with the current time.
+        let timestamp = DateTime::parse_from_rfc3339(&ts)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    format!("invalid timestamp {:?}: {e}", ts).into(),
+                )
+            })?;
+        let detector_version: String = row
+            .get::<_, Option<String>>(8)?
+            .unwrap_or_else(|| "1".to_string());
+        let _schema_version: u8 = row
+            .get::<_, Option<i64>>(9)?
+            .map(|v| v.clamp(0, u8::MAX as i64) as u8)
+            .unwrap_or(FINDING_SCHEMA_VERSION);
+        let first_string: String = row.get(10)?;
+        let first_seen_at = DateTime::parse_from_rfc3339(&first_string)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    format!("invalid first_seen_at {:?}: {e}", first_string).into(),
+                )
+            })?;
+        let last_string: String = row.get(11)?;
+        let last_seen_at = DateTime::parse_from_rfc3339(&last_string)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    format!("invalid last_seen_at {:?}: {e}", last_string).into(),
+                )
+            })?;
+        let lifecycle: String = row.get(12)?;
+        let lifecycle = match lifecycle.as_str() {
+            "resolved" => FindingLifecycle::Resolved,
+            _ => FindingLifecycle::Active,
+        };
         Ok(Finding {
             id: row.get(0)?,
             detector: row.get(1)?,
+            detector_version,
+            schema_version: FINDING_SCHEMA_VERSION,
             severity,
             node: row.get::<_, Option<String>>(3)?,
             channel: row.get::<_, Option<String>>(4)?,
             evidence,
             explanation: row.get::<_, Option<String>>(6)?,
-            timestamp: DateTime::parse_from_rfc3339(&ts)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            timestamp,
+            first_seen_at,
+            last_seen_at,
+            lifecycle,
         })
     }
 }
@@ -150,22 +207,29 @@ impl Storage for SqliteStorage {
         let evidence = serde_json::to_string(&finding.evidence)
             .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
         self.conn.execute(
-            "INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, explanation, ts, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
+                    evidence, explanation, ts, first_seen_at, last_seen_at, lifecycle)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
+                detector_version = excluded.detector_version,
                 explanation = COALESCE(excluded.explanation, findings.explanation),
+                first_seen_at = COALESCE(findings.first_seen_at, excluded.first_seen_at),
                 ts = excluded.ts,
-                last_seen = excluded.last_seen",
+                last_seen_at = excluded.last_seen_at,
+                lifecycle = excluded.lifecycle",
             params![
                 finding.id,
                 finding.detector,
+                finding.detector_version,
                 severity,
                 finding.node,
                 finding.channel,
                 evidence,
                 finding.explanation,
                 finding.timestamp.to_rfc3339(),
-                finding.timestamp.to_rfc3339()
+                finding.first_seen_at.to_rfc3339(),
+                finding.last_seen_at.to_rfc3339(),
+                lifecycle_str(finding.lifecycle),
             ],
         )?;
         Ok(())
@@ -173,7 +237,8 @@ impl Storage for SqliteStorage {
 
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts
+            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
              FROM findings ORDER BY ts DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_finding)?;
@@ -186,7 +251,8 @@ impl Storage for SqliteStorage {
 
     fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts
+            "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
              FROM findings WHERE channel_id = ? ORDER BY ts DESC",
         )?;
         let rows = stmt.query_map([channel_id], Self::row_to_finding)?;
@@ -701,6 +767,13 @@ fn status_str(s: rieko_alerts::DeliveryStatus) -> &'static str {
     }
 }
 
+fn lifecycle_str(s: FindingLifecycle) -> &'static str {
+    match s {
+        FindingLifecycle::Active => "active",
+        FindingLifecycle::Resolved => "resolved",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,15 +781,21 @@ mod tests {
     use rieko_findings::{Action, ActionStage, ActionType, Evidence, Severity};
 
     fn sample_finding() -> Finding {
+        let now = Utc::now();
         Finding {
             id: "f1".into(),
             detector: "channel_liquidity".into(),
+            detector_version: "1".into(),
+            schema_version: FINDING_SCHEMA_VERSION,
             severity: Severity::Critical,
             node: Some("local-node".into()),
             channel: Some("c1".into()),
             evidence: vec![Evidence::number("local_ratio", 0.02)],
             explanation: None,
-            timestamp: Utc::now(),
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: FindingLifecycle::Active,
         }
     }
 
@@ -744,6 +823,11 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "f1");
         assert_eq!(findings[0].severity, Severity::Critical);
+        // Lifecycle metadata survives the roundtrip (WP2.3).
+        assert_eq!(findings[0].detector_version, "1");
+        assert_eq!(findings[0].schema_version, FINDING_SCHEMA_VERSION);
+        assert_eq!(findings[0].lifecycle, FindingLifecycle::Active);
+        assert_eq!(findings[0].first_seen_at, findings[0].last_seen_at);
 
         let recs = s.latest_recommendations(10).unwrap();
         assert_eq!(recs.len(), 1);
@@ -1111,5 +1195,132 @@ mod tests {
 
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn active_finding_updates_last_seen_and_preserves_first_seen() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let mut f = sample_finding();
+        f.lifecycle = FindingLifecycle::Active;
+
+        s.save_finding(&f).unwrap();
+        // Recurrence of the same condition: a later observation.
+        let later = f.last_seen_at + chrono::Duration::seconds(60);
+        let mut updated = f.clone();
+        updated.last_seen_at = later;
+        updated.timestamp = later;
+        s.save_finding(&updated).unwrap();
+
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].first_seen_at, f.first_seen_at,
+            "first_seen preserved"
+        );
+        assert_eq!(got[0].last_seen_at, later, "last_seen advanced");
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
+    }
+
+    #[test]
+    fn resolving_finding_retains_evidence_history() {
+        let mut s = SqliteStorage::in_memory().unwrap();
+        let f = sample_finding();
+        let evidence = f.evidence.clone();
+        s.save_finding(&f).unwrap();
+        // Detector no longer observes the condition: mark resolved, keep the
+        // original evidence required by the model.
+        let mut resolved = f.clone();
+        resolved.lifecycle = FindingLifecycle::Resolved;
+        s.save_finding(&resolved).unwrap();
+
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Resolved);
+        assert_eq!(got[0].evidence, evidence, "evidence retained on resolve");
+        assert_eq!(got[0].first_seen_at, f.first_seen_at);
+    }
+
+    #[test]
+    fn malformed_evidence_fails_loudly_none_serialized_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bad-evidence.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            // Persist a finding whose evidence column will be deliberately
+            // corrupted at the storage level.
+            s.save_finding(&sample_finding()).unwrap();
+        }
+        // Corrupt persisted evidence into non-JSON, then reopen.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE findings SET evidence = 'not-json' WHERE id = 'f1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let err = s.latest_findings(10).unwrap_err();
+        // Must be a typed conversion failure, never a silent empty list.
+        assert!(matches!(
+            err,
+            StorageError::Backend(_) | StorageError::Corrupt(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_timestamp_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bad-ts.db");
+        {
+            let mut s = SqliteStorage::open(&db).unwrap();
+            s.save_finding(&sample_finding()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE findings SET ts = 'not-a-timestamp' WHERE id = 'f1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let err = s.latest_findings(10).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Backend(_) | StorageError::Corrupt(_)),
+            "invalid persisted timestamp must error, not fall back to Utc::now()"
+        );
+    }
+
+    #[test]
+    fn older_schema_rows_migrate_with_lifecycle_metadata() {
+        // A row written before the findings metadata columns existed. Opening
+        // the database runs v1->v2 and backfills first/last seen + lifecycle,
+        // then the row must decode via the strict path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old-schema.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE findings (
+                    id TEXT PRIMARY KEY, detector TEXT NOT NULL, severity INTEGER NOT NULL,
+                    node_id TEXT, channel_id TEXT, evidence TEXT NOT NULL,
+                    explanation TEXT, ts TEXT NOT NULL, last_seen TEXT
+                 );
+                 INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
+                 VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
+                         '2021-05-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let mut s = SqliteStorage::open(&db).unwrap();
+        let got = s.latest_findings(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "old1");
+        assert_eq!(got[0].detector_version, "1", "default detector version");
+        assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
+        assert_eq!(got[0].first_seen_at, got[0].last_seen_at);
     }
 }

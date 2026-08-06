@@ -5,7 +5,8 @@ use chrono::Utc;
 use rieko_api::RiekoApi;
 use rieko_domain::{ChannelSnapshot, ChannelStatus};
 use rieko_findings::{
-    Action, ActionStage, ActionType, Evidence, Finding, Recommendation, Severity,
+    Action, ActionStage, ActionType, Evidence, Finding, FindingLifecycle, Recommendation, Severity,
+    FINDING_SCHEMA_VERSION,
 };
 use rieko_storage::{MemoryStorage, Storage};
 use tower::ServiceExt;
@@ -168,12 +169,17 @@ async fn status_reports_operational_counts() {
     let warning = Finding {
         id: "f-warn".into(),
         detector: "channel_liquidity".into(),
+        detector_version: "1".into(),
         severity: Severity::Warning,
+        schema_version: FINDING_SCHEMA_VERSION,
         node: None,
         channel: Some("abc123x0".into()),
         evidence: vec![Evidence::string("local_ratio", "0.9")],
         explanation: None,
         timestamp: Utc::now(),
+        first_seen_at: Utc::now(),
+        last_seen_at: Utc::now(),
+        lifecycle: FindingLifecycle::Active,
     };
     mem.save_finding(&warning).unwrap();
     mem.save_finding(&Finding {

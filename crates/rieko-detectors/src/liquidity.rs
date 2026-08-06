@@ -87,6 +87,7 @@ impl Detector for LiquidityDetector {
                 Evidence::text("peer", channel.peer.to_string()),
             ];
 
+            let now = Utc::now();
             findings.push(Finding {
                 id: finding_identity(
                     self.id(),
@@ -97,12 +98,17 @@ impl Detector for LiquidityDetector {
                     &evidence,
                 ),
                 detector: self.id().to_string(),
+                detector_version: self.version().to_string(),
+                schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
                 severity,
                 node: Some(self.local_node.to_string()),
                 channel: Some(channel.id.to_string()),
                 evidence,
                 explanation: None,
-                timestamp: Utc::now(),
+                timestamp: now,
+                first_seen_at: now,
+                last_seen_at: now,
+                lifecycle: rieko_findings::FindingLifecycle::Active,
             });
         }
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));

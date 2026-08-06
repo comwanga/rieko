@@ -95,11 +95,15 @@ impl MemoryStorage {
 impl Storage for MemoryStorage {
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
         if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
-            // Idempotent replay: refresh explanation/last-seen, never duplicate.
+            // Idempotent replay: refresh explanation/last-seen, never
+            // duplicate. The first-seen timestamp is preserved across updates
+            // and the lifecycle follows the most recent observation.
             if finding.explanation.is_some() {
                 existing.explanation = finding.explanation.clone();
             }
             existing.timestamp = finding.timestamp;
+            existing.last_seen_at = finding.last_seen_at;
+            existing.lifecycle = finding.lifecycle;
         } else {
             self.findings.push(finding.clone());
         }

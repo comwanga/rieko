@@ -3,3 +3,9 @@
 *.db-wal
 *.db-shm
 .rieko/
+
+# Internal planning and audit documents: never pushed to the repository.
+RIEKO_AUDIT_REPORT.md
+remediation.md
+riekoauditcommand.md
+AGENTS.md
