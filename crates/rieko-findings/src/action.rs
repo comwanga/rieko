@@ -112,11 +112,68 @@ impl Action {
     }
 }
 
-/// A recommendation ties a finding to a proposed action.
+/// A recommendation ties a finding to a proposed action, together with the
+/// evidence-backed reasoning that justifies it (RIEKO-AUDIT-010).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recommendation {
     pub finding_id: String,
     pub action: Action,
+    /// Structured, evidence-backed reasoning. Filled deterministically by the
+    /// engine — never by an LLM — and always present.
+    pub rationale: Rationale,
+}
+
+/// Whether a recommendation asks the operator to act or merely informs them.
+/// Neither grants Rieko any authority to execute the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Actionability {
+    /// Observe / understand. No operator action is being proposed.
+    #[default]
+    Informational,
+    /// A human operator may choose to act; it is a decision-support suggestion.
+    OperatorActionable,
+}
+
+impl Actionability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Informational => "informational",
+            Self::OperatorActionable => "operator_actionable",
+        }
+    }
+}
+
+/// The evidence-backed reasoning behind a recommendation. Deterministic,
+/// populated by the engine from the source finding (RIEKO-AUDIT-010). An LLM
+/// is never required, and can never change these fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rationale {
+    /// The evidence keys (and, where useful, values) from the finding that the
+    /// advice is grounded in.
+    pub evidence: Vec<String>,
+    /// Conditions that should hold before an operator considers acting.
+    pub preconditions: Vec<String>,
+    /// The expected operational effect if the operator elects to act.
+    pub expected_effect: String,
+    /// Risks or trade-offs the operator should weigh.
+    pub risks: Vec<String>,
+    /// Known limitations or uncertainty of the analysis.
+    pub limitations: Vec<String>,
+    /// Whether this is informational context or operator-actionable advice.
+    pub actionability: Actionability,
+}
+
+impl Default for Rationale {
+    fn default() -> Self {
+        Self {
+            evidence: Vec::new(),
+            preconditions: Vec::new(),
+            expected_effect: String::new(),
+            risks: Vec::new(),
+            limitations: Vec::new(),
+            actionability: Actionability::Informational,
+        }
+    }
 }
 
 /// One row of the append-only audit log. Written for every action, including

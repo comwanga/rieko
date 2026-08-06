@@ -261,10 +261,12 @@ impl Storage for SqliteStorage {
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError> {
         let params_json = serde_json::to_string(&rec.action.params)
             .map_err(|e| StorageError::Corrupt(format!("recommendation params: {e}")))?;
+        let rationale_json = serde_json::to_string(&rec.rationale)
+            .map_err(|e| StorageError::Corrupt(format!("recommendation rationale: {e}")))?;
         self.conn.execute(
             "INSERT OR REPLACE INTO recommendations
-             (finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 rec.finding_id,
                 rec.action.id,
@@ -273,6 +275,7 @@ impl Storage for SqliteStorage {
                 rec.action.target,
                 params_json,
                 rec.action.summary,
+                rationale_json,
                 rec.action.created_at.to_rfc3339(),
                 rec.action.updated_at.to_rfc3339()
             ],
@@ -282,7 +285,7 @@ impl Storage for SqliteStorage {
 
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], |row| {
@@ -303,6 +306,7 @@ impl Storage for SqliteStorage {
             };
             let params: Value =
                 serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+            let rationale = parse_rationale(&row.get::<_, String>(7)?);
             Ok(Recommendation {
                 finding_id: row.get(0)?,
                 action: Action {
@@ -312,9 +316,10 @@ impl Storage for SqliteStorage {
                     target: row.get::<_, Option<String>>(4)?,
                     params,
                     summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(7)?),
-                    updated_at: parse_ts(&row.get::<_, String>(8)?),
+                    created_at: parse_ts(&row.get::<_, String>(8)?),
+                    updated_at: parse_ts(&row.get::<_, String>(9)?),
                 },
+                rationale,
             })
         })?;
         let mut out = Vec::new();
@@ -329,7 +334,7 @@ impl Storage for SqliteStorage {
         action_id: &str,
     ) -> Result<Option<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations WHERE action_id = ?1",
         )?;
         let mut rows = stmt.query_map([action_id], |row| {
@@ -350,6 +355,7 @@ impl Storage for SqliteStorage {
             };
             let params: Value =
                 serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+            let rationale = parse_rationale(&row.get::<_, String>(7)?);
             Ok(Recommendation {
                 finding_id: row.get(0)?,
                 action: Action {
@@ -359,9 +365,10 @@ impl Storage for SqliteStorage {
                     target: row.get::<_, Option<String>>(4)?,
                     params,
                     summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(7)?),
-                    updated_at: parse_ts(&row.get::<_, String>(8)?),
+                    created_at: parse_ts(&row.get::<_, String>(8)?),
+                    updated_at: parse_ts(&row.get::<_, String>(9)?),
                 },
+                rationale,
             })
         })?;
         rows.next().transpose().map_err(Into::into)
@@ -891,6 +898,10 @@ fn component_str(s: rieko_status::ComponentState) -> &'static str {
     s.as_str()
 }
 
+fn parse_rationale(s: &str) -> rieko_findings::Rationale {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
 fn severity_from_int(v: i64) -> Option<rieko_findings::Severity> {
     match v {
         0 => Some(rieko_findings::Severity::Info),
@@ -930,7 +941,15 @@ fn lifecycle_str(s: FindingLifecycle) -> &'static str {
 mod tests {
     use super::*;
     use crate::MemoryStorage;
-    use rieko_findings::{Action, ActionStage, ActionType, Evidence, Severity};
+    use rieko_findings::{Action, ActionStage, ActionType, Evidence, Rationale, Severity};
+
+    fn test_rec(finding_id: &str, action: Action) -> Recommendation {
+        Recommendation {
+            finding_id: finding_id.into(),
+            action,
+            rationale: Rationale::default(),
+        }
+    }
 
     fn sample_finding() -> Finding {
         let now = Utc::now();
@@ -956,15 +975,25 @@ mod tests {
         let mut s = SqliteStorage::in_memory().unwrap();
         s.save_finding(&sample_finding()).unwrap();
 
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: Action::new(
+        let rec = test_rec(
+            "f1",
+            Action::new(
                 ActionType::RebalanceChannel,
                 ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({"desired_ratio": 0.5}),
                 "Rebalance channel c1 to 50/50",
             ),
+        );
+        // A non-default rationale must survive the SQLite roundtrip (WP3.2).
+        let mut rec = rec;
+        rec.rationale = Rationale {
+            evidence: vec!["local_ratio=0.1".into()],
+            preconditions: vec!["confirm intent".into()],
+            expected_effect: "informed decision".into(),
+            risks: vec!["fees".into()],
+            limitations: vec!["single snapshot".into()],
+            actionability: rieko_findings::Actionability::OperatorActionable,
         };
         s.save_recommendation(&rec).unwrap();
 
@@ -985,6 +1014,10 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].action.action_type, ActionType::RebalanceChannel);
         assert_eq!(recs[0].action.stage, ActionStage::Recommended);
+        assert_eq!(
+            recs[0].rationale, rec.rationale,
+            "rationale must survive the roundtrip"
+        );
 
         let audit_rows = s.recent_audit(10).unwrap();
         assert_eq!(audit_rows.len(), 1);
@@ -999,16 +1032,16 @@ mod tests {
     fn action_stage_can_be_fetched_and_transitioned() {
         use rieko_findings::{Action, ActionStage, ActionType};
         let mut s = SqliteStorage::in_memory().unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: Action::new(
+        let rec = test_rec(
+            "f1",
+            Action::new(
                 ActionType::RebalanceChannel,
                 ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({"desired_ratio": 0.5}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
 
         let fetched = s
@@ -1206,16 +1239,16 @@ mod tests {
         let db = dir.path().join("tx.db");
         let mut w = SqliteStorage::open(&db).unwrap();
         let f = sample_finding();
-        let rec = Recommendation {
-            finding_id: f.id.clone(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            &f.id,
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 f.channel.clone(),
                 serde_json::json!({}),
                 "rebalance",
             ),
-        };
+        );
         let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
 
         w.begin_transaction().unwrap();
@@ -1242,16 +1275,16 @@ mod tests {
     fn rollback_leaves_no_half_written_state() {
         let mut s = SqliteStorage::in_memory().unwrap();
         let f = sample_finding();
-        let rec = Recommendation {
-            finding_id: f.id.clone(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            &f.id,
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 f.channel.clone(),
                 serde_json::json!({}),
                 "rebalance",
             ),
-        };
+        );
 
         // Simulate the cycle failing partway through: some writes succeed,
         // then an error aborts before commit.
@@ -1505,6 +1538,11 @@ mod tests {
                     id TEXT PRIMARY KEY, action_id TEXT NOT NULL, action_type TEXT NOT NULL,
                     stage TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL, ts TEXT NOT NULL
                  );
+                 CREATE TABLE recommendations (
+                    finding_id TEXT NOT NULL, action_id TEXT PRIMARY KEY, action_type TEXT NOT NULL,
+                    stage TEXT NOT NULL, target TEXT, params TEXT NOT NULL, summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                 );
                  INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
                  VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
                          '2021-05-01T00:00:00Z');",
@@ -1528,16 +1566,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("atomic-audit.db");
         let mut s = SqliteStorage::open(&db).unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
         let action_id = rec.action.id.clone();
 
@@ -1598,16 +1636,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rollback-audit.db");
         let mut s = SqliteStorage::open(&db).unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.save_recommendation(&rec).unwrap();
         let action_id = rec.action.id.clone();
 
@@ -1639,16 +1677,16 @@ mod tests {
         // RIEKO-AUDIT-007: the audit table denies normal UPDATE and DELETE via
         // triggers; the application API is the only writer.
         let mut s = SqliteStorage::in_memory().unwrap();
-        let rec = Recommendation {
-            finding_id: "f1".into(),
-            action: rieko_findings::Action::new(
+        let rec = test_rec(
+            "f1",
+            rieko_findings::Action::new(
                 rieko_findings::ActionType::RebalanceChannel,
                 rieko_findings::ActionStage::Recommended,
                 Some("c1".into()),
                 serde_json::json!({}),
                 "rebalance c1",
             ),
-        };
+        );
         s.append_audit(&AuditEntry::from_action(
             &rec.action,
             "system",

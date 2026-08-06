@@ -69,11 +69,24 @@ impl Simulator {
         if channel.capacity_msat == 0 {
             return Err(SimulationError::ZeroCapacity(channel.id.to_string()));
         }
-        let desired: f64 = action
-            .params
-            .get("desired_ratio")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| SimulationError::MissingDesiredRatio(channel.id.to_string()))?;
+        let desired: Option<f64> = action.params.get("desired_ratio").and_then(|v| v.as_f64());
+        let Some(desired) = desired else {
+            // RIEKO-AUDIT-010: conservative rebalance reviews carry no numeric
+            // target. Project the honest consequence — no liquidity movement —
+            // rather than inventing a target ratio.
+            return Ok(SimulationProjection {
+                local_ratio_before: channel.liquidity.local_ratio,
+                local_ratio_after: channel.liquidity.local_ratio,
+                local_balance_msat_after: channel.liquidity.local_balance_msat,
+                remote_balance_msat_after: channel.liquidity.remote_balance_msat,
+                delta_msat: 0,
+                clears_finding: false,
+                summary: format!(
+                    "Channel {} rebalance review carries no numeric target; no liquidity movement is projected.",
+                    channel.id
+                ),
+            });
+        };
         let desired = desired.clamp(0.0, 1.0);
 
         let local_after = (desired * channel.capacity_msat as f64).round() as u64;
@@ -194,5 +207,28 @@ mod tests {
         assert!(Simulator
             .project(&c, &rebalance_action("c1", 0.5), "f1")
             .is_err());
+    }
+
+    #[test]
+    fn rebalance_review_without_numeric_target_projects_no_movement() {
+        // RIEKO-AUDIT-010: conservative rebalance reviews carry no `desired_ratio`.
+        // Projecting them must not invent a target — the honest projection is no
+        // liquidity movement, and the imbalance is not cleared.
+        let c = channel("c1", 10_000, 90_000);
+        let action = Action::new(
+            ActionType::RebalanceChannel,
+            ActionStage::Recommended,
+            Some("c1".into()),
+            serde_json::json!({ "reason": "outbound liquidity drained" }),
+            "Review the intended role of channel c1 before considering a rebalance.",
+        );
+        let sim = Simulator.project(&c, &action, "f1").unwrap();
+        assert!(!sim.projection.clears_finding);
+        assert_eq!(sim.projection.delta_msat, 0);
+        assert_eq!(sim.projection.local_ratio_after, c.liquidity.local_ratio);
+        assert_eq!(
+            sim.projection.local_balance_msat_after,
+            c.liquidity.local_balance_msat
+        );
     }
 }

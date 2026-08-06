@@ -5,8 +5,8 @@ use chrono::Utc;
 use rieko_api::RiekoApi;
 use rieko_domain::{ChannelSnapshot, ChannelStatus};
 use rieko_findings::{
-    Action, ActionStage, ActionType, Evidence, Finding, FindingLifecycle, Recommendation, Severity,
-    FINDING_SCHEMA_VERSION,
+    Action, ActionStage, ActionType, Evidence, Finding, FindingLifecycle, Rationale,
+    Recommendation, Severity, FINDING_SCHEMA_VERSION,
 };
 use rieko_storage::{MemoryStorage, Storage};
 use tower::ServiceExt;
@@ -200,6 +200,7 @@ async fn status_reports_operational_counts() {
     mem.save_recommendation(&Recommendation {
         finding_id: "f-warn".into(),
         action: action.clone(),
+        rationale: Rationale::default(),
     })
     .unwrap();
     mem.save_recommendation(&Recommendation {
@@ -211,6 +212,7 @@ async fn status_reports_operational_counts() {
             serde_json::json!({}),
             "noop",
         ),
+        rationale: Rationale::default(),
     })
     .unwrap();
 

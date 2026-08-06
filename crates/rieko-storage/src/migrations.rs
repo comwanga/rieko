@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -37,6 +37,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: V4_OPERATIONAL_STATE,
+    },
+    Migration {
+        version: 5,
+        sql: V5_RECOMMENDATION_RATIONALE,
     },
 ];
 
@@ -180,6 +184,14 @@ CREATE TABLE IF NOT EXISTS operational_state (
     llm                     TEXT NOT NULL,
     alert_sink              TEXT NOT NULL
 );
+"#;
+
+/// v5: conservative, evidence-backed recommendations (RIEKO-AUDIT-010). Add
+/// the structured rationale (JSON), so the deterministic reasoning that
+/// justifies each recommendation persists with it. Fresh and upgraded databases
+/// both reach it via this step.
+const V5_RECOMMENDATION_RATIONALE: &str = r#"
+ALTER TABLE recommendations ADD COLUMN rationale TEXT NOT NULL DEFAULT '{}';
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).
