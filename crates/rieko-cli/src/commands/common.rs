@@ -276,6 +276,85 @@ mod tests {
         detector.run(graph, &rieko_detectors::DetectorContext::no_context())
     }
 
+    fn fixture_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/channels.json")
+    }
+
+    #[test]
+    fn fixture_vertical_slice_produces_expected_findings_and_recommendations() {
+        // Phase 3 gate: the full v1 slice (fixture → ingest → detect →
+        // recommend → persist) must work end to end against the committed
+        // fixture and match the documented liquidity semantics (RIEKO-AUDIT-011).
+        let source = GraphSource {
+            fixture: Some(fixture_path()),
+            node: "local-node".into(),
+            ..Default::default()
+        };
+        let graph = source.build().expect("fixture should load");
+
+        let findings = detect(&graph);
+        // 3 imbalanced channels: one Critical (ratio 0.01), one outbound
+        // Warning (0.08), one inbound Warning (0.95); two are Balanced.
+        assert_eq!(findings.len(), 3, "findings: {findings:#?}");
+        let critical = findings
+            .iter()
+            .filter(|f| f.severity == rieko_findings::Severity::Critical)
+            .count();
+        let warning = findings
+            .iter()
+            .filter(|f| f.severity == rieko_findings::Severity::Warning)
+            .count();
+        assert_eq!(critical, 1);
+        assert_eq!(warning, 2);
+
+        let mut storage = MemoryStorage::new();
+        let engine = rieko_recommendations::RecommendationEngine;
+        let recs =
+            persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings)
+                .unwrap();
+        // The engine may emit more than one recommendation per finding (e.g. a
+        // warning channel gets both a fee review and a rebalance review), but
+        // every finding must lead to at least one, and nothing may be dropped.
+        assert!(
+            recs.len() >= findings.len(),
+            "expected at least one recommendation per finding, got {}",
+            recs.len()
+        );
+        for f in &findings {
+            assert!(
+                recs.iter().any(|r| r.finding_id == f.id),
+                "no recommendation for finding {}",
+                f.id
+            );
+        }
+
+        for rec in &recs {
+            // Recommendations are decision support: no numeric mutation params,
+            // and a non-empty rationale carried through persistence.
+            for banned in [
+                "desired_ratio",
+                "fee_rate_ppm",
+                "base_fee_msat",
+                "cltv_delta",
+                "method",
+            ] {
+                assert!(
+                    rec.action.params.get(banned).is_none(),
+                    "recommendation for {} must not carry mutation param {banned}",
+                    rec.finding_id
+                );
+            }
+            assert!(
+                !rec.rationale.expected_effect.is_empty(),
+                "recommendation rationale must be populated without an LLM"
+            );
+        }
+        assert_eq!(
+            storage.latest_recommendations(10).unwrap().len(),
+            recs.len()
+        );
+    }
+
     #[test]
     fn missing_macaroon_file_fails_cleanly() {
         let source = GraphSource {
