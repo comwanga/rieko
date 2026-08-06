@@ -164,6 +164,31 @@ impl LndMutator {
     pub fn update_chan_policy(&self, body: &str) -> Result<String, LndClientError> {
         self.put("/v1/chanpolicy", body)
     }
+
+    fn post(&self, path: &str, body: &str) -> Result<String, LndClientError> {
+        use reqwest::header;
+        let url = format!("{}{}", self.rest_base.trim_end_matches('/'), path);
+        let mut req = self
+            .client
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        if let Some(mac) = &self.macaroon_hex {
+            req = req.header("Grpc-Metadata-macaroon", mac);
+        }
+        let resp = req.send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(LndClientError::Status(status));
+        }
+        Ok(resp.text()?)
+    }
+
+    /// Send a loop payment through LND's router (v2 API). Used for
+    /// single-hop rebalance execution (ADR-0002 D2).
+    pub fn send_payment(&self, body: &str) -> Result<String, LndClientError> {
+        self.post("/v2/router/send", body)
+    }
 }
 
 #[cfg(test)]
