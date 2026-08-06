@@ -129,7 +129,7 @@ impl RiekoApi {
                 "/snapshots/channel/:channel_id",
                 axum::routing::get(crate::routes::channel_snapshots),
             );
-        #[cfg(feature = "future")]
+        #[cfg(feature = "simulate")]
         let router = router.route(
             "/simulations",
             axum::routing::get(crate::routes::recent_simulations),

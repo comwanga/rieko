@@ -20,10 +20,10 @@ enum Command {
     /// Run the same pipeline continuously, tracking channel state over time.
     Monitor(commands::monitor::MonitorArgs),
     /// Run the pipeline once, then project what each recommendation would do.
-    #[cfg(feature = "future")]
+    #[cfg(feature = "simulate")]
     Simulate(commands::simulate::SimulateArgs),
     /// Approve or execute recommended actions (human-gated).
-    #[cfg(feature = "future")]
+    #[cfg(feature = "execute")]
     Actions(commands::actions::ActionsArgs),
     /// Show what's stored in the durable database.
     Status(commands::status::StatusArgs),
@@ -42,9 +42,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Scan(args) => commands::scan::run(args),
         Command::Monitor(args) => commands::monitor::run(args),
-        #[cfg(feature = "future")]
+        #[cfg(feature = "simulate")]
         Command::Simulate(args) => commands::simulate::run(args),
-        #[cfg(feature = "future")]
+        #[cfg(feature = "execute")]
         Command::Actions(args) => commands::actions::run(args),
         Command::Status(args) => commands::status::run(args),
         Command::Serve(args) => commands::serve::run(args),
@@ -53,44 +53,41 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "future"))]
-    use super::Cli;
-    #[cfg(not(feature = "future"))]
-    use clap::CommandFactory;
-
-    /// The v1 CLI must not advertise any capability that implies LND mutation
-    /// or human-gated execution authority (RIEKO-AUDIT-001/015).
-    #[cfg(not(feature = "future"))]
+    /// The default v2 CLI advertises simulation (read-only) but must not expose
+    /// execution (node-mutating) commands (RIEKO-AUDIT-001/015).
     #[test]
     fn default_cli_help_is_read_only() {
+        use super::Cli;
+        use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
-        for banned in [
-            "simulate", "Simulate", "actions", "Actions", "execute", "approve",
-        ] {
+        // When execution feature is off, these must not appear.
+        #[cfg(not(feature = "execute"))]
+        for banned in ["actions", "Actions", "execute", "approve"] {
             assert!(
                 !help.to_lowercase().contains(&banned.to_lowercase()),
                 "default CLI help must not advertise capability containing {banned:?}\n{help}"
             );
         }
-        for required in ["scan", "monitor", "status", "serve"] {
+        for required in ["scan", "monitor", "simulate", "status", "serve"] {
             assert!(
                 help.to_lowercase().contains(required),
-                "default CLI help must still advertise {required:?}\n{help}"
+                "default CLI help must advertise {required:?}\n{help}"
             );
         }
     }
 
-    #[cfg(not(feature = "future"))]
     #[test]
-    fn cli_dispatches_only_read_only_commands() {
+    fn cli_dispatches_simulation_but_not_execution() {
+        use super::Cli;
+        use clap::CommandFactory;
         let got = Cli::command()
             .get_subcommands()
             .map(|s| s.get_name().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            got,
-            vec!["scan", "monitor", "status", "serve"],
-            "got {got:?}"
-        );
+        #[cfg(not(feature = "execute"))]
+        let expected: &[&str] = &["scan", "monitor", "simulate", "status", "serve"];
+        #[cfg(feature = "execute")]
+        let expected: &[&str] = &["scan", "monitor", "simulate", "actions", "status", "serve"];
+        assert_eq!(got, expected, "got {got:?}");
     }
 }

@@ -13,6 +13,7 @@ rieko-domain.workspace = true
 rieko-findings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }

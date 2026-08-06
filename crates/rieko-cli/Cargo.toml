@@ -38,11 +38,15 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
-# `future` is the post-v1 execution/simulation surface. It is disabled by
-# default so the normal `rieko` binary cannot construct an execution path.
+# `simulate` enables what-if projection of recommendations. Enabled by default
+# in v2 — the simulation crate is pure and read-only (no node mutation).
+# `execute` gates node-mutating actions behind explicit human approval.
+# `future` is the combined legacy gate, preserved for compatibility.
 [features]
-default = []
-future = ["rieko-execution", "rieko-simulation"]
+default = ["simulate"]
+simulate = ["rieko-simulation"]
+execute = ["rieko-execution"]
+future = ["simulate", "execute"]
 
 [dev-dependencies]
 tempfile = "3"

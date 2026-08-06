@@ -1,20 +1,16 @@
 //! What-if simulation of recommended actions (D7 Simulate).
 //!
-//! This crate is **future-facing and deliberately isolated from the v1
-//! product** (RIEKO-AUDIT-022): the default build never links it, and it is
-//! only pulled in through the `future` feature of `rieko-cli`.
+//! **V2** (ADR-0005): simulation is now a first-class, default-enabled feature
+//! with a formal `SimulationRequest → SimulationResult` lifecycle, deterministic
+//! identity via `input_hash`, machine-readable assumptions and warnings, and a
+//! confidence model. The projections remain pure functions — no LND/network I/O.
 //!
-//! The projections are pure functions over explicit inputs (channels, actions,
-//! finding ids). They never ingest, never detect, never persist findings, and
-//! never append audit transitions — callers decide persistence. The crate has
-//! no storage, SQLite, or LND dependencies, so its tests stay independent of
-//! any database or live node.
-//!
-//! Phase 7.4 adds:
-//! * Multi-hop rebalance route projection (one simulation per hop).
-//! * Time-bound drift projection (ratio after N cycles of decline).
+//! The crate must never depend on `rieko-execution`, `rieko-api`, `rieko-cli`,
+//! `rieko-llm`, `rieko-alerts`, or any LND HTTP client.
 
 use std::collections::HashMap;
+
+pub mod model;
 
 use rieko_domain::{Channel, ChannelId, LiquidityImbalance, LiquidityProfile};
 use rieko_findings::{Action, ActionType, Simulation, SimulationProjection};

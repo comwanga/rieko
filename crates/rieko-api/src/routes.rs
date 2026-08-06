@@ -55,9 +55,9 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
         })
         .await?;
 
-    // A non-`future` build has no execution/simulation surface and is therefore
+    // An `execute`-feature build can mutate nodes; a build without it is
     // read-only. Capability is derived from the build, never claimed blindly.
-    let read_only = cfg!(not(feature = "future"));
+    let read_only = cfg!(not(feature = "execute"));
 
     let (overall, source, last_ingestion, last_cycle, llm, alert_sink, cleanup, last_cleanup) =
         match operational.as_ref() {
@@ -224,7 +224,7 @@ pub async fn audit(
     Ok(Json(out))
 }
 
-#[cfg(feature = "future")]
+#[cfg(feature = "simulate")]
 pub async fn recent_simulations(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
