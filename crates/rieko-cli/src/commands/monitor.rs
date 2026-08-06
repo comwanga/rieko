@@ -8,6 +8,7 @@ use rieko_detectors::{Detector, DetectorContext, DriftDetector, LiquidityDetecto
 use rieko_findings::Finding;
 use rieko_graph::{GraphView, InMemoryHistory};
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
+use rieko_status::OperationalStateStore;
 use rieko_storage::{SqliteStorage, Storage};
 use tracing::{info, warn};
 
@@ -50,6 +51,23 @@ pub struct MonitorArgs {
     /// Cooldown between identical alerts, in seconds.
     #[arg(long, default_value_t = 3600)]
     alert_cooldown: u64,
+
+    /// Snapshot retention period in days (RIEKO-AUDIT-016). Default: 30.
+    #[arg(long, default_value_t = 30, value_name = "DAYS")]
+    retention_days: u64,
+
+    /// Retention period in days for closed channels. Default: 3.
+    #[arg(long, default_value_t = 3, value_name = "DAYS")]
+    closed_retention_days: u64,
+
+    /// Optional cap on snapshots kept per channel (newest wins). Unset keeps
+    /// time-based retention only.
+    #[arg(long, value_name = "ROWS")]
+    max_snapshots_per_channel: Option<usize>,
+
+    /// How often a cleanup pass runs, in hours. Default: 6.
+    #[arg(long, default_value_t = 6, value_name = "HOURS")]
+    cleanup_interval: u64,
 }
 
 pub fn run(args: MonitorArgs) -> Result<()> {
@@ -136,7 +154,20 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         Box::new(DriftDetector::new(args.node.clone())),
     ];
 
+    // Retention is operator-overridable and defaults to a documented upper
+    // bound (RIEKO-AUDIT-016).
+    let retention = rieko_storage::RetentionPolicy {
+        snapshot_max_age: std::time::Duration::from_secs(args.retention_days * 24 * 3600),
+        closed_channel_max_age: std::time::Duration::from_secs(
+            args.closed_retention_days * 24 * 3600,
+        ),
+        max_snapshots_per_channel: args.max_snapshots_per_channel,
+        max_total_snapshots: None,
+        cleanup_interval: std::time::Duration::from_secs(args.cleanup_interval * 3600),
+    };
+
     let mut cycle: u64 = 0;
+    let mut last_cleanup: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         cycle += 1;
 
@@ -168,6 +199,40 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
         let recommendations =
             persist_and_recommend(&mut storage, &*llm, &engine, &args.node, &findings)?;
+
+        // Retention: bounded cleanup at most once per cleanup_interval
+        // (RIEKO-AUDIT-016). Cleanup only touches channel_snapshots and is
+        // transactional; the outcome is recorded so /status reports failures.
+        if last_cleanup.map_or(true, |t| {
+            chrono::Utc::now() - t
+                >= chrono::Duration::from_std(retention.cleanup_interval)
+                    .unwrap_or(chrono::Duration::zero())
+        }) {
+            let now = chrono::Utc::now();
+            let mut op = storage
+                .read_operational_state()
+                .unwrap_or_default()
+                .unwrap_or_default();
+            op.last_cleanup_attempt = Some(now);
+            match storage.prune_channel_snapshots(&retention, now) {
+                Ok(summary) => {
+                    op.cleanup = rieko_status::ComponentState::Healthy;
+                    op.last_cleanup_success = Some(now);
+                    info!(
+                        deleted_snapshots = summary.deleted_snapshots,
+                        "retention cleanup complete"
+                    );
+                    last_cleanup = Some(now);
+                }
+                Err(e) => {
+                    op.cleanup = rieko_status::ComponentState::Failing;
+                    warn!(error = %e, "retention cleanup failed");
+                }
+            }
+            storage
+                .write_operational_state(&op)
+                .context("recording cleanup state")?;
+        }
 
         // Cooldown and severity-escalation are enforced by the persistent
         // sink, so the loop only decides *what* to say, not *whether*.

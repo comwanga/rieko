@@ -1,8 +1,10 @@
 pub mod migrations;
+pub mod retention;
 pub mod sqlite;
 pub mod storage;
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
+pub use retention::{PruneSummary, RetentionPolicy};
 pub use sqlite::{SqliteStorage, WriterLock};
 pub use storage::{MemoryStorage, Storage, StorageCounts, StorageError};
 

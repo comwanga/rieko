@@ -91,6 +91,14 @@ cargo run -- monitor --fixture fixtures/channels.json --interval 300
 # or against a live node: --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert --macaroon read-only.macaroon
 ```
 
+Snapshot history is bounded: the monitor prunes stale rows on a schedule so
+the database cannot grow without limit. Tune it with `--retention-days`
+(default 30; older active-channel history is deleted), `--closed-retention-days`
+(default 3; closed channels are kept for a shorter grace period),
+`--max-snapshots-per-channel N`, and `--cleanup-interval HOURS` (default 6).
+Each cleanup runs in a transaction, never touches findings or
+recommendations, and its success/failure is surfaced in `rieko status`.
+
 Inspect stored state and serve the read-only API, plus the built UI:
 
 ```sh

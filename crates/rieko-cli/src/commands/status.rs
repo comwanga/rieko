@@ -67,6 +67,12 @@ pub fn run(args: StatusArgs) -> Result<()> {
             );
             println!("  llm:             {}", state.llm.as_str());
             println!("  alert sink:      {}", state.alert_sink.as_str());
+            println!("  cleanup:         {}", state.cleanup.as_str());
+            println!(
+                "  last cleanup:    attempt {} / success {}",
+                ts(state.last_cleanup_attempt),
+                ts(state.last_cleanup_success)
+            );
         }
         None => {
             let overall = assess(

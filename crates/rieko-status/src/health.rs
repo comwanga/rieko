@@ -26,7 +26,8 @@ impl Default for HealthPolicy {
 ///   * the latest ingestion attempt failed while valid older data exists;
 ///   * source data is older than the freshness threshold;
 ///   * an LLM is configured but failing (explanations expected);
-///   * an alert sink is configured but failing.
+///   * an alert sink is configured but failing;
+///   * the retention cleanup is failing (storage grows unbounded).
 /// * **Healthy**: a recent ingestion succeeded, data is fresh, and every
 ///   configured component is working.
 ///
@@ -71,7 +72,10 @@ pub fn assess(
     }
 
     // A configured component that is failing.
-    if state.llm == ComponentState::Failing || state.alert_sink == ComponentState::Failing {
+    if state.llm == ComponentState::Failing
+        || state.alert_sink == ComponentState::Failing
+        || state.cleanup == ComponentState::Failing
+    {
         degraded = true;
     }
 
@@ -175,6 +179,17 @@ mod tests {
         s.last_ingestion_success = Some(now - Duration::seconds(10));
         s.source_data_at = Some(now - Duration::seconds(5));
         s.alert_sink = ComponentState::Failing;
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
+    }
+
+    #[test]
+    fn failing_cleanup_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.last_ingestion_success = Some(now - Duration::seconds(10));
+        s.source_data_at = Some(now - Duration::seconds(5));
+        s.cleanup = ComponentState::Failing;
         assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
     }
 

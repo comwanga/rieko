@@ -25,6 +25,13 @@ pub struct OperationalState {
     pub llm: ComponentState,
     /// Alert sink capability state, without any secrets.
     pub alert_sink: ComponentState,
+    /// Retention cleanup state: Healthy after a successful pass, Failing when
+    /// the last pass errored, NotConfigured before any pass (RIEKO-AUDIT-016).
+    pub cleanup: ComponentState,
+    /// Last time a retention cleanup was attempted.
+    pub last_cleanup_attempt: Option<DateTime<Utc>>,
+    /// Last retention cleanup that completed successfully.
+    pub last_cleanup_success: Option<DateTime<Utc>>,
 }
 
 impl Default for OperationalState {
@@ -39,6 +46,9 @@ impl Default for OperationalState {
             source_data_at: None,
             llm: ComponentState::NotConfigured,
             alert_sink: ComponentState::NotConfigured,
+            cleanup: ComponentState::NotConfigured,
+            last_cleanup_attempt: None,
+            last_cleanup_success: None,
         }
     }
 }

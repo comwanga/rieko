@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -41,6 +41,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: V5_RECOMMENDATION_RATIONALE,
+    },
+    Migration {
+        version: 6,
+        sql: V6_CLEANUP_STATE,
     },
 ];
 
@@ -192,6 +196,15 @@ CREATE TABLE IF NOT EXISTS operational_state (
 /// both reach it via this step.
 const V5_RECOMMENDATION_RATIONALE: &str = r#"
 ALTER TABLE recommendations ADD COLUMN rationale TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// v6: retention cleanup observability (RIEKO-AUDIT-016). Record cleanup
+/// component state and last attempt/success so `/status` and the `status`
+/// command report whether the bounded-retention pass is healthy.
+const V6_CLEANUP_STATE: &str = r#"
+ALTER TABLE operational_state ADD COLUMN cleanup TEXT NOT NULL DEFAULT 'not_configured';
+ALTER TABLE operational_state ADD COLUMN last_cleanup_attempt TEXT;
+ALTER TABLE operational_state ADD COLUMN last_cleanup_success TEXT;
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).
