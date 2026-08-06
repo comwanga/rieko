@@ -244,13 +244,17 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
-    fn findings_for_channel(&mut self, channel_id: &str) -> Result<Vec<Finding>, StorageError> {
+    fn findings_for_channel(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
                     detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
-             FROM findings WHERE channel_id = ? ORDER BY ts DESC",
+             FROM findings WHERE channel_id = ? ORDER BY ts DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map([channel_id], Self::row_to_finding)?;
+        let rows = stmt.query_map(rusqlite::params![channel_id, limit], Self::row_to_finding)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -1096,8 +1100,28 @@ mod tests {
         let mut s = MemoryStorage::new();
         s.save_finding(&sample_finding()).unwrap();
         assert_eq!(s.latest_findings(10).unwrap().len(), 1);
-        assert_eq!(s.findings_for_channel("c1").unwrap().len(), 1);
-        assert_eq!(s.findings_for_channel("c2").unwrap().len(), 0);
+        assert_eq!(s.findings_for_channel("c1", 10).unwrap().len(), 1);
+        assert_eq!(s.findings_for_channel("c2", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn findings_for_channel_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("rieko-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("bound.db");
+        let mut s = SqliteStorage::open(&db).unwrap();
+        for i in 0..100 {
+            let mut f = sample_finding();
+            f.id = format!("f-{i}");
+            s.save_finding(&f).unwrap();
+        }
+        // A malicious or accidental `limit=0` still returns exactly one row;
+        // the route clamp also caps at 500, so a channel with a huge history
+        // can never materialize the whole table (RIEKO-AUDIT-014).
+        assert_eq!(s.findings_for_channel("c1", 1).unwrap().len(), 1);
+        assert_eq!(s.findings_for_channel("c1", 50).unwrap().len(), 50);
+        assert_eq!(s.findings_for_channel("c1", 10_000).unwrap().len(), 100);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

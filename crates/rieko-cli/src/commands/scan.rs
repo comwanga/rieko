@@ -136,8 +136,24 @@ pub fn run(args: ScanArgs) -> Result<()> {
                     .unwrap_or_else(|| summarize_finding(finding)),
             );
             match sink.send(&alert) {
-                Ok(()) => n_alerts += 1,
-                Err(e) => warn!(error = %e, "alert delivery failed"),
+                Ok(()) => {
+                    n_alerts += 1;
+                    super::common::record_component(
+                        &mut storage,
+                        super::common::ComponentKind::AlertSink,
+                        rieko_status::ComponentState::Healthy,
+                    )?;
+                }
+                Err(e) => {
+                    // A delivery failure must surface in operational status
+                    // (RIEKO-AUDIT-013) while findings stay persisted.
+                    warn!(error = %e, "alert delivery failed");
+                    super::common::record_component(
+                        &mut storage,
+                        super::common::ComponentKind::AlertSink,
+                        rieko_status::ComponentState::Failing,
+                    )?;
+                }
             }
         }
     }

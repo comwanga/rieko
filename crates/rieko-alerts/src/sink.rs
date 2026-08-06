@@ -35,7 +35,7 @@ pub enum AlertError {
     #[error("alert sink failed: {0}")]
     Sink(String),
     #[error("transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(String),
     #[error("alert state persistence failed: {0}")]
     Store(String),
 }
