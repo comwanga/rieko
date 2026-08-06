@@ -44,6 +44,8 @@ pub struct RiekoApi {
     /// Directory of built frontend assets to serve at `/`. None disables
     /// static serving (the API-only mode).
     pub static_dir: Option<Arc<PathBuf>>,
+    /// When the server process started. Used to report uptime in `/status`.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl RiekoApi {
@@ -54,6 +56,7 @@ impl RiekoApi {
                 auth_token: None,
             }),
             static_dir: None,
+            started_at: chrono::Utc::now(),
         })
     }
 

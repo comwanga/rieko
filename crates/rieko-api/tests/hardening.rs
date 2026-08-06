@@ -62,6 +62,20 @@ async fn no_token_configured_means_open_loopback_access() {
 }
 
 #[tokio::test]
+async fn status_reports_uptime() {
+    let app = app_with_auth(None);
+    let resp = get(&app, "/status", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let buf = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let body = String::from_utf8_lossy(&buf);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let uptime = v["uptime_ms"]
+        .as_u64()
+        .expect("status must include uptime_ms");
+    assert!(uptime > 0, "uptime_ms must be positive");
+}
+
+#[tokio::test]
 async fn security_headers_are_present_on_api_responses() {
     let app = app_with_auth(None);
     let resp = get(&app, "/status", None).await;

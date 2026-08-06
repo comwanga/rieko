@@ -31,5 +31,6 @@ future = []
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 chrono = { version = "0.4", features = ["serde"] }
+serde_json.workspace = true
 rieko-domain.workspace = true
 rieko-findings.workspace = true

@@ -16,6 +16,7 @@ pub struct Status {
     pub read_only: bool,
     pub integrity: String,
     pub overall: String,
+    pub uptime_ms: u64,
     pub source: Option<String>,
     pub last_ingestion: Option<OperationTimes>,
     pub last_cycle: Option<OperationTimes>,
@@ -108,6 +109,11 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
             }
         };
 
+    let uptime_ms = {
+        let delta = Utc::now() - api.started_at;
+        delta.num_milliseconds().max(0) as u64
+    };
+
     Ok(Json(Status {
         engine: "rieko",
         version: VERSION,
@@ -119,6 +125,7 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
             "failed".to_string()
         },
         overall,
+        uptime_ms,
         source,
         last_ingestion,
         last_cycle,

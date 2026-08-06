@@ -110,6 +110,11 @@ impl<S: AlertSink> AlertSink for PersistentDedupingSink<S> {
 
 /// In-memory dedup guard for the one-shot `scan` path, kept for parity with the
 /// previous behavior. The monitor uses [`PersistentDedupingSink`] instead.
+///
+/// This sink uses `Instant` (not `DateTime<Utc>`) because `scan` is a
+/// short-lived CLI process with no restart semantics; cooldown only needs to
+/// work within a single run. Any restart resets all state, which is intentional
+/// for the one-shot path.
 pub struct DedupingSink<S> {
     inner: S,
     cooldown: Duration,

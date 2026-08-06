@@ -43,7 +43,13 @@ pub trait GraphStore: GraphView {
 pub type GraphResult<T> = Result<T, GraphError>;
 
 /// In-memory graph. Single-binary v1 keeps the live graph in memory; durable
-/// records (findings, actions, audit, source ledger) live in `rieko-storage`.
+/// records (findings, actions, audit) live in `rieko-storage`.
+///
+/// The `source_ledger` tracks per-source ingestion cursors so replay does not
+/// re-process already-seen data. It is currently in-memory only; on restart
+/// the monitor re-processes all source data, which is safe because upsert
+/// semantics prevent duplicates. Persisting the ledger is tracked as post-v1
+/// work (it reduces wasted cycles but is not a correctness concern).
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryGraph {
     nodes: HashMap<NodeId, Node>,
