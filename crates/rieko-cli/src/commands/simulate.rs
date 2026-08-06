@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_detectors::Detector;
 use rieko_domain::ChannelId;
 use rieko_graph::GraphView;
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
@@ -58,9 +57,15 @@ pub fn run(args: SimulateArgs) -> Result<()> {
     let (n_nodes, n_channels) = graph.len();
     info!(n_nodes, n_channels, "graph loaded");
 
-    let detector = rieko_detectors::LiquidityDetector::new(args.node.clone());
-    let findings = detector.run(&graph, &rieko_detectors::DetectorContext::no_context());
-    info!(findings = findings.len(), "detection complete");
+    let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
+        Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
+        Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
+    ];
+    let mut findings: Vec<rieko_findings::Finding> = Vec::new();
+    for detector in &detectors {
+        findings.extend(detector.run(&graph, &rieko_detectors::DetectorContext::no_context()));
+    }
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
     let llm: Box<dyn LlmClient> = OpenAiCompatibleClient::from_env()
         .map(|c| Box::new(c) as Box<dyn LlmClient>)

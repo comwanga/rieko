@@ -4,7 +4,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, DedupingSink, TelegramSink};
-use rieko_detectors::Detector;
 use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
 use rieko_storage::SqliteStorage;
 use tracing::info;
@@ -65,9 +64,15 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let (n_nodes, n_channels) = graph.len();
     info!(n_nodes, n_channels, "graph loaded");
 
-    let detector = rieko_detectors::LiquidityDetector::new(args.node.clone());
-    let findings = detector.run(&graph, &rieko_detectors::DetectorContext::no_context());
-    info!(findings = findings.len(), "detection complete");
+    let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
+        Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
+        Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
+    ];
+    let mut findings: Vec<rieko_findings::Finding> = Vec::new();
+    for detector in &detectors {
+        findings.extend(detector.run(&graph, &rieko_detectors::DetectorContext::no_context()));
+    }
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
     let (llm, llm_configured): (Box<dyn LlmClient>, bool) = match OpenAiCompatibleClient::from_env()
     {
