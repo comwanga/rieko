@@ -69,16 +69,53 @@ impl Normalizer {
         let remote = u64::try_from(lnd.remote_balance)
             .map_err(|_| NormalizerError::NegativeBalance(id.clone()))?;
 
+        let capacity_msat = capacity * 1_000;
+        let local_msat = local * 1_000;
+        let remote_msat = remote * 1_000;
+
+        let local_reserve_msat = lnd
+            .local_chan_reserve_sat
+            .and_then(|s| u64::try_from(s).ok())
+            .map(|s| s * 1_000);
+        let remote_reserve_msat = lnd
+            .remote_chan_reserve_sat
+            .and_then(|s| u64::try_from(s).ok())
+            .map(|s| s * 1_000);
+
+        let spendable_outbound = local_reserve_msat
+            .map(|res| local_msat.saturating_sub(res))
+            .unwrap_or(0);
+        let spendable_inbound = remote_reserve_msat
+            .map(|res| remote_msat.saturating_sub(res))
+            .unwrap_or(0);
+
+        let mut profile = LiquidityProfile::compute(capacity_msat, local_msat, remote_msat);
+        profile.spendable_outbound_msat = spendable_outbound;
+        profile.spendable_inbound_msat = spendable_inbound;
+
         Ok(Channel {
             id: ChannelId::new(id),
             node: local_node.clone(),
             peer: NodeId::new(lnd.remote_pubkey.clone()),
-            capacity_msat: capacity * 1_000,
+            channel_point: lnd.channel_point.clone(),
+            capacity_msat,
             fee_policy: FeePolicy::default(),
             status: status_from_lnd_flags(&lnd.chan_status_flags),
-            liquidity: LiquidityProfile::compute(capacity * 1_000, local * 1_000, remote * 1_000),
+            liquidity: profile,
             last_seen: seen_at,
             opening_height: None,
+            local_reserve_msat,
+            remote_reserve_msat,
+            is_private: lnd.private,
+            is_initiator: lnd.initiator,
+            total_sent_msat: lnd
+                .total_satoshis_sent
+                .and_then(|s| u64::try_from(s).ok())
+                .map(|s| s * 1_000),
+            total_received_msat: lnd
+                .total_satoshis_received
+                .and_then(|s| u64::try_from(s).ok())
+                .map(|s| s * 1_000),
         })
     }
 
@@ -260,6 +297,12 @@ mod tests {
             commit_fee: 100,
             chan_status_flags: flags.into(),
             chan_id: None,
+            local_chan_reserve_sat: None,
+            remote_chan_reserve_sat: None,
+            private: false,
+            initiator: true,
+            total_satoshis_sent: None,
+            total_satoshis_received: None,
         }
     }
 

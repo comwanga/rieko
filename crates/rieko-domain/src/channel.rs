@@ -68,6 +68,11 @@ pub struct LiquidityProfile {
     pub inbound_capacity_msat: u64,
     /// Ability to send (local balance).
     pub outbound_capacity_msat: u64,
+    /// Effective outbound capacity after subtracting `local_chan_reserve`.
+    /// Zero when reserves are unknown (the v1 default).
+    pub spendable_outbound_msat: u64,
+    /// Effective inbound capacity after subtracting `remote_chan_reserve`.
+    pub spendable_inbound_msat: u64,
     pub imbalance: LiquidityImbalance,
 }
 
@@ -104,6 +109,8 @@ impl LiquidityProfile {
                 remote_balance_msat,
                 inbound_capacity_msat: remote_balance_msat,
                 outbound_capacity_msat: local_balance_msat,
+                spendable_outbound_msat: 0,
+                spendable_inbound_msat: 0,
                 imbalance: LiquidityImbalance::Unknown,
             };
         }
@@ -121,6 +128,8 @@ impl LiquidityProfile {
             remote_balance_msat,
             inbound_capacity_msat: remote_balance_msat,
             outbound_capacity_msat: local_balance_msat,
+            spendable_outbound_msat: 0,
+            spendable_inbound_msat: 0,
             imbalance,
         }
     }
@@ -134,6 +143,8 @@ impl LiquidityProfile {
             remote_balance_msat: 0,
             inbound_capacity_msat: 0,
             outbound_capacity_msat: 0,
+            spendable_outbound_msat: 0,
+            spendable_inbound_msat: 0,
             imbalance: LiquidityImbalance::Unknown,
         }
     }
@@ -168,12 +179,37 @@ pub struct Channel {
     pub id: ChannelId,
     pub node: NodeId,
     pub peer: NodeId,
+    /// Funding transaction outpoint (`txid:index`). Required for per-channel
+    /// fee policy targeting (RIEKO-AUDIT-011).
+    pub channel_point: String,
     pub capacity_msat: u64,
     pub fee_policy: FeePolicy,
     pub status: ChannelStatus,
     pub liquidity: LiquidityProfile,
     pub last_seen: DateTime<Utc>,
     pub opening_height: Option<u32>,
+    /// Local channel reserve in msat. The operator cannot spend below this
+    /// floor, so effective outbound is `local_balance - local_reserve`.
+    #[serde(default)]
+    pub local_reserve_msat: Option<u64>,
+    /// Remote channel reserve in msat.
+    #[serde(default)]
+    pub remote_reserve_msat: Option<u64>,
+    /// Whether this is an unannounced (private) channel. Private channels
+    /// have no forwarding demand, so imbalance is less concerning.
+    #[serde(default)]
+    pub is_private: bool,
+    /// Whether the local node opened this channel. Affects force-close risk:
+    /// the initiator cannot close without partner cooperation in some cases.
+    #[serde(default)]
+    pub is_initiator: bool,
+    /// Lifetime outbound volume in msat. Used to detect channel role (source,
+    /// sink, or transit) from actual behaviour rather than assumptions.
+    #[serde(default)]
+    pub total_sent_msat: Option<u64>,
+    /// Lifetime inbound volume in msat.
+    #[serde(default)]
+    pub total_received_msat: Option<u64>,
 }
 
 impl Channel {
@@ -251,12 +287,19 @@ mod tests {
             id: ChannelId::new("c1"),
             node: NodeId::new("n"),
             peer: NodeId::new("p"),
+            channel_point: "txn:0".into(),
             capacity_msat: 100_000,
             fee_policy: FeePolicy::default(),
             status: ChannelStatus::Active,
             liquidity: LiquidityProfile::compute(100_000, 50_000, 50_000),
             last_seen: Utc::now(),
             opening_height: Some(1),
+            local_reserve_msat: None,
+            remote_reserve_msat: None,
+            is_private: false,
+            is_initiator: true,
+            total_sent_msat: None,
+            total_received_msat: None,
         };
         assert_eq!(c.liquidity.imbalance, LiquidityImbalance::Balanced);
         assert!(c.healthy());

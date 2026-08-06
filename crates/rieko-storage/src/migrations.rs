@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -45,6 +45,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: V6_CLEANUP_STATE,
+    },
+    Migration {
+        version: 7,
+        sql: V7_SNAPSHOT_SPENDABLE,
     },
 ];
 
@@ -205,6 +209,25 @@ const V6_CLEANUP_STATE: &str = r#"
 ALTER TABLE operational_state ADD COLUMN cleanup TEXT NOT NULL DEFAULT 'not_configured';
 ALTER TABLE operational_state ADD COLUMN last_cleanup_attempt TEXT;
 ALTER TABLE operational_state ADD COLUMN last_cleanup_success TEXT;
+"#;
+
+/// v7: spendable liquidity columns on channel_snapshots (RIEKO-AUDIT-011 /
+/// Phase 7.1). Effective outbound/inbound capacity after subtracting channel
+/// reserves, so the drift detector and simulation can reason about funds
+/// actually available to move.
+const V7_SNAPSHOT_SPENDABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_snapshots (
+    channel_id        TEXT NOT NULL,
+    ts                TEXT NOT NULL,
+    local_ratio       REAL NOT NULL,
+    local_balance_msat INTEGER,
+    remote_balance_msat INTEGER,
+    capacity_msat     INTEGER,
+    status_int        INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, ts)
+);
+ALTER TABLE channel_snapshots ADD COLUMN spendable_outbound_msat INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channel_snapshots ADD COLUMN spendable_inbound_msat INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).

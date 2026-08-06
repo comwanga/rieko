@@ -81,6 +81,8 @@ mod tests {
             capacity_msat: capacity,
             status: ChannelStatus::Active,
             ts: chrono::Utc::now(),
+            spendable_outbound_msat: 0,
+            spendable_inbound_msat: 0,
         }
     }
 
@@ -120,6 +122,13 @@ mod tests {
             liquidity: LiquidityProfile::compute(100_000, 40_000, 60_000),
             last_seen: chrono::Utc::now(),
             opening_height: None,
+            channel_point: "tx:0".into(),
+            local_reserve_msat: None,
+            remote_reserve_msat: None,
+            is_private: false,
+            is_initiator: true,
+            total_sent_msat: None,
+            total_received_msat: None,
         }];
         h.push_channels(&channels, chrono::Utc::now());
         assert_eq!(h.len(), 1);

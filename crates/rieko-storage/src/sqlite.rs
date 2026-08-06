@@ -467,8 +467,8 @@ impl Storage for SqliteStorage {
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO channel_snapshots
-             (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 snapshot.channel_id,
                 snapshot.ts.to_rfc3339(),
@@ -476,7 +476,9 @@ impl Storage for SqliteStorage {
                 snapshot.local_balance_msat,
                 snapshot.remote_balance_msat,
                 snapshot.capacity_msat,
-                snapshot.status as i64
+                snapshot.status as i64,
+                snapshot.spendable_outbound_msat,
+                snapshot.spendable_inbound_msat,
             ],
         )?;
         Ok(())
@@ -488,7 +490,7 @@ impl Storage for SqliteStorage {
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat
              FROM channel_snapshots WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![channel_id, limit], |row| {
@@ -502,6 +504,8 @@ impl Storage for SqliteStorage {
                 capacity_msat: row.get(5)?,
                 status: status_from_i64(status_int),
                 ts: parse_ts(&ts),
+                spendable_outbound_msat: row.get::<_, u64>(7).unwrap_or(0),
+                spendable_inbound_msat: row.get::<_, u64>(8).unwrap_or(0),
             })
         })?;
         let mut out = Vec::new();
@@ -513,7 +517,7 @@ impl Storage for SqliteStorage {
 
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat
              FROM channel_snapshots ORDER BY ts DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |row| {
@@ -527,6 +531,8 @@ impl Storage for SqliteStorage {
                 capacity_msat: row.get(5)?,
                 status: status_from_i64(status_int),
                 ts: parse_ts(&ts),
+                spendable_outbound_msat: row.get::<_, u64>(7).unwrap_or(0),
+                spendable_inbound_msat: row.get::<_, u64>(8).unwrap_or(0),
             })
         })?;
         let mut out = Vec::new();
@@ -1263,6 +1269,8 @@ mod tests {
             capacity_msat: 1_000_000,
             status,
             ts,
+            spendable_outbound_msat: 0,
+            spendable_inbound_msat: 0,
         }
     }
 
@@ -1495,6 +1503,8 @@ mod tests {
             capacity_msat: 1_000_000,
             status: ChannelStatus::Active,
             ts,
+            spendable_outbound_msat: 0,
+            spendable_inbound_msat: 0,
         };
         s.save_channel_snapshot(&snap).unwrap();
         s.save_channel_snapshot(&ChannelSnapshot {

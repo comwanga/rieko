@@ -270,12 +270,19 @@ mod tests {
             id: "c1".into(),
             node: NodeId::new("local-node"),
             peer: NodeId::new("peer-1"),
+            channel_point: "tx:0".into(),
             capacity_msat: capacity,
             fee_policy: FeePolicy::default(),
             status: ChannelStatus::Active,
             liquidity: LiquidityProfile::compute(capacity, local_msat, remote_msat),
             last_seen: chrono::Utc::now(),
             opening_height: Some(1),
+            local_reserve_msat: None,
+            remote_reserve_msat: None,
+            is_private: false,
+            is_initiator: true,
+            total_sent_msat: None,
+            total_received_msat: None,
         }])
         .unwrap();
         g

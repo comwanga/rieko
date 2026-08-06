@@ -148,6 +148,13 @@ mod tests {
             liquidity: LiquidityProfile::compute(capacity, local, remote),
             last_seen: chrono::Utc::now(),
             opening_height: Some(1),
+            channel_point: "tx:0".into(),
+            local_reserve_msat: None,
+            remote_reserve_msat: None,
+            is_private: false,
+            is_initiator: true,
+            total_sent_msat: None,
+            total_received_msat: None,
         }
     }
 

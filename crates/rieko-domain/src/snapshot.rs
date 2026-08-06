@@ -15,6 +15,12 @@ pub struct ChannelSnapshot {
     pub capacity_msat: u64,
     pub status: ChannelStatus,
     pub ts: DateTime<Utc>,
+    /// Effective outbound after subtracting local reserve. Zero when unknown.
+    #[serde(default)]
+    pub spendable_outbound_msat: u64,
+    /// Effective inbound after subtracting remote reserve.
+    #[serde(default)]
+    pub spendable_inbound_msat: u64,
 }
 
 impl ChannelSnapshot {
@@ -27,6 +33,8 @@ impl ChannelSnapshot {
             capacity_msat: channel.capacity_msat,
             status: channel.status,
             ts,
+            spendable_outbound_msat: channel.liquidity.spendable_outbound_msat,
+            spendable_inbound_msat: channel.liquidity.spendable_inbound_msat,
         }
     }
 

@@ -27,6 +27,41 @@ pub struct LndChannel {
     pub chan_status_flags: String,
     #[serde(rename = "chan_id", default, deserialize_with = "de_opt_u64")]
     pub chan_id: Option<u64>,
+    // ── Phase 7.1: full liquidity model (RIEKO-AUDIT-011) ──
+    /// Local channel reserve in satoshis. LND's API reports this as `local_chan_reserve_sat`.
+    #[serde(
+        rename = "local_chan_reserve_sat",
+        default,
+        deserialize_with = "de_opt_i64"
+    )]
+    pub local_chan_reserve_sat: Option<i64>,
+    /// Remote channel reserve in satoshis.
+    #[serde(
+        rename = "remote_chan_reserve_sat",
+        default,
+        deserialize_with = "de_opt_i64"
+    )]
+    pub remote_chan_reserve_sat: Option<i64>,
+    /// Whether this is an unannounced (private) channel.
+    #[serde(default)]
+    pub private: bool,
+    /// Whether the local node opened (initiated) this channel.
+    #[serde(default)]
+    pub initiator: bool,
+    /// Lifetime total outbound msat sent through this channel.
+    #[serde(
+        rename = "total_satoshis_sent",
+        default,
+        deserialize_with = "de_opt_i64"
+    )]
+    pub total_satoshis_sent: Option<i64>,
+    /// Lifetime total inbound msat received through this channel.
+    #[serde(
+        rename = "total_satoshis_received",
+        default,
+        deserialize_with = "de_opt_i64"
+    )]
+    pub total_satoshis_received: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +145,25 @@ where
             .parse::<i64>()
             .map_err(|_| serde::de::Error::custom("expected i64 string")),
         _ => Err(serde::de::Error::custom("expected number or i64 string")),
+    }
+}
+
+/// Deserialise an optional signed 64-bit integer allowing `null`.
+fn de_opt_i64<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(s) => s
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected i64")),
+        serde_json::Value::String(s) => s
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("expected i64 string")),
+        _ => Err(serde::de::Error::custom("expected i64, string, or null")),
     }
 }
 

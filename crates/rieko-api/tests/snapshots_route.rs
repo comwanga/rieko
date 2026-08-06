@@ -22,6 +22,8 @@ async fn snapshots_path_param_route_reachable() {
         capacity_msat: 1_000_000,
         status: ChannelStatus::Active,
         ts: Utc::now(),
+        spendable_outbound_msat: 0,
+        spendable_inbound_msat: 0,
     };
     mem.save_channel_snapshot(&snap).unwrap();
     let api = RiekoApi::new(Box::new(mem)).unwrap();
@@ -224,6 +226,8 @@ async fn status_reports_operational_counts() {
         capacity_msat: 1_000_000,
         status: ChannelStatus::Active,
         ts: Utc::now(),
+        spendable_outbound_msat: 0,
+        spendable_inbound_msat: 0,
     })
     .unwrap();
 
