@@ -65,7 +65,7 @@ async fn snapshots_path_param_route_reachable() {
     assert_eq!(arr[0]["local_ratio"], 0.42);
 }
 
-#[cfg(feature = "future")]
+#[cfg(feature = "simulate")]
 #[tokio::test]
 async fn simulations_route_returns_persisted_sims() {
     use rieko_findings::{Action, ActionStage, ActionType, Simulation, SimulationProjection};
@@ -115,7 +115,7 @@ async fn simulations_route_returns_persisted_sims() {
     assert!(arr[0]["projection"]["clears_finding"].as_bool().unwrap());
 }
 
-#[cfg(not(feature = "future"))]
+#[cfg(not(feature = "simulate"))]
 #[tokio::test]
 async fn simulations_route_is_absent_in_read_only_v1() {
     let mem = MemoryStorage::new();
@@ -251,6 +251,6 @@ async fn status_reports_operational_counts() {
     assert_eq!(json["counts"]["channel_snapshots"], 1);
     assert_eq!(json["counts"]["audit"], 0);
     assert_eq!(json["engine"], "rieko");
-    assert_eq!(json["read_only"], cfg!(not(feature = "future")));
+    assert_eq!(json["read_only"], cfg!(not(feature = "execute")));
     assert_eq!(json["overall"], "not_initialized");
 }

@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(n1, findings.len(), "one audit entry per new finding");
     }
 
-    #[cfg(feature = "future")]
+    #[cfg(feature = "simulate")]
     #[test]
     fn simulation_does_not_create_a_false_audit_transition() {
         // RIEKO-AUDIT-007: simulating a recommended action is read-only. It
