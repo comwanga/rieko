@@ -149,7 +149,7 @@ ALTER TABLE findings ADD COLUMN first_seen_at TEXT;
 ALTER TABLE findings ADD COLUMN detector_version TEXT NOT NULL DEFAULT '1';
 ALTER TABLE findings ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE findings ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
-UPDATE findings SET last_seen_at = COALESCE(last_seen_at, last_seen, ts) WHERE last_seen_at IS NULL;
+UPDATE findings SET last_seen_at = COALESCE(last_seen_at, ts) WHERE last_seen_at IS NULL;
 UPDATE findings SET first_seen_at = COALESCE(first_seen_at, ts) WHERE first_seen_at IS NULL;
 "#;
 
