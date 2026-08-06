@@ -80,6 +80,8 @@ pub fn run(args: SimulateArgs) -> Result<()> {
             warn!(target, "no channel in graph for recommendation target");
             continue;
         };
+
+        // Single-channel simulation (the v2 path).
         let sim = match simulator.project(channel, &rec.action, &rec.finding_id) {
             Ok(s) => s,
             Err(e) => {
@@ -89,6 +91,14 @@ pub fn run(args: SimulateArgs) -> Result<()> {
         };
         storage.save_simulation(&sim)?;
         n_simulated += 1;
+
+        // Multi-hop rebalance route projection (Phase 7.4). When the graph
+        // gains path-finding (Phase 7.2), swap the route below with
+        // `graph.find_path(&channel.node, desired_peer, amount)` and call
+        // `simulator.project_rebalance_route()` to project effect on every
+        // channel in the path. For now the single-hop projection above covers
+        // the one-channel case.
+        let _ = channel; // silence unused warning until wired
 
         // The simulation itself is persisted above. Do NOT write a `Simulated`
         // audit entry here: the recommendation's stage never actually changes

@@ -4,11 +4,17 @@
 //! product** (RIEKO-AUDIT-022): the default build never links it, and it is
 //! only pulled in through the `future` feature of `rieko-cli`.
 //!
-//! The projections are pure functions over explicit inputs (a [`Channel`], an
-//! [`Action`], a finding id). They never ingest, never detect, never persist
-//! findings, and never append audit transitions — callers decide persistence.
-//! The crate has no storage, SQLite, or LND dependencies, so its tests stay
-//! independent of any database or live node.
+//! The projections are pure functions over explicit inputs (channels, actions,
+//! finding ids). They never ingest, never detect, never persist findings, and
+//! never append audit transitions — callers decide persistence. The crate has
+//! no storage, SQLite, or LND dependencies, so its tests stay independent of
+//! any database or live node.
+//!
+//! Phase 7.4 adds:
+//! * Multi-hop rebalance route projection (one simulation per hop).
+//! * Time-bound drift projection (ratio after N cycles of decline).
+
+use std::collections::HashMap;
 
 use rieko_domain::{Channel, ChannelId, LiquidityImbalance, LiquidityProfile};
 use rieko_findings::{Action, ActionType, Simulation, SimulationProjection};
@@ -70,6 +76,134 @@ impl Simulator {
             action_type: action.action_type,
             projection,
             created_at: chrono::Utc::now(),
+        })
+    }
+
+    /// Project how rebalancing `source_channel` to `desired_ratio` would
+    /// affect every hop in the `route`. The route is an ordered list of
+    /// channel IDs from source to destination (produced by a path-finding
+    /// algorithm like Dijkstra in `rieko-graph`).
+    ///
+    /// Returns one `Simulation` per channel in the route. The source channel
+    /// gets the projected ratio shift; intermediate hops reflect the amount
+    /// moving through them (same delta, opposite direction per hop).
+    ///
+    /// `channels` is a lookup from ChannelId → Channel for the full graph.
+    pub fn project_rebalance_route(
+        &self,
+        source_channel: &Channel,
+        desired_ratio: f64,
+        route: &[ChannelId],
+        channels: &HashMap<ChannelId, Channel>,
+        finding_id: &str,
+    ) -> Result<Vec<Simulation>, SimulationError> {
+        if route.is_empty() {
+            return Err(SimulationError::UnsupportedActionType("empty route".into()));
+        }
+        if source_channel.capacity_msat == 0 {
+            return Err(SimulationError::ZeroCapacity(source_channel.id.to_string()));
+        }
+        let desired = desired_ratio.clamp(0.0, 1.0);
+        let local_after = (desired * source_channel.capacity_msat as f64).round() as u64;
+        let delta = local_after.abs_diff(source_channel.liquidity.local_balance_msat);
+
+        let mut simulations = Vec::with_capacity(route.len());
+
+        for (i, cid) in route.iter().enumerate() {
+            let hop = channels
+                .get(cid)
+                .ok_or_else(|| SimulationError::ChannelNotFound(cid.clone()))?;
+
+            let (local_after, remote_after) = if i == 0 {
+                // Source channel: rebalance to target ratio.
+                let la = (desired * hop.capacity_msat as f64).round() as u64;
+                let ra = hop.capacity_msat.saturating_sub(la);
+                (la, ra)
+            } else {
+                // Intermediate hop: same delta moves through, direction
+                // alternates per hop (inbound/outbound swap).
+                let direction = if i % 2 == 0 { delta } else { 0 };
+                let local_after = if direction > 0 {
+                    hop.liquidity.local_balance_msat.saturating_sub(delta)
+                } else {
+                    hop.liquidity.local_balance_msat.saturating_add(delta)
+                };
+                let remote_after = hop.capacity_msat.saturating_sub(local_after);
+                (local_after, remote_after)
+            };
+
+            let projected = LiquidityProfile::compute(hop.capacity_msat, local_after, remote_after);
+            let clears_finding = projected.imbalance == LiquidityImbalance::Balanced;
+
+            simulations.push(Simulation {
+                id: uuid::Uuid::new_v4().to_string(),
+                action_id: format!("route-{finding_id}"),
+                finding_id: finding_id.to_string(),
+                action_type: ActionType::RebalanceChannel,
+                projection: SimulationProjection {
+                    local_ratio_before: hop.liquidity.local_ratio,
+                    local_ratio_after: projected.local_ratio,
+                    local_balance_msat_after: local_after,
+                    remote_balance_msat_after: remote_after,
+                    delta_msat: delta,
+                    clears_finding,
+                    summary: format!(
+                        "Hop {i} ({cid}): {delta} msat routed → local={local_after}, {status}",
+                        status = if clears_finding {
+                            "balanced"
+                        } else {
+                            "still unbalanced"
+                        },
+                    ),
+                },
+                created_at: chrono::Utc::now(),
+            });
+        }
+
+        Ok(simulations)
+    }
+
+    /// Project where a channel's ratio would be after `cycles_ahead` cycles
+    /// of steady decline at `decline_per_cycle` per cycle. Returns `None` if
+    /// the current ratio is already at zero or capacity is invalid.
+    pub fn project_drift(
+        channel: &Channel,
+        decline_per_cycle: f64,
+        cycles_ahead: u32,
+    ) -> Option<SimulationProjection> {
+        if channel.capacity_msat == 0 || channel.liquidity.local_ratio <= 0.0 {
+            return None;
+        }
+        let projected_ratio =
+            (channel.liquidity.local_ratio - decline_per_cycle * cycles_ahead as f64).max(0.0);
+        let local_after = (projected_ratio * channel.capacity_msat as f64).round() as u64;
+        let remote_after = channel.capacity_msat.saturating_sub(local_after);
+        let projected = LiquidityProfile::compute(channel.capacity_msat, local_after, remote_after);
+        let will_be_critical = projected.imbalance == LiquidityImbalance::SeverelyDrained;
+
+        Some(SimulationProjection {
+            local_ratio_before: channel.liquidity.local_ratio,
+            local_ratio_after: projected_ratio,
+            local_balance_msat_after: local_after,
+            remote_balance_msat_after: remote_after,
+            delta_msat: local_after.abs_diff(channel.liquidity.local_balance_msat),
+            clears_finding: false,
+            summary: format!(
+                "After {cycles_ahead} cycles at -{:.4} per cycle, channel {} would \
+                 reach local_ratio={:.4} ({}) — the current severity threshold is \
+                 crossed in {} cycle(s).",
+                decline_per_cycle,
+                channel.id,
+                projected_ratio,
+                if will_be_critical {
+                    "Critical"
+                } else if projected.local_ratio < 0.10 {
+                    "Drained"
+                } else {
+                    "Stable"
+                },
+                ((channel.liquidity.local_ratio - 0.10).max(0.0) / decline_per_cycle) as u32,
+            ),
         })
     }
 
@@ -249,5 +383,74 @@ mod tests {
             sim.projection.local_balance_msat_after,
             c.liquidity.local_balance_msat
         );
+    }
+
+    // ── Multi-hop rebalance route ────────────────────────────────────
+
+    fn graph_map(channels: &[Channel]) -> HashMap<ChannelId, Channel> {
+        channels.iter().map(|c| (c.id.clone(), c.clone())).collect()
+    }
+
+    #[test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    fn single_hop_route_is_equivalent_to_direct_rebalance() {
+        let c = channel("c1", 10_000, 90_000);
+        let channels = graph_map(&[c.clone()]);
+        let route = vec![ChannelId::new("c1")];
+        let sims = Simulator
+            .project_rebalance_route(&c, 0.5, &route, &channels, "f1")
+            .unwrap();
+        assert_eq!(sims.len(), 1);
+        assert!(sims[0].projection.clears_finding);
+        assert_eq!(sims[0].projection.delta_msat, 40_000);
+    }
+
+    #[test]
+    fn multi_hop_projects_effect_on_each_hop() {
+        let c1 = channel("c1", 10_000, 90_000);
+        let c2 = channel("c2", 500_000, 500_000);
+        let channels = graph_map(&[c1.clone(), c2.clone()]);
+        let route = vec![ChannelId::new("c1"), ChannelId::new("c2")];
+        let sims = Simulator
+            .project_rebalance_route(&c1, 0.5, &route, &channels, "f1")
+            .unwrap();
+        assert_eq!(sims.len(), 2);
+        assert!(sims[0].projection.clears_finding); // c1 balanced
+                                                    // c2 gets delta applied (intermediate hop)
+        assert_eq!(sims[1].projection.delta_msat, 40_000);
+    }
+
+    #[test]
+    fn empty_route_is_error() {
+        let c = channel("c1", 50_000, 50_000);
+        let channels = graph_map(&[]);
+        assert!(Simulator
+            .project_rebalance_route(&c, 0.5, &[], &channels, "f1")
+            .is_err());
+    }
+
+    // ── Time-bound drift projection ──────────────────────────────────
+
+    #[test]
+    fn drift_projection_shows_decline_after_cycles() {
+        let c = channel("c1", 400_000, 600_000); // local_ratio = 0.4
+        let proj = Simulator::project_drift(&c, 0.05, 4).unwrap();
+        // 0.4 - 0.05*4 = 0.2
+        assert!((proj.local_ratio_after - 0.2).abs() < 1e-9);
+        assert_eq!(proj.delta_msat, 200_000);
+    }
+
+    #[test]
+    fn drift_projection_floors_at_zero() {
+        let c = channel("c1", 100_000, 900_000); // local_ratio = 0.1
+        let proj = Simulator::project_drift(&c, 0.05, 5).unwrap();
+        assert_eq!(proj.local_ratio_after, 0.0);
+    }
+
+    #[test]
+    fn drift_projection_none_for_zero_capacity() {
+        let mut c = channel("c1", 0, 0);
+        c.capacity_msat = 0;
+        assert!(Simulator::project_drift(&c, 0.05, 3).is_none());
     }
 }
