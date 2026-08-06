@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -49,6 +49,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: V7_SNAPSHOT_SPENDABLE,
+    },
+    Migration {
+        version: 8,
+        sql: V8_SIMULATION_V2,
     },
 ];
 
@@ -228,6 +232,20 @@ CREATE TABLE IF NOT EXISTS channel_snapshots (
 );
 ALTER TABLE channel_snapshots ADD COLUMN spendable_outbound_msat INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE channel_snapshots ADD COLUMN spendable_inbound_msat INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// v8: v2 simulation fields (ADR-0005). Adds lifecycle, provenance, and
+/// deterministic-identity columns to the simulations table. Existing rows
+/// get sensible defaults (status=completed, model_id='legacy').
+const V8_SIMULATION_V2: &str = r#"
+ALTER TABLE simulations ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';
+ALTER TABLE simulations ADD COLUMN model_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE simulations ADD COLUMN model_version TEXT NOT NULL DEFAULT '0';
+ALTER TABLE simulations ADD COLUMN input_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE simulations ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE simulations ADD COLUMN assumptions TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE simulations ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE simulations ADD COLUMN explanation TEXT NOT NULL DEFAULT '';
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).

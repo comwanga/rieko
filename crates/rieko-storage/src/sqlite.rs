@@ -695,6 +695,74 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    // ── V2 simulation persistence (ADR-0005) ──────────────────────────
+
+    fn save_simulation_v2(&mut self, rec: &crate::SimulationRecord) -> Result<(), StorageError> {
+        let proj = serde_json::to_string(&rec.projection)
+            .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
+        let assumptions = serde_json::to_string(&rec.assumptions)
+            .map_err(|e| StorageError::Corrupt(format!("assumptions: {e}")))?;
+        let warnings = serde_json::to_string(&rec.warnings)
+            .map_err(|e| StorageError::Corrupt(format!("warnings: {e}")))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO simulations
+             (id, action_id, finding_id, action_type, status, model_id, model_version,
+              input_hash, confidence, assumptions, warnings, explanation, projection, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                rec.id,
+                rec.action_id,
+                rec.finding_id,
+                rec.action_type,
+                rec.status,
+                rec.model_id,
+                rec.model_version,
+                rec.input_hash,
+                rec.confidence,
+                assumptions,
+                warnings,
+                rec.explanation,
+                proj,
+                rec.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn recent_simulations_v2(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<crate::SimulationRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at
+             FROM simulations ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map([limit], Self::row_to_simulation_v2)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn simulations_v2_for_action(
+        &mut self,
+        action_id: &str,
+    ) -> Result<Vec<crate::SimulationRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at
+             FROM simulations WHERE action_id = ? ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([action_id], Self::row_to_simulation_v2)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn counts(&mut self) -> Result<StorageCounts, StorageError> {
         let count = |table: &str| -> Result<usize, StorageError> {
             let n: i64 =
@@ -739,6 +807,25 @@ impl SqliteStorage {
             action_type,
             projection,
             created_at: parse_ts(&row.get::<_, String>(5)?),
+        })
+    }
+
+    fn row_to_simulation_v2(row: &rusqlite::Row) -> rusqlite::Result<crate::SimulationRecord> {
+        Ok(crate::SimulationRecord {
+            id: row.get(0)?,
+            action_id: row.get(1)?,
+            finding_id: row.get(2)?,
+            action_type: row.get(3)?,
+            status: row.get(4)?,
+            model_id: row.get(5)?,
+            model_version: row.get(6)?,
+            input_hash: row.get(7)?,
+            confidence: row.get(8)?,
+            assumptions: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+            warnings: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+            explanation: row.get(11)?,
+            projection: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+            created_at: row.get(13)?,
         })
     }
 }
@@ -1900,6 +1987,10 @@ mod tests {
                     finding_id TEXT NOT NULL, action_id TEXT PRIMARY KEY, action_type TEXT NOT NULL,
                     stage TEXT NOT NULL, target TEXT, params TEXT NOT NULL, summary TEXT NOT NULL,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE simulations (
+                    id TEXT PRIMARY KEY, action_id TEXT NOT NULL, finding_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL, projection TEXT NOT NULL, created_at TEXT NOT NULL
                  );
                  INSERT INTO findings (id, detector, severity, node_id, channel_id, evidence, ts)
                  VALUES ('old1', 'channel_liquidity', 0, 'n1', 'c1', '[{\"key\":\"k\",\"value\":1}]',
