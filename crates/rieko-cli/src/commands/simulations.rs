@@ -5,6 +5,11 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
+use rieko_domain::ChannelId;
+use rieko_simulation::model::{
+    compute_input_hash, LiquidityRedistributionModel, SimulationContext, SimulationModel,
+    SimulationRequest,
+};
 use rieko_storage::{SimulationRecord, SqliteStorage, Storage};
 use tracing::info;
 
@@ -85,57 +90,121 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
         _ => bail!("unknown simulation model: {model_id}"),
     };
 
+    // Build parameters
     let params = serde_json::json!({
         "source_channel": c.source_channel,
         "destination_channel": c.destination_channel,
         "amount_sats": c.amount_sats,
     });
 
-    // Validate amount
     if let Some(amt) = c.amount_sats {
         if amt == 0 {
             bail!("amount must be greater than zero");
         }
     }
 
-    let input_hash = compute_v2_input_hash(model_id, model_version, &params, &now);
     let id = uuid::Uuid::new_v4().to_string();
+
+    // Build simulation context from persisted channel snapshots
+    let mut channels = std::collections::HashMap::new();
+    if c.source_channel.is_some() || c.destination_channel.is_some() {
+        let snaps = storage.recent_snapshots_all(500)?;
+        // Reconstruct approximate channel state from most recent snapshot per channel
+        let mut seen: std::collections::HashMap<ChannelId, bool> = std::collections::HashMap::new();
+        for snap in snaps {
+            let cid = snap.channel_id();
+            if !seen.contains_key(&cid) {
+                seen.insert(cid.clone(), true);
+                channels.insert(
+                    cid.clone(),
+                    rieko_domain::Channel {
+                        id: cid,
+                        node: rieko_domain::NodeId::new("local-node"),
+                        peer: rieko_domain::NodeId::new("unknown"),
+                        channel_point: String::new(),
+                        capacity_msat: snap.capacity_msat,
+                        fee_policy: rieko_domain::FeePolicy::default(),
+                        status: snap.status,
+                        liquidity: rieko_domain::LiquidityProfile::compute(
+                            snap.capacity_msat,
+                            snap.local_balance_msat,
+                            snap.remote_balance_msat,
+                        ),
+                        last_seen: snap.ts,
+                        opening_height: None,
+                        local_reserve_msat: None,
+                        remote_reserve_msat: None,
+                        is_private: false,
+                        is_initiator: false,
+                        total_sent_msat: None,
+                        total_received_msat: None,
+                    },
+                );
+            }
+        }
+    }
+
+    let ctx = SimulationContext { channels };
+    let request = SimulationRequest {
+        id: id.clone(),
+        recommendation_id: c.recommendation.clone(),
+        finding_id: rec.finding_id.clone(),
+        model_id: model_id.into(),
+        model_version: model_version.into(),
+        source_observed_at: now,
+        parameters: params.clone(),
+        requested_at: now,
+    };
+
+    let input_hash = compute_input_hash(model_id, model_version, &params, &now);
+
+    // Run the model
+    let model = LiquidityRedistributionModel::new();
+    let (status, confidence, assumptions, warnings, projection, explanation) =
+        match model.simulate(&request, &ctx) {
+            Ok(result) => (
+                result.status.as_str().to_string(),
+                result.confidence.as_str().to_string(),
+                result
+                    .assumptions
+                    .iter()
+                    .map(|a| serde_json::json!({"code": a.code, "description": a.description}))
+                    .collect::<Vec<_>>(),
+                result
+                    .warnings
+                    .iter()
+                    .map(|w| serde_json::json!({"code": w.code, "description": w.description}))
+                    .collect::<Vec<_>>(),
+                serde_json::to_value(&result).unwrap_or_default(),
+                result.explanation.unwrap_or_default(),
+            ),
+            Err(e) => {
+                // On failure, store a minimal record with the error.
+                (
+                    "failed".into(),
+                    "unknown".into(),
+                    vec![] as Vec<serde_json::Value>,
+                    vec![serde_json::json!({"code": "ModelError", "description": e.to_string()})],
+                    serde_json::json!({}),
+                    String::new(),
+                )
+            }
+        };
 
     let rec = SimulationRecord {
         id: id.clone(),
         action_id: rec.action.id.clone(),
         finding_id: rec.finding_id.clone(),
         action_type: rec.action.action_type.as_str().to_string(),
-        status: "completed".into(),
+        status,
         model_id: model_id.into(),
         model_version: model_version.into(),
         input_hash: input_hash.clone(),
-        confidence: "medium".into(),
-        assumptions: serde_json::json!([
-            {"code":"FeesNotEstimated","description":"Routing fees are not estimated"},
-            {"code":"PendingHtlcsExcluded","description":"Pending HTLCs are not included in the projection"}
-        ]),
-        warnings: if c.force {
-            serde_json::json!([])
-        } else {
-            serde_json::json!([
-                {"code":"SnapshotMayBecomeStale","description":"Source data may become stale without a recent observation"}
-            ])
-        },
-        explanation: String::new(),
-        projection: serde_json::json!({
-            "local_ratio_before": 0.0,
-            "local_ratio_after": 0.0,
-            "local_balance_msat_after": 0,
-            "remote_balance_msat_after": 0,
-            "delta_msat": 0,
-            "clears_finding": false,
-            "summary": format!(
-                "Simulation created from recommendation {}. To see projected liquidity changes, \
-                 connect to a live node with `--lnd-rest` in the simulate pipeline.",
-                c.recommendation
-            ),
-        }),
+        confidence,
+        assumptions: serde_json::Value::Array(assumptions),
+        warnings: serde_json::Value::Array(warnings),
+        explanation,
+        projection,
         created_at: now.to_rfc3339(),
     };
 
@@ -218,25 +287,6 @@ fn run_show(args: &SimulationsArgs, simulation_id: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn compute_v2_input_hash(
-    model_id: &str,
-    model_version: &str,
-    params: &serde_json::Value,
-    observed_at: &chrono::DateTime<chrono::Utc>,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"rieko-simulation-v2:");
-    h.update(model_id.as_bytes());
-    h.update(b":");
-    h.update(model_version.as_bytes());
-    h.update(b":");
-    h.update(observed_at.to_rfc3339().as_bytes());
-    h.update(b":");
-    h.update(serde_json::to_vec(params).unwrap_or_default());
-    format!("{:x}", h.finalize())
 }
 
 /// Minimal polyfill for platforms where `dirs_next` isn't available.
