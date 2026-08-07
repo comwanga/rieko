@@ -22,6 +22,9 @@ enum Command {
     /// Run the pipeline once, then project what each recommendation would do.
     #[cfg(feature = "simulate")]
     Simulate(commands::simulate::SimulateArgs),
+    /// Create and inspect deterministic what-if projections (v2).
+    #[cfg(feature = "simulate")]
+    Simulations(commands::simulations::SimulationsArgs),
     /// Approve or execute recommended actions (human-gated).
     #[cfg(feature = "execute")]
     Actions(commands::actions::ActionsArgs),
@@ -44,6 +47,8 @@ fn main() -> anyhow::Result<()> {
         Command::Monitor(args) => commands::monitor::run(args),
         #[cfg(feature = "simulate")]
         Command::Simulate(args) => commands::simulate::run(args),
+        #[cfg(feature = "simulate")]
+        Command::Simulations(args) => commands::simulations::run(args),
         #[cfg(feature = "execute")]
         Command::Actions(args) => commands::actions::run(args),
         Command::Status(args) => commands::status::run(args),
@@ -68,7 +73,14 @@ mod tests {
                 "default CLI help must not advertise capability containing {banned:?}\n{help}"
             );
         }
-        for required in ["scan", "monitor", "simulate", "status", "serve"] {
+        for required in [
+            "scan",
+            "monitor",
+            "simulate",
+            "simulations",
+            "status",
+            "serve",
+        ] {
             assert!(
                 help.to_lowercase().contains(required),
                 "default CLI help must advertise {required:?}\n{help}"
@@ -85,9 +97,24 @@ mod tests {
             .map(|s| s.get_name().to_string())
             .collect::<Vec<_>>();
         #[cfg(not(feature = "execute"))]
-        let expected: &[&str] = &["scan", "monitor", "simulate", "status", "serve"];
+        let expected: &[&str] = &[
+            "scan",
+            "monitor",
+            "simulate",
+            "simulations",
+            "status",
+            "serve",
+        ];
         #[cfg(feature = "execute")]
-        let expected: &[&str] = &["scan", "monitor", "simulate", "actions", "status", "serve"];
+        let expected: &[&str] = &[
+            "scan",
+            "monitor",
+            "simulate",
+            "simulations",
+            "actions",
+            "status",
+            "serve",
+        ];
         assert_eq!(got, expected, "got {got:?}");
     }
 }

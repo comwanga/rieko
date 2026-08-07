@@ -130,10 +130,19 @@ impl RiekoApi {
                 axum::routing::get(crate::routes::channel_snapshots),
             );
         #[cfg(feature = "simulate")]
-        let router = router.route(
-            "/simulations",
-            axum::routing::get(crate::routes::recent_simulations),
-        );
+        let router = router
+            .route(
+                "/simulations",
+                axum::routing::get(crate::routes::recent_simulations),
+            )
+            .route(
+                "/simulations/v2",
+                axum::routing::get(crate::routes::recent_simulations_v2),
+            )
+            .route(
+                "/simulations/:simulation_id",
+                axum::routing::get(crate::routes::simulation_v2_by_id),
+            );
         router
             // Bearer auth guards the JSON surface; static assets are inert.
             .route_layer(axum::middleware::from_fn_with_state(

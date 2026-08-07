@@ -6,4 +6,6 @@ pub mod scan;
 pub mod serve;
 #[cfg(feature = "simulate")]
 pub mod simulate;
+#[cfg(feature = "simulate")]
+pub mod simulations;
 pub mod status;
