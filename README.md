@@ -175,22 +175,40 @@ export RIEKO_TELEGRAM_CHAT_ID=...
 Severity escalation (e.g. Warning → Critical) pierces the cooldown and
 delivers immediately. Failed deliveries do not consume the cooldown.
 
-### 11. Future features (--features future)
+### 11. Simulation (v2, default-enabled)
 
-Simulation and execution are post-v1 capabilities gated behind the `future`
-Cargo feature. They are not available in the default build:
+`rieko simulations create` projects a hypothetical liquidity transfer
+and records the deterministic result using the `liquidity-redistribution`
+model — it does not move real funds:
 
 ```sh
-cargo run --features future -- simulate --fixture fixtures/channels.json
-cargo run --features future -- actions list
-cargo run --features future -- actions approve <id> --actor alice
-cargo run --features future -- actions execute <id> --actor alice \
-  --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert \
-  --macaroon read-only.macaroon --allow-mainnet
+cargo run -- simulations create \
+  --recommendation <rec-id> \
+  --model liquidity-redistribution \
+  --source-channel <id> --destination-channel <id> --amount-sats 50000
+
+cargo run -- simulations list
+cargo run -- simulations show <sim-id>
 ```
 
-See [docs/adrs/0002-rebalance-execution-safety.md](docs/adrs/0002-rebalance-execution-safety.md)
-and the following ADRs for the execution threat model.
+Simulation is read-only, deterministic, and snapshot-bound. See
+[docs/adrs/0005-v2-deterministic-simulation.md](docs/adrs/0005-v2-deterministic-simulation.md).
+
+### 12. Execution (v3, gated behind --features execute)
+
+Node-mutating actions require explicit opt-in at build time:
+
+```sh
+cargo run --features execute -- actions list
+cargo run --features execute -- actions approve <id> --actor alice
+cargo run --features execute -- actions execute <id> --actor alice \
+  --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert \
+  --macaroon execution.macaroon --allow-mainnet
+```
+
+Execution uses a separate macaroon from observation. See
+[docs/adrs/0003-human-in-the-loop-threat-model.md](docs/adrs/0003-human-in-the-loop-threat-model.md)
+and [docs/adrs/0004-mainnet-readiness-approval-workflow.md](docs/adrs/0004-mainnet-readiness-approval-workflow.md).
 
 ## Architecture
 

@@ -4,7 +4,7 @@ pub mod common;
 pub mod monitor;
 pub mod scan;
 pub mod serve;
-#[cfg(feature = "simulate")]
+#[cfg(feature = "execute")]
 pub mod simulate;
 #[cfg(feature = "simulate")]
 pub mod simulations;

@@ -118,6 +118,9 @@ pub struct SimulationRequest {
     pub model_id: String,
     pub model_version: String,
     pub source_observed_at: DateTime<Utc>,
+    /// Canonical hash of the immutable source snapshot (channel state)
+    /// this simulation was computed against.
+    pub source_snapshot_hash: String,
     pub parameters: serde_json::Value,
     pub requested_at: DateTime<Utc>,
 }
@@ -184,6 +187,7 @@ pub fn compute_input_hash(
     model_version: &str,
     parameters: &serde_json::Value,
     source_observed_at: &DateTime<Utc>,
+    source_snapshot_hash: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -193,6 +197,8 @@ pub fn compute_input_hash(
     h.update(model_version.as_bytes());
     h.update(b":");
     h.update(source_observed_at.to_rfc3339().as_bytes());
+    h.update(b":");
+    h.update(source_snapshot_hash.as_bytes());
     h.update(b":");
     h.update(serde_json::to_vec(parameters).unwrap_or_default());
     format!("{:x}", h.finalize())
@@ -271,10 +277,32 @@ impl SimulationModel for LiquidityRedistributionModel {
                 "source channel {source_id} has zero capacity"
             )));
         }
-        let _dest = context
+        let dest = context
             .channels
             .get(&ChannelId::new(dest_id))
             .ok_or_else(|| ModelError::ChannelNotFound(dest_id.into()))?;
+        let amount_msat = amount_sats.saturating_mul(1000);
+        let available = src.liquidity.local_balance_msat;
+        if amount_msat > available {
+            return Err(ModelError::InvalidInput(format!(
+                "amount {amount_sats} sats exceeds available source liquidity {available} msat"
+            )));
+        }
+        if !dest.status.is_open() {
+            return Err(ModelError::InvalidInput(format!(
+                "destination channel {dest_id} is not open"
+            )));
+        }
+        if dest
+            .liquidity
+            .local_balance_msat
+            .saturating_add(amount_msat)
+            > dest.capacity_msat
+        {
+            return Err(ModelError::InvalidInput(format!(
+                "amount {amount_sats} sats would overflow destination channel {dest_id} capacity"
+            )));
+        }
         Ok(())
     }
 
@@ -300,18 +328,31 @@ impl SimulationModel for LiquidityRedistributionModel {
             .get("amount_sats")
             .and_then(|v| v.as_u64())
             .unwrap();
-        let amount_msat = amount_sats * 1000;
+        let amount_msat = amount_sats
+            .checked_mul(1000)
+            .ok_or_else(|| ModelError::CalculationFailed("amount overflow".into()))?;
 
         let src = context.channels.get(&ChannelId::new(source_id)).unwrap();
         let dest = context.channels.get(&ChannelId::new(dest_id)).unwrap();
 
-        let src_local_after = src.liquidity.local_balance_msat.saturating_sub(amount_msat);
-        let src_remote_after = src.capacity_msat.saturating_sub(src_local_after);
+        let src_local_after = src
+            .liquidity
+            .local_balance_msat
+            .checked_sub(amount_msat)
+            .ok_or_else(|| ModelError::CalculationFailed("source underflow".into()))?;
+        let src_remote_after = src
+            .capacity_msat
+            .checked_sub(src_local_after)
+            .ok_or_else(|| ModelError::CalculationFailed("source capacity underflow".into()))?;
         let dest_local_after = dest
             .liquidity
             .local_balance_msat
-            .saturating_add(amount_msat);
-        let dest_remote_after = dest.capacity_msat.saturating_sub(dest_local_after);
+            .checked_add(amount_msat)
+            .ok_or_else(|| ModelError::CalculationFailed("destination overflow".into()))?;
+        let dest_remote_after = dest
+            .capacity_msat
+            .checked_sub(dest_local_after)
+            .ok_or_else(|| ModelError::CalculationFailed("dest capacity underflow".into()))?;
 
         let src_profile = rieko_domain::LiquidityProfile::compute(
             src.capacity_msat,
@@ -326,6 +367,7 @@ impl SimulationModel for LiquidityRedistributionModel {
             self.model_version(),
             &request.parameters,
             &request.source_observed_at,
+            &request.source_snapshot_hash,
         );
 
         Ok(SimulationResult {
@@ -401,8 +443,8 @@ mod tests {
     fn input_hash_is_deterministic() {
         let params = serde_json::json!({"amount_sats": 100_000u64});
         let ts = Utc::now();
-        let h1 = compute_input_hash("liquidity-redistribution", "1", &params, &ts);
-        let h2 = compute_input_hash("liquidity-redistribution", "1", &params, &ts);
+        let h1 = compute_input_hash("liquidity-redistribution", "1", &params, &ts, "");
+        let h2 = compute_input_hash("liquidity-redistribution", "1", &params, &ts, "");
         assert_eq!(h1, h2);
     }
 
@@ -410,8 +452,8 @@ mod tests {
     fn input_hash_differs_per_model_version() {
         let params = serde_json::json!({});
         let ts = Utc::now();
-        let h1 = compute_input_hash("m", "1", &params, &ts);
-        let h2 = compute_input_hash("m", "2", &params, &ts);
+        let h1 = compute_input_hash("m", "1", &params, &ts, "");
+        let h2 = compute_input_hash("m", "2", &params, &ts, "");
         assert_ne!(h1, h2);
     }
 
@@ -454,6 +496,7 @@ mod tests {
             model_id: "liquidity-redistribution".into(),
             model_version: "1".into(),
             source_observed_at: Utc::now(),
+            source_snapshot_hash: "hash1".into(),
             parameters: params,
             requested_at: Utc::now(),
         }
@@ -463,21 +506,34 @@ mod tests {
     fn valid_redistribution_produces_result() {
         let model = LiquidityRedistributionModel::new();
         let ctx = test_context(vec![
+            test_channel("c1", 1_000_000_000, 200_000_000),
+            test_channel("c2", 1_000_000_000, 800_000_000),
+        ]);
+        let req = test_request(serde_json::json!({
+            "source_channel": "c1",
+            "destination_channel": "c2",
+            "amount_sats": 50_000,
+        }));
+        let result = model.simulate(&req, &ctx).unwrap();
+        assert_eq!(result.status, SimulationStatus::Completed);
+        assert_eq!(result.deltas.len(), 2);
+        assert_eq!(result.deltas[0].channel_id, "c1");
+        assert_eq!(result.deltas[0].delta_msat, 50_000_000);
+    }
+
+    #[test]
+    fn amount_exceeding_source_fails_validation() {
+        let model = LiquidityRedistributionModel::new();
+        let ctx = test_context(vec![
             test_channel("c1", 1_000_000, 200_000),
             test_channel("c2", 1_000_000, 800_000),
         ]);
         let req = test_request(serde_json::json!({
             "source_channel": "c1",
             "destination_channel": "c2",
-            "amount_sats": 100_000,
+            "amount_sats": 300,
         }));
-        let result = model.simulate(&req, &ctx).unwrap();
-        assert_eq!(result.status, SimulationStatus::Completed);
-        assert_eq!(result.deltas.len(), 2);
-        assert_eq!(result.deltas[0].channel_id, "c1");
-        assert_eq!(result.deltas[0].delta_msat, 100_000_000);
-        // source: 200_000 - 100_000_000 saturates to 0
-        assert_eq!(result.deltas[0].local_after_msat, 0);
+        assert!(model.validate(&req, &ctx).is_err());
     }
 
     #[test]
