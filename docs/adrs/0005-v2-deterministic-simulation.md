@@ -1,6 +1,6 @@
 # ADR-0005: Rieko v2 — Deterministic Operational Simulation
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Date:** 2026-08-07
 - **Deciders:** Owner
 - **Type:** Architecture (v2, D7 Simulate)

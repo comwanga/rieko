@@ -83,7 +83,7 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
         .recommendation_for_action(&c.recommendation)?
         .with_context(|| format!("no recommendation with id {}", c.recommendation))?;
 
-    let now = chrono::Utc::now();
+    let mut source_observed_at = chrono::Utc::now(); // default, overwritten from snapshot
     let model_id = &c.model;
     let model_version = match model_id.as_str() {
         "liquidity-redistribution" => "1",
@@ -109,6 +109,7 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
     let mut channels = std::collections::HashMap::new();
     if c.source_channel.is_some() || c.destination_channel.is_some() {
         let snaps = storage.recent_snapshots_all(500)?;
+        source_observed_at = snaps.first().map(|s| s.ts).unwrap_or(source_observed_at);
         // Reconstruct approximate channel state from most recent snapshot per channel
         let mut seen: std::collections::HashMap<ChannelId, bool> = std::collections::HashMap::new();
         for snap in snaps {
@@ -144,6 +145,23 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
         }
     }
 
+    let snapshot_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut sorted: std::collections::BTreeMap<&ChannelId, &rieko_domain::Channel> =
+            std::collections::BTreeMap::new();
+        for (cid, ch) in channels.iter() {
+            sorted.insert(cid, ch);
+        }
+        for (cid, ch) in &sorted {
+            h.update(cid.as_str().as_bytes());
+            h.update(ch.liquidity.local_balance_msat.to_be_bytes());
+            h.update(ch.liquidity.remote_balance_msat.to_be_bytes());
+            h.update(ch.capacity_msat.to_be_bytes());
+        }
+        format!("{:x}", h.finalize())
+    };
+
     let ctx = SimulationContext { channels };
     let request = SimulationRequest {
         id: id.clone(),
@@ -151,45 +169,38 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
         finding_id: rec.finding_id.clone(),
         model_id: model_id.into(),
         model_version: model_version.into(),
-        source_observed_at: now,
+        source_observed_at,
+        source_snapshot_hash: snapshot_hash.clone(),
         parameters: params.clone(),
-        requested_at: now,
+        requested_at: chrono::Utc::now(),
     };
 
-    let input_hash = compute_input_hash(model_id, model_version, &params, &now);
+    let input_hash = compute_input_hash(
+        model_id,
+        model_version,
+        &params,
+        &source_observed_at,
+        &snapshot_hash,
+    );
 
     // Run the model
     let model = LiquidityRedistributionModel::new();
-    let (status, confidence, assumptions, warnings, projection, explanation) =
-        match model.simulate(&request, &ctx) {
-            Ok(result) => (
-                result.status.as_str().to_string(),
-                result.confidence.as_str().to_string(),
-                result
-                    .assumptions
-                    .iter()
-                    .map(|a| serde_json::json!({"code": a.code, "description": a.description}))
-                    .collect::<Vec<_>>(),
-                result
-                    .warnings
-                    .iter()
-                    .map(|w| serde_json::json!({"code": w.code, "description": w.description}))
-                    .collect::<Vec<_>>(),
-                serde_json::to_value(&result).unwrap_or_default(),
-                result.explanation.unwrap_or_default(),
-            ),
-            Err(e) => {
-                // On failure, store a minimal record with the error.
-                (
-                    "failed".into(),
-                    "unknown".into(),
-                    vec![] as Vec<serde_json::Value>,
-                    vec![serde_json::json!({"code": "ModelError", "description": e.to_string()})],
-                    serde_json::json!({}),
-                    String::new(),
-                )
-            }
-        };
+    let result = model.simulate(&request, &ctx)?;
+
+    let status = result.status.as_str().to_string();
+    let confidence = result.confidence.as_str().to_string();
+    let assumptions: Vec<_> = result
+        .assumptions
+        .iter()
+        .map(|a| serde_json::json!({"code": a.code, "description": a.description}))
+        .collect();
+    let warnings: Vec<_> = result
+        .warnings
+        .iter()
+        .map(|w| serde_json::json!({"code": w.code, "description": w.description}))
+        .collect();
+    let explanation = result.explanation.clone();
+    let projection = serde_json::to_value(&result).unwrap_or_default();
 
     let rec = SimulationRecord {
         id: id.clone(),
@@ -199,20 +210,20 @@ fn run_create(args: &SimulationsArgs, c: &CreateArgs) -> Result<()> {
         status,
         model_id: model_id.into(),
         model_version: model_version.into(),
-        input_hash: input_hash.clone(),
+        input_hash,
         confidence,
         assumptions: serde_json::Value::Array(assumptions),
         warnings: serde_json::Value::Array(warnings),
-        explanation,
+        explanation: explanation.unwrap_or_default(),
         projection,
-        created_at: now.to_rfc3339(),
+        created_at: chrono::Utc::now().to_rfc3339(),
     };
 
     storage.save_simulation_v2(&rec)?;
     info!(simulation_id = %id, model_id, "simulation created");
     println!("Created simulation {id}");
     println!("  model:   {model_id} v{model_version}");
-    println!("  hash:    {input_hash}");
+    println!("  hash:    {}", rec.input_hash);
 
     Ok(())
 }
