@@ -6,7 +6,9 @@ pub mod storage;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use retention::{PruneSummary, RetentionPolicy};
 pub use sqlite::{SqliteStorage, WriterLock};
-pub use storage::{MemoryStorage, SimulationRecord, Storage, StorageCounts, StorageError};
+pub use storage::{
+    MemoryStorage, SimulationEvent, SimulationRecord, Storage, StorageCounts, StorageError,
+};
 
 /// Cap for table row counts loaded by the default `counts()` fallback. Real
 /// backends override `counts()` with `SELECT COUNT(*)` and never hit this cap.

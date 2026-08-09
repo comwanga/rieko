@@ -19,9 +19,6 @@ enum Command {
     Scan(commands::scan::ScanArgs),
     /// Run the same pipeline continuously, tracking channel state over time.
     Monitor(commands::monitor::MonitorArgs),
-    /// Run the pipeline once, then project what each recommendation would do.
-    #[cfg(feature = "execute")]
-    Simulate(commands::simulate::SimulateArgs),
     /// Create and inspect deterministic what-if projections (v2).
     #[cfg(feature = "simulate")]
     Simulations(commands::simulations::SimulationsArgs),
@@ -45,8 +42,6 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Scan(args) => commands::scan::run(args),
         Command::Monitor(args) => commands::monitor::run(args),
-        #[cfg(feature = "execute")]
-        Command::Simulate(args) => commands::simulate::run(args),
         #[cfg(feature = "simulate")]
         Command::Simulations(args) => commands::simulations::run(args),
         #[cfg(feature = "execute")]
@@ -73,7 +68,11 @@ mod tests {
                 "default CLI help must not advertise capability containing {banned:?}\n{help}"
             );
         }
-        for required in ["scan", "monitor", "simulations", "status", "serve"] {
+        #[cfg(feature = "simulate")]
+        let required = ["scan", "monitor", "simulations", "status", "serve"];
+        #[cfg(not(feature = "simulate"))]
+        let required = ["scan", "monitor", "status", "serve"];
+        for required in required {
             assert!(
                 help.to_lowercase().contains(required),
                 "default CLI help must advertise {required:?}\n{help}"
@@ -89,18 +88,21 @@ mod tests {
             .get_subcommands()
             .map(|s| s.get_name().to_string())
             .collect::<Vec<_>>();
-        #[cfg(not(feature = "execute"))]
+        #[cfg(all(not(feature = "execute"), feature = "simulate"))]
         let expected: &[&str] = &["scan", "monitor", "simulations", "status", "serve"];
-        #[cfg(feature = "execute")]
+        #[cfg(all(feature = "execute", feature = "simulate"))]
         let expected: &[&str] = &[
             "scan",
             "monitor",
-            "simulate",
             "simulations",
             "actions",
             "status",
             "serve",
         ];
+        #[cfg(all(feature = "execute", not(feature = "simulate")))]
+        let expected: &[&str] = &["scan", "monitor", "actions", "status", "serve"];
+        #[cfg(all(not(feature = "execute"), not(feature = "simulate")))]
+        let expected: &[&str] = &["scan", "monitor", "status", "serve"];
         assert_eq!(got, expected, "got {got:?}");
     }
 }

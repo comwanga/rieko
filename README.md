@@ -197,22 +197,28 @@ cargo run -- simulations list
 cargo run -- simulations show <sim-id>
 ```
 
-Simulation is read-only, deterministic, and snapshot-bound. See
+Simulation is read-only and deterministic. It requires source and destination
+snapshots from the same observation, embeds those exact inputs for replay, and
+rejects data older than 15 minutes unless the operator explicitly uses
+`--force`; forced stale results remain marked stale. See
 [docs/adrs/0005-v2-deterministic-simulation.md](docs/adrs/0005-v2-deterministic-simulation.md).
+Databases upgraded to schema v10 need one new monitor cycle before simulation,
+because legacy snapshots do not contain a trustworthy local-node identity.
 
-### 12. Execution (v3, gated behind --features execute)
+### 12. Execution (v3, interlocked)
 
-Node-mutating actions require explicit opt-in at build time:
+The draft execution code remains compile-time isolated behind `--features
+execute`, but live execution is intentionally refused even in that build.
+Simulation integrity is only the first prerequisite; durable execution
+idempotency, verified LND protocol behavior, confirmation, pre-flight checks,
+and regtest fault testing are not complete.
 
 ```sh
 cargo run --features execute -- actions list
 cargo run --features execute -- actions approve <id> --actor alice
-cargo run --features execute -- actions execute <id> --actor alice \
-  --lnd-rest https://localhost:8080 --tls-cert ~/.lnd/tls.cert \
-  --macaroon execution.macaroon --allow-mainnet
 ```
 
-Execution uses a separate macaroon from observation. See
+Do not use Rieko for node mutation. The draft threat model is documented in
 [docs/adrs/0003-human-in-the-loop-threat-model.md](docs/adrs/0003-human-in-the-loop-threat-model.md)
 and [docs/adrs/0004-mainnet-readiness-approval-workflow.md](docs/adrs/0004-mainnet-readiness-approval-workflow.md).
 

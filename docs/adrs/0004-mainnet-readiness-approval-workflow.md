@@ -15,6 +15,10 @@ recovery path if something goes wrong.
 This ADR defines the approval workflow and the pre-execution checklist
 the CLI enforces.
 
+Current implementation status: the CLI does not yet enforce this workflow and
+live execution is interlocked. This draft specifies prerequisites for a future
+implementation; it does not describe current release behavior.
+
 ## Decisions
 
 ### D1 — Three-stage approval workflow

@@ -12,6 +12,9 @@ trait (`Executor::execute`). The engine can now move funds (rebalance) and
 change fee policies (update_chan_policy). Without a clear human-in-the-loop
 model, an attacker or a bug could drain channels or disrupt routing.
 
+Current implementation status: live execution is interlocked and unsupported.
+The decisions below are proposed release requirements, not implemented claims.
+
 The existing state machine already enforces that the system actor
 (`"system"`) cannot self-approve — approval requires a non-empty, non-system
 actor string. This ADR extends that model to the execution surface.

@@ -2,14 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
-use rieko_execution::{
-    transition, ExecutionError, Executor, LndExecutor, RecordingExecutor, SYSTEM_ACTOR,
-};
+use rieko_execution::{transition, ExecutionError, SYSTEM_ACTOR};
 use rieko_findings::{Action, ActionStage, AuditEntry};
 use rieko_storage::{SqliteStorage, Storage};
 use tracing::info;
-
-use super::common::GraphSource;
 
 /// Approve or execute recommended actions (D7). Approvals are human-only: the
 /// system never self-approves its own recommendations.
@@ -64,7 +60,7 @@ enum ActionCommand {
         #[arg(long)]
         actor: String,
     },
-    /// Execute an approved action against the node.
+    /// Reserved for v3; currently refused by the execution interlock.
     Execute {
         action_id: String,
         /// Human actor id confirming the execution.
@@ -161,82 +157,14 @@ fn run_transition(args: &ActionsArgs, action_id: &str, actor: &str, to: ActionSt
     Ok(())
 }
 
-fn run_execute(args: &ActionsArgs, action_id: &str, actor: &str) -> Result<()> {
-    if actor == SYSTEM_ACTOR {
+fn run_execute(_args: &ActionsArgs, _action_id: &str, actor: &str) -> Result<()> {
+    let actor = actor.trim();
+    if actor.is_empty() || actor == SYSTEM_ACTOR {
         bail!("execution must be confirmed by a human, not `{SYSTEM_ACTOR}`");
     }
-    let mut storage = open(args)?;
-    let rec = storage
-        .recommendation_for_action(action_id)?
-        .with_context(|| format!("no action with id {action_id}"))?;
-
-    // Build the graph so an executor has live state to act on.
-    let source = GraphSource {
-        fixture: args.fixture.clone(),
-        lnd_rest: args.lnd_rest.clone(),
-        macaroon: args.macaroon.clone(),
-        tls_cert: args.tls_cert.clone(),
-        node: args.node.clone(),
-    };
-    let _graph = source.build()?;
-
-    // Pick the executor: live node when one is configured, recording otherwise.
-    let macaroon = args
-        .macaroon
-        .as_ref()
-        .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
-        .transpose()
-        .context("reading macaroon")?;
-    let tls_cert = args
-        .tls_cert
-        .as_ref()
-        .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
-        .transpose()
-        .context("reading TLS certificate")?;
-    let executor: Box<dyn Executor> = match &args.lnd_rest {
-        Some(rest) => Box::new(LndExecutor::new(rest.clone(), macaroon, tls_cert)?),
-        None => {
-            info!("no --lnd-rest configured; using recording executor");
-            Box::new(RecordingExecutor)
-        }
-    };
-    let report = executor
-        .execute(&rec.action)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    let next = if report.success {
-        ActionStage::Executed
-    } else {
-        ActionStage::Failed
-    };
-
-    // State transition and its audit entry commit together (RIEKO-AUDIT-007).
-    storage.begin_transaction()?;
-    let result = (|| {
-        storage.set_action_stage(action_id, next)?;
-        let audit = AuditEntry::from_transition(
-            &Action {
-                stage: next,
-                ..rec.action.clone()
-            },
-            rec.action.stage,
-            actor,
-            serde_json::json!({ "result": report.detail }),
-        );
-        storage.append_audit(&audit)?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    match result {
-        Ok(()) => storage.commit_transaction()?,
-        Err(e) => {
-            let _ = storage.rollback_transaction();
-            return Err(e);
-        }
-    }
-
-    info!(action_id, actor, stage = format!("{:?}", next), detail = %report.detail, "action executed");
-    println!("{action_id}: Executed ({})", report.detail);
-    Ok(())
+    bail!(
+        "live execution is interlocked until simulation integrity, durable idempotency, and regtest safety gates are complete"
+    )
 }
 
 fn default_db_path() -> PathBuf {
@@ -244,4 +172,28 @@ fn default_db_path() -> PathBuf {
     let dir = PathBuf::from(home).join(".rieko");
     std::fs::create_dir_all(&dir).ok();
     dir.join("rieko.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_interlock_precedes_database_credentials_and_network() {
+        let args = ActionsArgs {
+            command: ActionCommand::Execute {
+                action_id: "action".into(),
+                actor: "operator".into(),
+            },
+            fixture: None,
+            lnd_rest: Some("https://127.0.0.1:1".into()),
+            macaroon: Some(PathBuf::from("/does/not/exist/macaroon")),
+            tls_cert: Some(PathBuf::from("/does/not/exist/tls.cert")),
+            node: "local-node".into(),
+            db: Some(PathBuf::from("/does/not/exist/rieko.db")),
+        };
+
+        let error = run_execute(&args, "action", "operator").unwrap_err();
+        assert!(error.to_string().contains("interlocked"));
+    }
 }

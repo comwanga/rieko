@@ -123,7 +123,8 @@ pub fn channel_state_digest(channel: &Channel) -> String {
 /// SHA-256 digest of explicit snapshot state, excluding its observation time.
 pub fn channel_snapshot_state_digest(snapshot: &ChannelSnapshot) -> String {
     digest(|m| {
-        field(m, b"rieko-channel-snapshot-state-v1");
+        field(m, b"rieko-channel-snapshot-state-v2");
+        optional_field(m, snapshot.node_id.as_deref());
         field(m, &snapshot.channel_id);
         field(m, snapshot.local_ratio.to_bits().to_be_bytes());
         field(m, snapshot.local_balance_msat.to_be_bytes());

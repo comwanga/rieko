@@ -74,6 +74,7 @@ mod tests {
         let capacity = 1_000_000u64;
         let local = (ratio * capacity as f64) as u64;
         ChannelSnapshot {
+            node_id: Some("local-node".into()),
             channel_id: id.to_string(),
             local_ratio: ratio,
             local_balance_msat: local,

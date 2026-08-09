@@ -22,10 +22,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint (clippy)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
+
+      - name: Check feature isolation
+        run: |
+          cargo check -p rieko-cli --no-default-features
+          cargo check -p rieko-cli --no-default-features --features simulate
+          cargo check -p rieko-cli --no-default-features --features execute
 
       - name: Build
         run: cargo build --workspace

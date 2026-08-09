@@ -21,6 +21,10 @@ This ADR defines the execution boundary for rebalancing: what we can safely
 commit, what we cannot, and the rollback guarantees we provide (and do not
 provide) to the operator.
 
+The implementation is currently interlocked: even an `execute` feature build
+refuses live execution. The route construction described by this draft has not
+been validated against LND and none of its safety claims are release behavior.
+
 ## Decisions
 
 ### D1 — Rebalance via LND's `SendToRouteV2` (or `SendToRoute`)
@@ -89,12 +93,12 @@ What we **do not** provide:
 The operator makes an informed choice, with simulation preview and
 pre-flight checks, and acknowledges that rebalances are one-way.
 
-### D6 — Execution must remain gated behind `future` feature
+### D6 — Execution must remain gated behind `execute` and a runtime interlock
 
 Execution code (`rieko-execution`, `LndExecutor`) remains behind
-`#[cfg(feature = "future")]`. The default v1 binary cannot construct
-an LND executor and cannot execute any action. This is the same gate
-that protects `rieko-simulation` from v1 reachability (RIEKO-AUDIT-022).
+`#[cfg(feature = "execute")]`. The default binary cannot construct an LND
+executor. Until this ADR is accepted and its regtest gates pass, the
+execute-feature CLI must also refuse before constructing a live executor.
 
 ## Consequences
 

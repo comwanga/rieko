@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -57,6 +57,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         sql: V9_FINDING_PROVENANCE,
+    },
+    Migration {
+        version: 10,
+        sql: V10_SIMULATION_INTEGRITY,
     },
 ];
 
@@ -260,6 +264,78 @@ CREATE INDEX IF NOT EXISTS idx_findings_scope_lifecycle
     ON findings (detector, node_id, lifecycle);
 "#;
 
+/// v10: immutable, replayable v2 simulation inputs and a lifecycle event log.
+/// Existing rows remain readable but carry NULL canonical input because source
+/// state cannot be reconstructed after the fact.
+const V10_SIMULATION_INTEGRITY: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_snapshots (
+    channel_id TEXT NOT NULL, ts TEXT NOT NULL, local_ratio REAL NOT NULL,
+    local_balance_msat INTEGER, remote_balance_msat INTEGER, capacity_msat INTEGER,
+    status_int INTEGER NOT NULL, spendable_outbound_msat INTEGER NOT NULL DEFAULT 0,
+    spendable_inbound_msat INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_id, ts)
+);
+ALTER TABLE channel_snapshots RENAME TO channel_snapshots_v9;
+CREATE TABLE channel_snapshots (
+    node_id TEXT,
+    channel_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    local_ratio REAL NOT NULL,
+    local_balance_msat INTEGER,
+    remote_balance_msat INTEGER,
+    capacity_msat INTEGER,
+    status_int INTEGER NOT NULL,
+    spendable_outbound_msat INTEGER NOT NULL DEFAULT 0,
+    spendable_inbound_msat INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (node_id, channel_id, ts)
+);
+INSERT INTO channel_snapshots
+    (node_id, channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+     capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat)
+SELECT NULL, channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+       capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat
+FROM channel_snapshots_v9;
+DROP TABLE channel_snapshots_v9;
+CREATE INDEX idx_snapshots_channel_ts
+    ON channel_snapshots (channel_id, ts DESC);
+CREATE INDEX idx_snapshots_node_channel_ts
+    ON channel_snapshots (node_id, channel_id, ts DESC);
+
+ALTER TABLE simulations ADD COLUMN canonical_input TEXT;
+ALTER TABLE simulations ADD COLUMN source_observed_at TEXT;
+ALTER TABLE simulations ADD COLUMN requested_at TEXT;
+ALTER TABLE simulations ADD COLUMN completed_at TEXT;
+ALTER TABLE simulations ADD COLUMN error_code TEXT;
+UPDATE simulations SET requested_at = created_at WHERE requested_at IS NULL;
+UPDATE simulations SET completed_at = created_at
+    WHERE completed_at IS NULL AND status IN ('completed', 'stale');
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_simulations_input_hash_unique
+    ON simulations (input_hash)
+    WHERE input_hash <> '' AND canonical_input IS NOT NULL AND projection <> 'null';
+
+CREATE TABLE simulation_events (
+    id              TEXT PRIMARY KEY,
+    simulation_id   TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    error_code      TEXT,
+    ts              TEXT NOT NULL,
+    FOREIGN KEY (simulation_id) REFERENCES simulations(id)
+);
+CREATE INDEX idx_simulation_events_simulation_ts
+    ON simulation_events (simulation_id, ts);
+CREATE TRIGGER simulation_events_append_only_update
+BEFORE UPDATE ON simulation_events
+BEGIN
+    SELECT RAISE(ABORT, 'simulation events are append-only');
+END;
+CREATE TRIGGER simulation_events_append_only_delete
+BEFORE DELETE ON simulation_events
+BEGIN
+    SELECT RAISE(ABORT, 'simulation events are append-only');
+END;
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -345,6 +421,7 @@ mod tests {
             "audit",
             "channel_snapshots",
             "simulations",
+            "simulation_events",
             "alert_state",
             "operational_state",
         ] {
@@ -406,6 +483,13 @@ mod tests {
                 ('legacy', 'detector', '1', 1, 0, NULL, NULL, '[]', NULL,
                  '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z',
                  '2020-01-01T00:00:00Z', 'active');
+             CREATE TABLE simulations (
+                id TEXT PRIMARY KEY, action_id TEXT NOT NULL, finding_id TEXT NOT NULL,
+                action_type TEXT NOT NULL, projection TEXT NOT NULL, created_at TEXT NOT NULL,
+                status TEXT NOT NULL, model_id TEXT NOT NULL, model_version TEXT NOT NULL,
+                input_hash TEXT NOT NULL, confidence TEXT NOT NULL, assumptions TEXT NOT NULL,
+                warnings TEXT NOT NULL, explanation TEXT NOT NULL
+             );
              PRAGMA user_version = 8;",
         )
         .unwrap();
@@ -430,6 +514,53 @@ mod tests {
             )
             .unwrap();
         assert!(index_exists);
+    }
+
+    #[test]
+    fn v10_preserves_legacy_simulation_and_adds_integrity_metadata() {
+        let mut conn = bare_conn();
+        conn.execute_batch(
+            "CREATE TABLE simulations (
+                id TEXT PRIMARY KEY, action_id TEXT NOT NULL, finding_id TEXT NOT NULL,
+                action_type TEXT NOT NULL, projection TEXT NOT NULL, created_at TEXT NOT NULL,
+                status TEXT NOT NULL, model_id TEXT NOT NULL, model_version TEXT NOT NULL,
+                input_hash TEXT NOT NULL, confidence TEXT NOT NULL, assumptions TEXT NOT NULL,
+                warnings TEXT NOT NULL, explanation TEXT NOT NULL
+             );
+             INSERT INTO simulations VALUES
+                ('legacy', 'a1', 'f1', 'rebalance_channel', '{}',
+                 '2020-01-01T00:00:00Z', 'completed', 'legacy', '0', 'old-hash',
+                 'unknown', '[]', '[]', ''),
+                ('legacy-duplicate', 'a1', 'f1', 'rebalance_channel', '{}',
+                 '2020-01-01T00:01:00Z', 'completed', 'legacy', '0', 'old-hash',
+                 'unknown', '[]', '[]', '');
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let (canonical_input, requested_at, completed_at): (
+            Option<String>,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT canonical_input, requested_at, completed_at
+                 FROM simulations WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(canonical_input, None);
+        assert_eq!(requested_at, "2020-01-01T00:00:00Z");
+        assert_eq!(completed_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+        assert!(has_table(&conn, "simulation_events"));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM simulations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "historical duplicate hashes must be preserved");
+        assert_eq!(schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

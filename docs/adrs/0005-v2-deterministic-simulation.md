@@ -38,10 +38,12 @@ so replay is independently verifiable.
 
 ### D3 — Every simulation is snapshot-bound
 
-A simulation references immutable source data. The `source_snapshot_id` and
-`source_observed_at` timestamp are recorded. Once created, the result is
-never recomputed from newer data — it becomes `Stale` when the source data
-ages past a configurable threshold.
+A simulation embeds a canonical input document containing the exact source and
+destination snapshots, source provenance, parameters, and
+`source_observed_at`. This is equivalent to immutable snapshot references but
+survives normal snapshot retention. Once created, the result is never
+recomputed from newer data; query surfaces report it `Stale` when the source
+data ages past the configured threshold.
 
 ### D4 — Unsupported actions fail closed
 

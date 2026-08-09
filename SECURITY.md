@@ -19,9 +19,9 @@ binary cannot:
 - Update channel fee policy.
 - Mutate Bitcoin Core.
 
-The `future` feature gate (disabled by default) enables simulation and
-execution capabilities (v2/v3). These are post-v1 and require explicit
-operator opt-in via `--features future` at build time.
+Deterministic simulation is enabled by default and remains read-only. Draft v3
+types are isolated behind the disabled-by-default `execute` feature. Live
+execution is additionally interlocked at runtime and is not supported.
 
 If you discover a flaw that could enable mutation in the default v1 build,
 please report it immediately.
@@ -65,17 +65,17 @@ Known assumptions:
   `Grpc-Metadata-macaroon` header. It is never logged, never included in
   error messages, and never stored in the audit trail.
 
-## Execution safety (future feature)
+## Execution safety (draft feature)
 
-When `--features future` is enabled, the `actions execute` command can
-mutate LND state. The following guards apply:
+`--features execute` exposes draft action workflow commands for development,
+but `actions execute` refuses before opening the database, loading credentials,
+or constructing an LND mutator. The planned guards below are not implemented
+and must not be treated as current capabilities:
 
-- Execution requires explicit human approval (`--actor` must be a non-empty,
-  non-system string).
-- Every execution is audited with the actor identity, action details, and
-  payment hash.
-- Mainnet execution requires `--allow-mainnet` flag.
-- Simulation preview is mandatory before execution.
-- Pre-flight checks verify the channel is open and has sufficient balance.
-- Single-hop rebalances only (no multi-hop — see ADR-0002).
-- No rollback mechanism for rebalances (documented limitation).
+- immutable simulation binding and freshness validation;
+- durable execution idempotency and crash reconciliation;
+- explicit network and mainnet gates;
+- exact mutation preview and confirmation;
+- fresh channel and spendable-balance checks;
+- structured execution audit records;
+- LND-version-specific regtest protocol validation.
