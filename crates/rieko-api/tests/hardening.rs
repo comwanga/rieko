@@ -11,7 +11,7 @@ use tower::ServiceExt;
 fn app_with_auth(token: Option<&str>) -> axum::Router {
     let mut api = RiekoApi::new(Box::new(MemoryStorage::new())).unwrap();
     if let Some(t) = token {
-        api = api.with_auth(t);
+        api = api.with_auth(t).unwrap();
     }
     api.router()
 }
@@ -52,6 +52,24 @@ async fn wrong_token_is_rejected() {
     let app = app_with_auth(Some("top-secret"));
     let resp = get(&app, "/status", Some("wrong")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn empty_auth_tokens_are_rejected() {
+    for token in ["", " ", "\t\r\n"] {
+        let api = RiekoApi::new(Box::new(MemoryStorage::new())).unwrap();
+        assert!(api.with_auth(token).is_err());
+    }
+}
+
+#[tokio::test]
+async fn configured_auth_token_is_trimmed() {
+    let api = RiekoApi::new(Box::new(MemoryStorage::new()))
+        .unwrap()
+        .with_auth("  top-secret  ")
+        .unwrap();
+    let resp = get(&api.router(), "/status", Some("top-secret")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

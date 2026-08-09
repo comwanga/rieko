@@ -46,7 +46,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 [features]
 default = ["simulate"]
 simulate = ["rieko-simulation"]
-execute = ["rieko-execution"]
+execute = ["rieko-execution", "rieko-api/execute"]
 future = ["simulate", "execute"]
 
 [dev-dependencies]

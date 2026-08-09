@@ -46,7 +46,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         api = api.with_static_dir(dir);
     }
     if let Some(token) = token.take() {
-        api = api.with_auth(token);
+        api = api.with_auth(token)?;
     }
 
     let app = api.router();
@@ -85,7 +85,7 @@ fn enforce_binding_policy(
              (external exposure also requires a bearer token)"
         );
     }
-    if token.is_none() {
+    if !token.is_some_and(|value| !value.trim().is_empty()) {
         bail!(
             "refusing to bind {addr}: external exposure requires a bearer token \
              (set --token-file or RIEKO_API_TOKEN)"
@@ -112,9 +112,17 @@ fn load_token(file: Option<&std::path::Path>) -> Result<Option<String>> {
             .to_string();
         return Ok(Some(token));
     }
-    Ok(std::env::var("RIEKO_API_TOKEN")
-        .ok()
-        .map(|t| t.trim().to_string()))
+    match std::env::var("RIEKO_API_TOKEN") {
+        Ok(value) => {
+            let token = value.trim();
+            if token.is_empty() {
+                bail!("RIEKO_API_TOKEN is empty");
+            }
+            Ok(Some(token.to_string()))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("RIEKO_API_TOKEN is not valid Unicode"),
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +155,8 @@ mod tests {
     #[test]
     fn external_bind_without_token_fails() {
         let err = enforce_binding_policy(addr("0.0.0.0:8080"), true, None).unwrap_err();
+        assert!(err.to_string().contains("bearer token"), "got {err}");
+        let err = enforce_binding_policy(addr("0.0.0.0:8080"), true, Some("  ")).unwrap_err();
         assert!(err.to_string().contains("bearer token"), "got {err}");
     }
 
@@ -187,6 +197,15 @@ mod tests {
             "the --token-file must override the environment"
         );
         std::fs::remove_dir_all(&dir).ok();
+
+        unsafe {
+            std::env::set_var("RIEKO_API_TOKEN", " \t ");
+        }
+        assert!(
+            load_token(None).is_err(),
+            "blank environment token must fail"
+        );
+
         unsafe {
             std::env::remove_var("RIEKO_API_TOKEN");
         }
