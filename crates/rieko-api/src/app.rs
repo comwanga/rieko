@@ -27,6 +27,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum RiekoApiError {
     #[error("storage error: {0}")]
     Storage(#[from] rieko_storage::StorageError),
+    #[error("bearer token cannot be empty")]
+    InvalidAuthToken,
 }
 
 /// Shared state: durable storage behind a mutex. The engine is write-once at
@@ -66,12 +68,16 @@ impl RiekoApi {
     /// Require `Authorization: Bearer <token>` on every JSON route. The caller
     /// decides when this is mandatory (non-loopback binding); it may also be
     /// set for loopback use. Comparison is constant-time (RIEKO-AUDIT-014).
-    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+    pub fn with_auth(mut self, token: impl Into<String>) -> Result<Self, RiekoApiError> {
+        let token = token.into().trim().to_string();
+        if token.is_empty() {
+            return Err(RiekoApiError::InvalidAuthToken);
+        }
         self.state = Arc::new(AppState {
             storage: self.state.storage.clone(),
-            auth_token: Some(token.into()),
+            auth_token: Some(token),
         });
-        self
+        Ok(self)
     }
 
     pub fn router(&self) -> axum::Router {
@@ -184,7 +190,7 @@ pub(crate) async fn block_read<T: Send + 'static>(
 /// Constant-time comparison of a supplied bearer token against the configured
 /// secret. Both values are fixed-length byte strings here; no user accounts.
 fn token_matches(expected: &str, provided: &[u8]) -> bool {
-    expected.as_bytes().ct_eq(provided).into()
+    !expected.trim().is_empty() && bool::from(expected.as_bytes().ct_eq(provided))
 }
 
 async fn require_auth(

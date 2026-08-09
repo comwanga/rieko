@@ -50,9 +50,9 @@ fn macaroon_header(bytes: Vec<u8>) -> String {
 /// the macaroon as lowercase-hex bytes in the `Grpc-Metadata-macaroon` header.
 ///
 /// This is the v1 observation surface and deliberately exposes no node-mutating
-/// RPC; write operations live on [`LndMutator`] instead. Certificate validation
-/// is never disabled, so an optional certificate only narrows trust to the
-/// configured peer.
+/// RPC; write operations live on the execute-gated mutator instead. Certificate
+/// validation is never disabled, so an optional certificate only narrows trust
+/// to the configured peer.
 pub struct LndClient {
     rest_base: String,
     macaroon_hex: Option<String>,
@@ -120,13 +120,15 @@ impl LndClient {
 }
 
 /// Node-mutating LND REST client, kept separate from the read-only v1 surface.
-/// Only the future-gated execution path constructs this.
+/// Only the execute-gated execution path compiles and constructs this.
+#[cfg(feature = "execute")]
 pub struct LndMutator {
     rest_base: String,
     macaroon_hex: Option<String>,
     client: reqwest::blocking::Client,
 }
 
+#[cfg(feature = "execute")]
 impl LndMutator {
     pub fn new(
         rest_base: impl Into<String>,
