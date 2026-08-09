@@ -24,8 +24,10 @@ impl Default for HealthPolicy {
 ///   was configured but has never connected.
 /// * **Degraded**:
 ///   * the latest ingestion attempt failed while valid older data exists;
+///   * a previously successful live source is currently disconnected;
+///   * the latest detector-cycle attempt did not complete;
 ///   * source data is older than the freshness threshold;
-///   * an LLM is configured but failing (explanations expected);
+///   * an LLM is configured but unverified or failing (explanations expected);
 ///   * an alert sink is configured but failing;
 ///   * the retention cleanup is failing (storage grows unbounded).
 /// * **Healthy**: a recent ingestion succeeded, data is fresh, and every
@@ -64,6 +66,22 @@ pub fn assess(
         }
     }
 
+    // A live source that worked before is temporarily unavailable. A source
+    // that has never connected is handled as Unhealthy above.
+    if matches!(state.source, SourceState::LndRest { connected: false }) {
+        degraded = true;
+    }
+
+    // An attempted cycle without a matching or newer success did not complete.
+    if let Some(attempt) = state.last_cycle_attempt {
+        if state
+            .last_cycle_success
+            .map_or(true, |success| attempt > success)
+        {
+            degraded = true;
+        }
+    }
+
     // Data older than the freshness threshold.
     if let Some(data_at) = state.source_data_at {
         if now - data_at > policy.freshness {
@@ -72,8 +90,10 @@ pub fn assess(
     }
 
     // A configured component that is failing.
-    if state.llm == ComponentState::Failing
-        || state.alert_sink == ComponentState::Failing
+    if matches!(
+        state.llm,
+        ComponentState::Configured | ComponentState::Failing
+    ) || state.alert_sink == ComponentState::Failing
         || state.cleanup == ComponentState::Failing
     {
         degraded = true;
@@ -172,6 +192,17 @@ mod tests {
     }
 
     #[test]
+    fn configured_llm_not_yet_verified_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.last_ingestion_success = Some(now - Duration::seconds(10));
+        s.source_data_at = Some(now - Duration::seconds(5));
+        s.llm = ComponentState::Configured;
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
+    }
+
+    #[test]
     fn telegram_configured_and_failing_is_degraded() {
         let policy = HealthPolicy::default();
         let now = Utc::now();
@@ -200,5 +231,39 @@ mod tests {
         let mut s = base();
         s.source = SourceState::LndRest { connected: false };
         assert_eq!(assess(&s, &policy, now, true), OverallState::Unhealthy);
+    }
+
+    #[test]
+    fn disconnected_previously_successful_live_source_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.source = SourceState::LndRest { connected: false };
+        s.last_ingestion_success = Some(now - Duration::minutes(1));
+        s.source_data_at = Some(now - Duration::minutes(1));
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
+    }
+
+    #[test]
+    fn incomplete_cycle_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.last_ingestion_success = Some(now - Duration::minutes(1));
+        s.source_data_at = Some(now - Duration::minutes(1));
+        s.last_cycle_attempt = Some(now - Duration::seconds(30));
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
+    }
+
+    #[test]
+    fn latest_failed_cycle_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.last_ingestion_success = Some(now - Duration::minutes(1));
+        s.source_data_at = Some(now - Duration::minutes(1));
+        s.last_cycle_success = Some(now - Duration::seconds(45));
+        s.last_cycle_attempt = Some(now - Duration::seconds(30));
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
     }
 }

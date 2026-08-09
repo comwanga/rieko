@@ -17,6 +17,7 @@ pub struct Status {
     pub integrity: String,
     pub overall: String,
     pub source: Option<String>,
+    pub source_data_at: Option<String>,
     pub last_ingestion: Option<OperationTimes>,
     pub last_cycle: Option<OperationTimes>,
     pub llm: String,
@@ -59,54 +60,65 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
     // read-only. Capability is derived from the build, never claimed blindly.
     let read_only = cfg!(not(feature = "execute"));
 
-    let (overall, source, last_ingestion, last_cycle, llm, alert_sink, cleanup, last_cleanup) =
-        match operational.as_ref() {
-            Some(state) => {
-                let overall = rieko_status::assess(
-                    state,
-                    &rieko_status::HealthPolicy::default(),
-                    Utc::now(),
-                    integrity_ok,
-                );
-                (
-                    overall.as_str().to_string(),
-                    Some(source_label(state)),
-                    Some(OperationTimes {
-                        attempt: state.last_ingestion_attempt.map(|t| t.to_rfc3339()),
-                        success: state.last_ingestion_success.map(|t| t.to_rfc3339()),
-                    }),
-                    Some(OperationTimes {
-                        attempt: state.last_cycle_attempt.map(|t| t.to_rfc3339()),
-                        success: state.last_cycle_success.map(|t| t.to_rfc3339()),
-                    }),
-                    state.llm.as_str().to_string(),
-                    state.alert_sink.as_str().to_string(),
-                    state.cleanup.as_str().to_string(),
-                    Some(OperationTimes {
-                        attempt: state.last_cleanup_attempt.map(|t| t.to_rfc3339()),
-                        success: state.last_cleanup_success.map(|t| t.to_rfc3339()),
-                    }),
-                )
-            }
-            None => {
-                let overall = rieko_status::assess(
-                    &rieko_status::OperationalState::default(),
-                    &rieko_status::HealthPolicy::default(),
-                    Utc::now(),
-                    integrity_ok,
-                );
-                (
-                    overall.as_str().to_string(),
-                    None,
-                    None,
-                    None,
-                    "not_configured".into(),
-                    "not_configured".into(),
-                    "not_configured".into(),
-                    None,
-                )
-            }
-        };
+    let (
+        overall,
+        source,
+        source_data_at,
+        last_ingestion,
+        last_cycle,
+        llm,
+        alert_sink,
+        cleanup,
+        last_cleanup,
+    ) = match operational.as_ref() {
+        Some(state) => {
+            let overall = rieko_status::assess(
+                state,
+                &rieko_status::HealthPolicy::default(),
+                Utc::now(),
+                integrity_ok,
+            );
+            (
+                overall.as_str().to_string(),
+                Some(source_label(state)),
+                state.source_data_at.map(|t| t.to_rfc3339()),
+                Some(OperationTimes {
+                    attempt: state.last_ingestion_attempt.map(|t| t.to_rfc3339()),
+                    success: state.last_ingestion_success.map(|t| t.to_rfc3339()),
+                }),
+                Some(OperationTimes {
+                    attempt: state.last_cycle_attempt.map(|t| t.to_rfc3339()),
+                    success: state.last_cycle_success.map(|t| t.to_rfc3339()),
+                }),
+                state.llm.as_str().to_string(),
+                state.alert_sink.as_str().to_string(),
+                state.cleanup.as_str().to_string(),
+                Some(OperationTimes {
+                    attempt: state.last_cleanup_attempt.map(|t| t.to_rfc3339()),
+                    success: state.last_cleanup_success.map(|t| t.to_rfc3339()),
+                }),
+            )
+        }
+        None => {
+            let overall = rieko_status::assess(
+                &rieko_status::OperationalState::default(),
+                &rieko_status::HealthPolicy::default(),
+                Utc::now(),
+                integrity_ok,
+            );
+            (
+                overall.as_str().to_string(),
+                None,
+                None,
+                None,
+                None,
+                "not_configured".into(),
+                "not_configured".into(),
+                "not_configured".into(),
+                None,
+            )
+        }
+    };
 
     Ok(Json(Status {
         engine: "rieko",
@@ -120,6 +132,7 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
         },
         overall,
         source,
+        source_data_at,
         last_ingestion,
         last_cycle,
         llm,

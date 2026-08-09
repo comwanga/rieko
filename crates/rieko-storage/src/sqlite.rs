@@ -190,9 +190,13 @@ impl Storage for SqliteStorage {
 
     fn rollback_transaction(&mut self) -> Result<(), StorageError> {
         if !self.in_transaction {
-            return Ok(());
+            return Err(StorageError::Backend(
+                "rollback with no open transaction".into(),
+            ));
         }
-        let _ = self.conn.execute_batch("ROLLBACK");
+        self.conn
+            .execute_batch("ROLLBACK")
+            .map_err(|e| StorageError::Backend(format!("rolling back transaction: {e}")))?;
         self.in_transaction = false;
         Ok(())
     }
@@ -1114,6 +1118,7 @@ fn parse_source(s: &str, connected: Option<i64>) -> rieko_status::SourceState {
 fn parse_component(s: &str) -> rieko_status::ComponentState {
     use rieko_status::ComponentState;
     match s {
+        "configured" => ComponentState::Configured,
         "healthy" => ComponentState::Healthy,
         "failing" => ComponentState::Failing,
         _ => ComponentState::NotConfigured,
@@ -1361,6 +1366,29 @@ mod tests {
         }
     }
 
+    fn save_cycle(
+        storage: &mut impl Storage,
+        snapshot: &ChannelSnapshot,
+        finding: &Finding,
+        recommendation: &Recommendation,
+        audit: &AuditEntry,
+    ) {
+        storage.save_channel_snapshot(snapshot).unwrap();
+        storage.save_finding(finding).unwrap();
+        storage.save_recommendation(recommendation).unwrap();
+        storage.append_audit(audit).unwrap();
+    }
+
+    fn assert_cycle_rows(storage: &mut impl Storage, expected: usize) {
+        assert_eq!(
+            storage.recent_channel_snapshots("c1", 10).unwrap().len(),
+            expected
+        );
+        assert_eq!(storage.latest_findings(10).unwrap().len(), expected);
+        assert_eq!(storage.latest_recommendations(10).unwrap().len(), expected);
+        assert_eq!(storage.recent_audit(10).unwrap().len(), expected);
+    }
+
     #[test]
     fn retention_removes_old_snapshots_and_keeps_recent() {
         let dir = std::env::temp_dir().join(format!("rieko-ret-{}", std::process::id()));
@@ -1548,7 +1576,7 @@ mod tests {
             last_cycle_success: Some(Utc::now()),
             last_persist_success: Some(Utc::now()),
             source_data_at: Some(Utc::now()),
-            llm: rieko_status::ComponentState::Healthy,
+            llm: rieko_status::ComponentState::Configured,
             alert_sink: rieko_status::ComponentState::Failing,
             cleanup: rieko_status::ComponentState::Healthy,
             last_cleanup_attempt: Some(Utc::now()),
@@ -1574,6 +1602,18 @@ mod tests {
         assert!(mem.read_operational_state().unwrap().is_none());
         mem.write_operational_state(&state).unwrap();
         assert_eq!(mem.read_operational_state().unwrap().unwrap(), state);
+    }
+
+    #[test]
+    fn component_state_decodes_configured() {
+        assert_eq!(
+            parse_component("configured"),
+            rieko_status::ComponentState::Configured
+        );
+        assert_eq!(
+            parse_component("unknown"),
+            rieko_status::ComponentState::NotConfigured
+        );
     }
 
     #[test]
@@ -1691,25 +1731,20 @@ mod tests {
             ),
         );
         let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
+        let snapshot = snapshot_at("c1", ChannelStatus::Active, Utc::now());
 
         w.begin_transaction().unwrap();
-        w.save_finding(&f).unwrap();
-        w.save_recommendation(&rec).unwrap();
-        w.append_audit(&audit).unwrap();
+        save_cycle(&mut w, &snapshot, &f, &rec, &audit);
 
         // A separate reader connection must not see the uncommitted cycle.
         let mut r = SqliteStorage::open(&db).unwrap();
-        assert_eq!(r.latest_findings(10).unwrap().len(), 0);
-        assert_eq!(r.latest_recommendations(10).unwrap().len(), 0);
-        assert_eq!(r.recent_audit(10).unwrap().len(), 0);
+        assert_cycle_rows(&mut r, 0);
 
         w.commit_transaction().unwrap();
 
         // After commit the whole cycle is visible together.
         let mut r2 = SqliteStorage::open(&db).unwrap();
-        assert_eq!(r2.latest_findings(10).unwrap().len(), 1);
-        assert_eq!(r2.latest_recommendations(10).unwrap().len(), 1);
-        assert_eq!(r2.recent_audit(10).unwrap().len(), 1);
+        assert_cycle_rows(&mut r2, 1);
     }
 
     #[test]
@@ -1726,22 +1761,19 @@ mod tests {
                 "rebalance",
             ),
         );
+        let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
+        let snapshot = snapshot_at("c1", ChannelStatus::Active, Utc::now());
 
-        // Simulate the cycle failing partway through: some writes succeed,
-        // then an error aborts before commit.
+        // Simulate the cycle failing after all writes but before commit.
         let result = (|| -> Result<(), StorageError> {
             s.begin_transaction()?;
-            s.save_finding(&f)?;
-            s.save_recommendation(&rec)?;
-            // ...failure before audit and before commit.
+            save_cycle(&mut s, &snapshot, &f, &rec, &audit);
             Err(StorageError::Backend("mid-cycle failure".into()))
         })();
         assert!(result.is_err());
         s.rollback_transaction().unwrap();
 
-        // No partial finding/recommendation survives the rollback.
-        assert_eq!(s.latest_findings(10).unwrap().len(), 0);
-        assert_eq!(s.latest_recommendations(10).unwrap().len(), 0);
+        assert_cycle_rows(&mut s, 0);
     }
 
     #[test]
@@ -1754,8 +1786,89 @@ mod tests {
             s.commit_transaction().is_err(),
             "commit with no open transaction must fail"
         );
-        // rollback with none open is a safe no-op
-        assert!(s.rollback_transaction().is_ok());
+        assert!(
+            s.rollback_transaction().is_err(),
+            "rollback with no open transaction must fail"
+        );
+    }
+
+    #[test]
+    fn memory_transaction_commits_and_rolls_back_complete_cycles() {
+        let mut s = MemoryStorage::new();
+        let f = sample_finding();
+        let rec = test_rec(
+            &f.id,
+            Action::new(
+                ActionType::RebalanceChannel,
+                ActionStage::Recommended,
+                f.channel.clone(),
+                serde_json::json!({}),
+                "rebalance",
+            ),
+        );
+        let audit = AuditEntry::from_action(&rec.action, "system", serde_json::json!({}));
+        let snapshot = snapshot_at("c1", ChannelStatus::Active, Utc::now());
+
+        s.begin_transaction().unwrap();
+        save_cycle(&mut s, &snapshot, &f, &rec, &audit);
+        s.rollback_transaction().unwrap();
+        assert_cycle_rows(&mut s, 0);
+
+        s.begin_transaction().unwrap();
+        save_cycle(&mut s, &snapshot, &f, &rec, &audit);
+        s.commit_transaction().unwrap();
+        assert_cycle_rows(&mut s, 1);
+
+        let mut changed_finding = f.clone();
+        changed_finding.explanation = Some("transactional update".into());
+        let approved = Action {
+            stage: ActionStage::Approved,
+            ..rec.action.clone()
+        };
+        let changed_audit = AuditEntry::from_transition(
+            &approved,
+            ActionStage::Recommended,
+            "operator",
+            serde_json::json!({}),
+        );
+        let changed_snapshot = snapshot_at(
+            "c1",
+            ChannelStatus::Inactive,
+            snapshot.ts + chrono::Duration::seconds(1),
+        );
+
+        s.begin_transaction().unwrap();
+        s.save_channel_snapshot(&changed_snapshot).unwrap();
+        s.save_finding(&changed_finding).unwrap();
+        s.set_action_stage(&rec.action.id, ActionStage::Approved)
+            .unwrap();
+        s.append_audit(&changed_audit).unwrap();
+        s.rollback_transaction().unwrap();
+
+        assert_cycle_rows(&mut s, 1);
+        assert_eq!(s.latest_findings(1).unwrap()[0].explanation, None);
+        assert_eq!(
+            s.recommendation_for_action(&rec.action.id)
+                .unwrap()
+                .unwrap()
+                .action
+                .stage,
+            ActionStage::Recommended
+        );
+        assert_eq!(
+            s.recent_channel_snapshots("c1", 1).unwrap()[0].status,
+            ChannelStatus::Active
+        );
+    }
+
+    #[test]
+    fn memory_transaction_rejects_nested_and_orphan_operations() {
+        let mut s = MemoryStorage::new();
+        assert!(s.commit_transaction().is_err());
+        assert!(s.rollback_transaction().is_err());
+        s.begin_transaction().unwrap();
+        assert!(s.begin_transaction().is_err());
+        s.rollback_transaction().unwrap();
     }
 
     #[test]

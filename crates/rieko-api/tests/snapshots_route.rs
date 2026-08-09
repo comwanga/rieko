@@ -8,6 +8,7 @@ use rieko_findings::{
     Action, ActionStage, ActionType, Evidence, Finding, FindingLifecycle, Rationale,
     Recommendation, Severity, FINDING_SCHEMA_VERSION,
 };
+use rieko_status::OperationalStateStore;
 use rieko_storage::{MemoryStorage, Storage};
 use tower::ServiceExt;
 
@@ -253,4 +254,33 @@ async fn status_reports_operational_counts() {
     assert_eq!(json["engine"], "rieko");
     assert_eq!(json["read_only"], cfg!(not(feature = "execute")));
     assert_eq!(json["overall"], "not_initialized");
+}
+
+#[tokio::test]
+async fn status_exposes_source_data_timestamp() {
+    let source_data_at = chrono::DateTime::parse_from_rfc3339("2026-08-10T12:34:56Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut mem = MemoryStorage::new();
+    mem.write_operational_state(&rieko_status::OperationalState {
+        last_ingestion_success: Some(source_data_at),
+        source_data_at: Some(source_data_at),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let app = RiekoApi::new(Box::new(mem)).unwrap().router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["source_data_at"], source_data_at.to_rfc3339());
 }

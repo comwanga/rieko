@@ -110,6 +110,9 @@ The monitor persists findings, recommendations, and channel snapshots each
 cycle. Snapshot history is bounded by a configurable retention policy
 (`--retention-days` default 30, `--closed-retention-days` default 3,
 `--max-snapshots-per-channel`, `--cleanup-interval` default 6 hours).
+Transient LND ingestion failures are retried three times with bounded backoff.
+If a retry round is exhausted, status records the disconnection and monitoring
+continues after the configured interval instead of exiting.
 
 ### 7. Inspect status
 
@@ -161,7 +164,10 @@ export RIEKO_LLM_MODEL=gpt-4o-mini
 
 The LLM summarises structured evidence into plain-language explanations.
 Detectors never depend on the LLM; Rieko remains functional when it is
-unavailable.
+unavailable. LLM HTTP calls use finite deadlines: 5 seconds to connect and 30
+seconds for the complete request. At most three findings are sent for
+explanation per cycle, keeping the optional integration from starving the
+authoritative monitor pipeline.
 
 ### 10. Optional: Telegram alerts
 

@@ -51,6 +51,7 @@ pub fn run(args: StatusArgs) -> Result<()> {
             let overall = assess(state, &HealthPolicy::default(), Utc::now(), integrity_ok);
             println!("  overall:         {}", overall.as_str());
             println!("  source:          {}", source_label(state));
+            println!("  source data at:  {}", ts(state.source_data_at));
             println!(
                 "  last ingestion:  attempt {} / success {}",
                 ts(state.last_ingestion_attempt),

@@ -1,5 +1,10 @@
+use std::time::Duration;
+
 use rieko_findings::Finding;
 use thiserror::Error;
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A request to explain a finding. The LLM only *summarizes* structured
 /// evidence — it never produces the finding (D1).
@@ -12,6 +17,8 @@ pub struct ExplainRequest<'a> {
 
 #[derive(Debug, Error)]
 pub enum LlmError {
+    #[error("invalid LLM configuration: {0}")]
+    Configuration(String),
     #[error("LLM request failed: {0}")]
     Request(String),
     #[error("transport error: {0}")]
@@ -49,21 +56,65 @@ impl OpenAiCompatibleClient {
         endpoint: impl Into<String>,
         api_key: Option<String>,
         model: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, LlmError> {
+        Self::with_timeouts(
+            endpoint,
+            api_key,
+            model,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Construct a client with explicit deadlines, primarily for callers that
+    /// need stricter bounds and tests that must complete quickly.
+    pub fn with_timeouts(
+        endpoint: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, LlmError> {
+        if connect_timeout.is_zero() {
+            return Err(LlmError::Configuration(
+                "connect timeout must be greater than zero".into(),
+            ));
+        }
+        if request_timeout.is_zero() {
+            return Err(LlmError::Configuration(
+                "request timeout must be greater than zero".into(),
+            ));
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .map_err(|error| LlmError::Configuration(error.to_string()))?;
+
+        Ok(Self {
             endpoint: endpoint.into(),
             api_key,
             model: model.into(),
-            client: reqwest::blocking::Client::new(),
-        }
+            client,
+        })
     }
 
     /// From `RIEKO_LLM_ENDPOINT`, `RIEKO_LLM_API_KEY`, `RIEKO_LLM_MODEL`.
-    pub fn from_env() -> Option<Self> {
-        let endpoint = std::env::var("RIEKO_LLM_ENDPOINT").ok()?;
+    /// Returns `Ok(None)` when no endpoint is configured.
+    pub fn from_env() -> Result<Option<Self>, LlmError> {
+        let endpoint = match std::env::var("RIEKO_LLM_ENDPOINT") {
+            Ok(endpoint) => endpoint,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => {
+                return Err(LlmError::Configuration(format!(
+                    "RIEKO_LLM_ENDPOINT is invalid: {error}"
+                )))
+            }
+        };
         let model = std::env::var("RIEKO_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         let api_key = std::env::var("RIEKO_LLM_API_KEY").ok();
-        Some(Self::new(endpoint, api_key, model))
+        Self::new(endpoint, api_key, model).map(Some)
     }
 }
 
@@ -103,6 +154,9 @@ impl LlmClient for OpenAiCompatibleClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+
     use super::*;
     use crate::build_explanation_prompt;
     use rieko_findings::{Evidence, Severity};
@@ -146,5 +200,67 @@ mod tests {
         assert!(p.contains("local_ratio"));
         assert!(p.contains("0.02"));
         assert!(p.contains("lnd 0.18.5"));
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() {
+        let error = OpenAiCompatibleClient::with_timeouts(
+            "http://127.0.0.1:1",
+            None,
+            "model",
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("zero connect timeout must fail");
+        assert!(error.to_string().contains("connect timeout"));
+
+        let error = OpenAiCompatibleClient::with_timeouts(
+            "http://127.0.0.1:1",
+            None,
+            "model",
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .err()
+        .expect("zero request timeout must fail");
+        assert!(error.to_string().contains("request timeout"));
+    }
+
+    #[test]
+    fn default_constructor_builds_a_client() {
+        OpenAiCompatibleClient::new("http://127.0.0.1:1", None, "model").unwrap();
+    }
+
+    #[test]
+    fn request_timeout_bounds_explain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let client = OpenAiCompatibleClient::with_timeouts(
+            endpoint,
+            None,
+            "model",
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let finding = finding();
+        let request = ExplainRequest {
+            finding: &finding,
+            context: None,
+        };
+
+        let started = std::time::Instant::now();
+        let error = client.explain(&request).unwrap_err();
+
+        assert!(matches!(error, LlmError::Transport(ref error) if error.is_timeout()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
     }
 }
