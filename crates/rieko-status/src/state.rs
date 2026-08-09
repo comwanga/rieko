@@ -85,6 +85,8 @@ impl SourceState {
 pub enum ComponentState {
     /// Not configured; absence is expected and not a problem.
     NotConfigured,
+    /// Configured, but not yet verified by a successful operation.
+    Configured,
     /// Configured and functioning.
     Healthy,
     /// Configured but failing.
@@ -95,6 +97,7 @@ impl ComponentState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NotConfigured => "not_configured",
+            Self::Configured => "configured",
             Self::Healthy => "healthy",
             Self::Failing => "failing",
         }

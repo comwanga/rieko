@@ -6,13 +6,30 @@ use clap::Args;
 use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
 use rieko_detectors::{Detector, DetectorContext, DriftDetector, LiquidityDetector};
 use rieko_findings::Finding;
-use rieko_graph::{GraphView, InMemoryHistory};
-use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
+use rieko_graph::{GraphView, InMemoryGraph, InMemoryHistory};
+use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_status::OperationalStateStore;
 use rieko_storage::{SqliteStorage, Storage};
 use tracing::{info, warn};
 
-use super::common::{persist_and_recommend, GraphSource};
+use super::common::{persist_monitor_cycle, GraphSource};
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_attempts: u32,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
 
 #[derive(Args, Debug)]
 pub struct MonitorArgs {
@@ -89,16 +106,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         node: args.node.clone(),
     };
 
-    let (llm, llm_configured): (Box<dyn LlmClient>, bool) = match OpenAiCompatibleClient::from_env()
-    {
-        Some(c) => (Box::new(c) as Box<dyn LlmClient>, true),
-        None => (Box::new(NullClient), false),
-    };
+    let llm = OpenAiCompatibleClient::from_env().context("building LLM client")?;
     super::common::record_component(
         &mut storage,
         super::common::ComponentKind::Llm,
-        if llm_configured {
-            rieko_status::ComponentState::Healthy
+        if llm.is_some() {
+            rieko_status::ComponentState::Configured
         } else {
             rieko_status::ComponentState::NotConfigured
         },
@@ -170,22 +183,35 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let mut last_cleanup: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         cycle += 1;
-
-        let graph = source.build()?;
+        let Some(graph) = ingest_with_retry(
+            &mut storage,
+            &source,
+            RetryPolicy::default(),
+            || source.build(),
+            std::thread::sleep,
+        )?
+        else {
+            warn!("LND ingestion retry round exhausted; monitoring will continue");
+            if cycle_limit_reached(cycle, args.cycles) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(args.interval));
+            continue;
+        };
         let (n_nodes, n_channels) = graph.len();
 
-        // Ingestion reached this point, so the source is reachable and current.
-        super::common::record_source_ingestion(&mut storage, &source)?;
+        super::common::record_cycle_attempt(&mut storage)?;
 
         // Record this cycle's channel states, both in-memory (for detectors)
         // and durably (for the API and future trend queries).
         let now = chrono::Utc::now();
         let channels = graph.channels();
-        for channel in &channels {
-            history.push(rieko_domain::ChannelSnapshot::from_channel(channel, now));
-            storage
-                .save_channel_snapshot(&rieko_domain::ChannelSnapshot::from_channel(channel, now))
-                .with_context(|| format!("persisting snapshot for {}", channel.id))?;
+        let snapshots: Vec<_> = channels
+            .iter()
+            .map(|channel| rieko_domain::ChannelSnapshot::from_channel(channel, now))
+            .collect();
+        for snapshot in &snapshots {
+            history.push(snapshot.clone());
         }
 
         let ctx = DetectorContext {
@@ -197,8 +223,14 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         }
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
-        let recommendations =
-            persist_and_recommend(&mut storage, &*llm, &engine, &args.node, &findings)?;
+        let recommendations = persist_monitor_cycle(
+            &mut storage,
+            llm.as_ref().map(|client| client as &dyn LlmClient),
+            &engine,
+            &args.node,
+            &snapshots,
+            &mut findings,
+        )?;
 
         // Retention: bounded cleanup at most once per cleanup_interval
         // (RIEKO-AUDIT-016). Cleanup only touches channel_snapshots and is
@@ -211,7 +243,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             let now = chrono::Utc::now();
             let mut op = storage
                 .read_operational_state()
-                .unwrap_or_default()
+                .context("reading operational state")?
                 .unwrap_or_default();
             op.last_cleanup_attempt = Some(now);
             match storage.prune_channel_snapshots(&retention, now) {
@@ -284,13 +316,65 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             "cycle complete"
         );
 
-        if args.cycles > 0 && cycle >= args.cycles {
+        if cycle_limit_reached(cycle, args.cycles) {
             break;
         }
         std::thread::sleep(Duration::from_secs(args.interval));
     }
 
     Ok(())
+}
+
+fn ingest_with_retry<S, Build, Sleep>(
+    storage: &mut S,
+    source: &GraphSource,
+    policy: RetryPolicy,
+    mut build: Build,
+    mut sleep: Sleep,
+) -> Result<Option<InMemoryGraph>>
+where
+    S: rieko_status::OperationalStateStore,
+    Build: FnMut() -> Result<InMemoryGraph>,
+    Sleep: FnMut(Duration),
+{
+    let attempts = policy.max_attempts.max(1);
+    for attempt in 1..=attempts {
+        super::common::record_ingestion_attempt(storage, source)?;
+        match build() {
+            Ok(graph) => {
+                super::common::record_ingestion_success(
+                    storage,
+                    source,
+                    super::common::newest_source_data_at(&graph),
+                )?;
+                return Ok(Some(graph));
+            }
+            Err(error) => {
+                super::common::record_ingestion_failure(storage, source)
+                    .with_context(|| format!("recording ingestion failure after: {error:#}"))?;
+                if source.lnd_rest.is_none() {
+                    return Err(error);
+                }
+                if attempt == attempts {
+                    warn!(attempt, error = %error, "LND ingestion failed");
+                    return Ok(None);
+                }
+                let multiplier = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX);
+                let delay = policy
+                    .initial_delay
+                    .checked_mul(multiplier)
+                    .unwrap_or(policy.max_delay)
+                    .min(policy.max_delay);
+                warn!(attempt, error = %error, ?delay, "LND ingestion failed; retrying");
+                sleep(delay);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn cycle_limit_reached(cycle: u64, configured_limit: u64) -> bool {
+    configured_limit > 0 && cycle >= configured_limit
 }
 
 fn summarize_finding(finding: &Finding) -> String {
@@ -307,4 +391,120 @@ fn default_db_path() -> PathBuf {
     let dir = PathBuf::from(home).join(".rieko");
     std::fs::create_dir_all(&dir).ok();
     dir.join("rieko.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rieko_status::OperationalStateStore;
+    use rieko_storage::MemoryStorage;
+
+    fn live_source() -> GraphSource {
+        GraphSource {
+            lnd_rest: Some("https://localhost:8080".into()),
+            ..Default::default()
+        }
+    }
+
+    fn policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(15),
+        }
+    }
+
+    #[test]
+    fn transient_lnd_failure_retries_and_recovers() {
+        let mut storage = MemoryStorage::new();
+        let source = live_source();
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+
+        let graph = ingest_with_retry(
+            &mut storage,
+            &source,
+            policy(),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(anyhow::anyhow!("offline"))
+                } else {
+                    Ok(InMemoryGraph::new())
+                }
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+
+        assert!(graph.is_some());
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            delays,
+            vec![Duration::from_millis(10), Duration::from_millis(15)]
+        );
+        assert_eq!(
+            storage.read_operational_state().unwrap().unwrap().source,
+            rieko_status::SourceState::LndRest { connected: true }
+        );
+    }
+
+    #[test]
+    fn exhausted_lnd_retry_round_keeps_monitor_recoverable() {
+        let mut storage = MemoryStorage::new();
+        let source = live_source();
+        let mut attempts = 0;
+
+        let graph = ingest_with_retry(
+            &mut storage,
+            &source,
+            policy(),
+            || {
+                attempts += 1;
+                Err(anyhow::anyhow!("offline"))
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(graph.is_none());
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            storage.read_operational_state().unwrap().unwrap().source,
+            rieko_status::SourceState::LndRest { connected: false }
+        );
+    }
+
+    #[test]
+    fn fixture_failure_is_not_retried() {
+        let mut storage = MemoryStorage::new();
+        let source = GraphSource {
+            fixture: Some("missing.json".into()),
+            ..Default::default()
+        };
+        let mut attempts = 0;
+        let mut sleeps = 0;
+
+        let result = ingest_with_retry(
+            &mut storage,
+            &source,
+            policy(),
+            || {
+                attempts += 1;
+                Err(anyhow::anyhow!("bad fixture"))
+            },
+            |_| sleeps += 1,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn failed_retry_rounds_respect_finite_cycle_limit() {
+        assert!(!cycle_limit_reached(1, 0));
+        assert!(!cycle_limit_reached(1, 2));
+        assert!(cycle_limit_reached(2, 2));
+    }
 }

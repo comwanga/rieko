@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, DedupingSink, TelegramSink};
-use rieko_llm::{LlmClient, NullClient, OpenAiCompatibleClient};
+use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_storage::SqliteStorage;
 use tracing::info;
 use tracing::warn;
@@ -59,11 +59,24 @@ pub fn run(args: ScanArgs) -> Result<()> {
         tls_cert: args.tls_cert.clone(),
         node: args.node.clone(),
     };
-    let graph = source.build()?;
-    super::common::record_source_ingestion(&mut storage, &source)?;
+    super::common::record_ingestion_attempt(&mut storage, &source)?;
+    let graph = match source.build() {
+        Ok(graph) => graph,
+        Err(error) => {
+            super::common::record_ingestion_failure(&mut storage, &source)
+                .with_context(|| format!("recording ingestion failure after: {error:#}"))?;
+            return Err(error);
+        }
+    };
+    super::common::record_ingestion_success(
+        &mut storage,
+        &source,
+        super::common::newest_source_data_at(&graph),
+    )?;
     let (n_nodes, n_channels) = graph.len();
     info!(n_nodes, n_channels, "graph loaded");
 
+    super::common::record_cycle_attempt(&mut storage)?;
     let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
         Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
         Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
@@ -74,16 +87,12 @@ pub fn run(args: ScanArgs) -> Result<()> {
     }
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
-    let (llm, llm_configured): (Box<dyn LlmClient>, bool) = match OpenAiCompatibleClient::from_env()
-    {
-        Some(c) => (Box::new(c) as Box<dyn LlmClient>, true),
-        None => (Box::new(NullClient), false),
-    };
+    let llm = OpenAiCompatibleClient::from_env().context("building LLM client")?;
     super::common::record_component(
         &mut storage,
         super::common::ComponentKind::Llm,
-        if llm_configured {
-            rieko_status::ComponentState::Healthy
+        if llm.is_some() {
+            rieko_status::ComponentState::Configured
         } else {
             rieko_status::ComponentState::NotConfigured
         },
@@ -122,8 +131,13 @@ pub fn run(args: ScanArgs) -> Result<()> {
         None
     };
 
-    let recommendations =
-        persist_and_recommend(&mut storage, &*llm, &engine, &args.node, &findings)?;
+    let recommendations = persist_and_recommend(
+        &mut storage,
+        llm.as_ref().map(|client| client as &dyn LlmClient),
+        &engine,
+        &args.node,
+        &mut findings,
+    )?;
 
     let mut n_alerts = 0;
     if let Some(sink) = alert_sink.as_mut() {

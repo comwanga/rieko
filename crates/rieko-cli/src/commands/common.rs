@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rieko_domain::NodeId;
+use rieko_domain::{ChannelSnapshot, NodeId};
 use rieko_findings::{AuditEntry, Finding, Recommendation};
-use rieko_graph::{GraphStore, InMemoryGraph};
+use rieko_graph::{GraphStore, GraphView, InMemoryGraph};
 use rieko_ingest_lnd::{LndChannelResponse, LndClient, Normalizer, ShortChanResolver};
 use rieko_llm::{ExplainRequest, LlmClient};
 use rieko_recommendations::RecommendationEngine;
 use rieko_storage::Storage;
 use tracing::{debug, info, warn};
+
+const MAX_LLM_EXPLANATIONS_PER_CYCLE: usize = 3;
 
 /// Where channel state comes from: a JSON fixture or a live LND REST node.
 /// Both scan and monitor share this so the ingestion path stays identical.
@@ -94,42 +96,105 @@ fn load_fixture(path: &Path, local: &NodeId) -> Result<Vec<rieko_domain::Channel
         .collect()
 }
 
-/// A successful source build reflects a reachable data source; record it so
-/// `/status` and `status` know what feeds the pipeline and when it last worked.
-/// Called right after [`GraphSource::build`] succeeds.
-pub fn record_source_ingestion<S: Storage + rieko_status::OperationalStateStore>(
+fn read_operational_state<S: rieko_status::OperationalStateStore>(
+    storage: &S,
+) -> Result<rieko_status::OperationalState> {
+    storage
+        .read_operational_state()
+        .context("reading operational state")
+        .map(|state| state.unwrap_or_default())
+}
+
+fn source_state(source: &GraphSource, connected: bool) -> rieko_status::SourceState {
+    if source.lnd_rest.is_some() {
+        rieko_status::SourceState::LndRest { connected }
+    } else {
+        rieko_status::SourceState::Fixture
+    }
+}
+
+pub fn record_ingestion_attempt<S: rieko_status::OperationalStateStore>(
     storage: &mut S,
     source: &GraphSource,
 ) -> Result<()> {
-    let now = chrono::Utc::now();
-    let mut state = storage
-        .read_operational_state()
-        .unwrap_or_default()
-        .unwrap_or_default();
-    if source.lnd_rest.is_some() {
-        state.source = rieko_status::SourceState::LndRest { connected: true };
-    } else {
-        state.source = rieko_status::SourceState::Fixture;
-    }
-    state.last_ingestion_attempt = Some(now);
-    state.last_ingestion_success = Some(now);
+    let mut state = read_operational_state(storage)?;
+    let was_connected = matches!(
+        state.source,
+        rieko_status::SourceState::LndRest { connected: true }
+    );
+    state.source = source_state(source, was_connected);
+    state.last_ingestion_attempt = Some(chrono::Utc::now());
     storage
         .write_operational_state(&state)
-        .context("recording source ingestion")?;
+        .context("recording ingestion attempt")?;
+    Ok(())
+}
+
+pub fn record_ingestion_success<S: rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    source: &GraphSource,
+    source_data_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let mut state = read_operational_state(storage)?;
+    state.source = source_state(source, true);
+    state.last_ingestion_success = Some(now);
+    state.source_data_at = source_data_at;
+    storage
+        .write_operational_state(&state)
+        .context("recording ingestion success")?;
+    Ok(())
+}
+
+pub fn record_ingestion_failure<S: rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    source: &GraphSource,
+) -> Result<()> {
+    let mut state = read_operational_state(storage)?;
+    state.source = source_state(source, false);
+    storage
+        .write_operational_state(&state)
+        .context("recording ingestion failure")?;
+    Ok(())
+}
+
+pub fn newest_source_data_at(graph: &dyn GraphView) -> Option<chrono::DateTime<chrono::Utc>> {
+    graph
+        .channels()
+        .into_iter()
+        .map(|channel| channel.last_seen)
+        .chain(
+            graph
+                .recent_forwards(usize::MAX)
+                .into_iter()
+                .map(|event| event.timestamp),
+        )
+        .chain(
+            graph
+                .recent_payments(usize::MAX)
+                .into_iter()
+                .map(|event| event.timestamp),
+        )
+        .max()
+}
+
+pub fn record_cycle_attempt<S: rieko_status::OperationalStateStore>(storage: &mut S) -> Result<()> {
+    let mut state = read_operational_state(storage)?;
+    state.last_cycle_attempt = Some(chrono::Utc::now());
+    storage
+        .write_operational_state(&state)
+        .context("recording cycle attempt")?;
     Ok(())
 }
 
 /// Record the state of an optional component (LLM or alert sink). Presence and
 /// health are derived from configuration/behaviour, never from secrets.
-pub fn record_component<S: Storage + rieko_status::OperationalStateStore>(
+pub fn record_component<S: rieko_status::OperationalStateStore>(
     storage: &mut S,
     kind: ComponentKind,
     state: rieko_status::ComponentState,
 ) -> Result<()> {
-    let mut op = storage
-        .read_operational_state()
-        .unwrap_or_default()
-        .unwrap_or_default();
+    let mut op = read_operational_state(storage)?;
     match kind {
         ComponentKind::Llm => op.llm = state,
         ComponentKind::AlertSink => op.alert_sink = state,
@@ -151,27 +216,54 @@ pub enum ComponentKind {
 /// alert/report.
 pub fn persist_and_recommend<S: Storage + rieko_status::OperationalStateStore>(
     storage: &mut S,
-    llm: &dyn LlmClient,
+    llm: Option<&dyn LlmClient>,
     engine: &RecommendationEngine,
     node: &str,
-    findings: &[Finding],
+    findings: &mut [Finding],
 ) -> Result<Vec<Recommendation>> {
-    // One detector cycle is one logical unit: findings, explanations,
-    // recommendations and audit transitions all commit together or roll back
-    // together (D9, invariant #8). A failure mid-cycle leaves no half-written
-    // recommendation/audit state behind.
+    persist_cycle(storage, llm, engine, node, &[], findings)
+}
+
+pub fn persist_monitor_cycle<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    llm: Option<&dyn LlmClient>,
+    engine: &RecommendationEngine,
+    node: &str,
+    snapshots: &[ChannelSnapshot],
+    findings: &mut [Finding],
+) -> Result<Vec<Recommendation>> {
+    persist_cycle(storage, llm, engine, node, snapshots, findings)
+}
+
+fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    llm: Option<&dyn LlmClient>,
+    engine: &RecommendationEngine,
+    node: &str,
+    snapshots: &[ChannelSnapshot],
+    findings: &mut [Finding],
+) -> Result<Vec<Recommendation>> {
+    explain_findings(storage, llm, node, findings)?;
+
     storage
         .begin_transaction()
         .context("beginning persistence transaction")?;
 
-    let result = persist_cycle_locked(storage, llm, engine, node, findings);
+    let result = (|| {
+        for snapshot in snapshots {
+            storage.save_channel_snapshot(snapshot)?;
+        }
+        let recommendations = persist_cycle_locked(storage, engine, findings)?;
+        record_cycle_success(storage)?;
+        Ok(recommendations)
+    })();
 
     match result {
         Ok(all) => {
-            storage
-                .commit_transaction()
-                .context("committing persistence transaction")?;
-            record_cycle_success(storage)?;
+            if let Err(error) = storage.commit_transaction() {
+                let _ = storage.rollback_transaction();
+                return Err(error).context("committing persistence transaction");
+            }
             Ok(all)
         }
         Err(e) => {
@@ -181,17 +273,61 @@ pub fn persist_and_recommend<S: Storage + rieko_status::OperationalStateStore>(
     }
 }
 
-/// A completed, committed detector cycle. Updated outside the transaction so a
-/// rolled-back cycle does not falsely look successful.
+fn explain_findings<S: rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    llm: Option<&dyn LlmClient>,
+    node: &str,
+    findings: &mut [Finding],
+) -> Result<()> {
+    let Some(llm) = llm else {
+        return Ok(());
+    };
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for finding in findings.iter_mut().take(MAX_LLM_EXPLANATIONS_PER_CYCLE) {
+        match llm.explain(&ExplainRequest {
+            finding,
+            context: Some(format!("local node id {node}")),
+        }) {
+            Ok(Some(text)) => {
+                finding.explanation = Some(text);
+                debug!(finding = %finding.id, "explanation generated");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failed = true;
+                warn!(error = %error, finding = %finding.id, "explanation skipped");
+            }
+        }
+    }
+    if findings.len() > MAX_LLM_EXPLANATIONS_PER_CYCLE {
+        warn!(
+            skipped = findings.len() - MAX_LLM_EXPLANATIONS_PER_CYCLE,
+            limit = MAX_LLM_EXPLANATIONS_PER_CYCLE,
+            "LLM explanation cycle limit reached"
+        );
+    }
+    record_component(
+        storage,
+        ComponentKind::Llm,
+        if failed {
+            rieko_status::ComponentState::Failing
+        } else {
+            rieko_status::ComponentState::Healthy
+        },
+    )
+}
+
+/// Mark a completed detector cycle inside the same transaction as its data, so
+/// a rollback cannot leave either side claiming success independently.
 fn record_cycle_success<S: Storage + rieko_status::OperationalStateStore>(
     storage: &mut S,
 ) -> Result<()> {
     let now = chrono::Utc::now();
-    let mut state = storage
-        .read_operational_state()
-        .unwrap_or_default()
-        .unwrap_or_default();
-    state.last_cycle_attempt = Some(now);
+    let mut state = read_operational_state(storage)?;
     state.last_cycle_success = Some(now);
     state.last_persist_success = Some(now);
     storage
@@ -204,28 +340,12 @@ fn record_cycle_success<S: Storage + rieko_status::OperationalStateStore>(
 /// [`persist_and_recommend`].
 fn persist_cycle_locked<S: Storage>(
     storage: &mut S,
-    llm: &dyn LlmClient,
     engine: &RecommendationEngine,
-    node: &str,
     findings: &[Finding],
 ) -> Result<Vec<Recommendation>> {
     let mut all = Vec::new();
     for finding in findings {
         storage.save_finding(finding)?;
-
-        match llm.explain(&ExplainRequest {
-            finding,
-            context: Some(format!("local node id {node}")),
-        }) {
-            Ok(Some(text)) => {
-                let mut explained = finding.clone();
-                explained.explanation = Some(text);
-                storage.save_finding(&explained)?;
-                debug!(finding = %finding.id, "explanation stored");
-            }
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, "explanation skipped"),
-        }
 
         for rec in engine.recommend(finding).unwrap_or_default() {
             // Idempotency: a recommendation keyed by its deterministic action id
@@ -260,7 +380,8 @@ mod tests {
     use super::*;
     use rieko_detectors::{Detector, LiquidityDetector};
     use rieko_domain::{Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId};
-    use rieko_llm::NullClient;
+    use rieko_llm::LlmError;
+    use rieko_status::OperationalStateStore;
     use rieko_storage::{MemoryStorage, SqliteStorage};
 
     fn drained_graph(local_msat: u64, remote_msat: u64) -> InMemoryGraph {
@@ -309,7 +430,7 @@ mod tests {
         };
         let graph = source.build().expect("fixture should load");
 
-        let findings = detect(&graph);
+        let mut findings = detect(&graph);
         // 3 imbalanced channels: one Critical (ratio 0.01), one outbound
         // Warning (0.08), one inbound Warning (0.95); two are Balanced.
         assert_eq!(findings.len(), 3, "findings: {findings:#?}");
@@ -326,9 +447,8 @@ mod tests {
 
         let mut storage = MemoryStorage::new();
         let engine = rieko_recommendations::RecommendationEngine;
-        let recs =
-            persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings)
-                .unwrap();
+        let recs = persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
+            .unwrap();
         // The engine may emit more than one recommendation per finding (e.g. a
         // warning channel gets both a fee review and a rebalance review), but
         // every finding must lead to at least one, and nothing may be dropped.
@@ -386,17 +506,223 @@ mod tests {
         );
     }
 
+    struct SuccessfulLlm;
+
+    impl LlmClient for SuccessfulLlm {
+        fn explain(&self, _: &ExplainRequest) -> Result<Option<String>, LlmError> {
+            Ok(Some("bounded explanation".into()))
+        }
+    }
+
+    struct FailingLlm;
+
+    impl LlmClient for FailingLlm {
+        fn explain(&self, _: &ExplainRequest) -> Result<Option<String>, LlmError> {
+            Err(LlmError::Request("offline".into()))
+        }
+    }
+
+    struct TransactionProbeLlm {
+        storage: std::sync::Mutex<SqliteStorage>,
+        succeeded: std::sync::atomic::AtomicBool,
+    }
+
+    struct CountingLlm(std::sync::atomic::AtomicUsize);
+
+    impl LlmClient for CountingLlm {
+        fn explain(&self, _: &ExplainRequest) -> Result<Option<String>, LlmError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("bounded".into()))
+        }
+    }
+
+    impl LlmClient for TransactionProbeLlm {
+        fn explain(&self, _: &ExplainRequest) -> Result<Option<String>, LlmError> {
+            let mut storage = self.storage.lock().unwrap();
+            storage
+                .begin_transaction()
+                .map_err(|error| LlmError::Request(error.to_string()))?;
+            storage
+                .rollback_transaction()
+                .map_err(|error| LlmError::Request(error.to_string()))?;
+            self.succeeded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("writer lock was free".into()))
+        }
+    }
+
+    #[test]
+    fn llm_explanation_is_propagated_and_persisted_before_transaction() {
+        let engine = RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let mut findings = detect(&graph);
+        let mut storage = MemoryStorage::new();
+
+        persist_and_recommend(
+            &mut storage,
+            Some(&SuccessfulLlm),
+            &engine,
+            "local-node",
+            &mut findings,
+        )
+        .unwrap();
+
+        assert_eq!(
+            findings[0].explanation.as_deref(),
+            Some("bounded explanation")
+        );
+        assert_eq!(
+            storage.latest_findings(1).unwrap()[0]
+                .explanation
+                .as_deref(),
+            Some("bounded explanation")
+        );
+        assert_eq!(
+            storage.read_operational_state().unwrap().unwrap().llm,
+            rieko_status::ComponentState::Healthy
+        );
+    }
+
+    #[test]
+    fn llm_failure_does_not_block_authoritative_cycle() {
+        let engine = RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let mut findings = detect(&graph);
+        let mut storage = MemoryStorage::new();
+
+        let recommendations = persist_and_recommend(
+            &mut storage,
+            Some(&FailingLlm),
+            &engine,
+            "local-node",
+            &mut findings,
+        )
+        .unwrap();
+
+        assert!(!recommendations.is_empty());
+        assert!(!storage.latest_findings(10).unwrap().is_empty());
+        assert_eq!(
+            storage.read_operational_state().unwrap().unwrap().llm,
+            rieko_status::ComponentState::Failing
+        );
+    }
+
+    #[test]
+    fn llm_runs_before_sqlite_writer_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("llm-order.db");
+        let mut storage = SqliteStorage::open(&db).unwrap();
+        let probe = TransactionProbeLlm {
+            storage: std::sync::Mutex::new(SqliteStorage::open(&db).unwrap()),
+            succeeded: std::sync::atomic::AtomicBool::new(false),
+        };
+        let engine = RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let mut findings = detect(&graph);
+
+        persist_and_recommend(
+            &mut storage,
+            Some(&probe),
+            &engine,
+            "local-node",
+            &mut findings,
+        )
+        .unwrap();
+
+        assert!(probe.succeeded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn llm_work_is_bounded_per_cycle() {
+        let graph = drained_graph(20_000, 980_000);
+        let mut finding = detect(&graph).remove(0);
+        finding.explanation = None;
+        let mut findings = vec![finding; MAX_LLM_EXPLANATIONS_PER_CYCLE + 2];
+        let llm = CountingLlm(std::sync::atomic::AtomicUsize::new(0));
+        let mut storage = MemoryStorage::new();
+
+        explain_findings(&mut storage, Some(&llm), "local-node", &mut findings).unwrap();
+
+        assert_eq!(
+            llm.0.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_LLM_EXPLANATIONS_PER_CYCLE
+        );
+        assert!(findings[..MAX_LLM_EXPLANATIONS_PER_CYCLE]
+            .iter()
+            .all(|finding| finding.explanation.is_some()));
+        assert!(findings[MAX_LLM_EXPLANATIONS_PER_CYCLE..]
+            .iter()
+            .all(|finding| finding.explanation.is_none()));
+    }
+
+    #[test]
+    fn monitor_cycle_commits_snapshots_with_findings_and_audit() {
+        let engine = RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let now = chrono::Utc::now();
+        let snapshots: Vec<_> = graph
+            .channels()
+            .iter()
+            .map(|channel| ChannelSnapshot::from_channel(channel, now))
+            .collect();
+        let mut findings = detect(&graph);
+        let mut storage = MemoryStorage::new();
+
+        persist_monitor_cycle(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &snapshots,
+            &mut findings,
+        )
+        .unwrap();
+
+        assert_eq!(storage.recent_snapshots_all(10).unwrap(), snapshots);
+        assert!(!storage.latest_findings(10).unwrap().is_empty());
+        assert!(!storage.latest_recommendations(10).unwrap().is_empty());
+        assert!(!storage.recent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_ingestion_preserves_last_good_observation() {
+        let source = GraphSource {
+            lnd_rest: Some("https://localhost:8080".into()),
+            ..Default::default()
+        };
+        let graph = drained_graph(20_000, 980_000);
+        let observed_at = newest_source_data_at(&graph);
+        let mut storage = MemoryStorage::new();
+
+        record_ingestion_attempt(&mut storage, &source).unwrap();
+        record_ingestion_success(&mut storage, &source, observed_at).unwrap();
+        let successful = storage.read_operational_state().unwrap().unwrap();
+        record_ingestion_attempt(&mut storage, &source).unwrap();
+        record_ingestion_failure(&mut storage, &source).unwrap();
+        let failed = storage.read_operational_state().unwrap().unwrap();
+
+        assert_eq!(
+            failed.last_ingestion_success,
+            successful.last_ingestion_success
+        );
+        assert_eq!(failed.source_data_at, observed_at);
+        assert_eq!(
+            failed.source,
+            rieko_status::SourceState::LndRest { connected: false }
+        );
+    }
+
     #[test]
     fn replay_produces_no_duplicates_in_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let engine = rieko_recommendations::RecommendationEngine;
         let graph = drained_graph(20_000, 980_000);
-        let findings = detect(&graph);
 
         let run = |db_path: &std::path::Path| -> (usize, usize, usize) {
             let mut storage = SqliteStorage::open(db_path).unwrap();
-            persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings)
+            let mut findings = detect(&graph);
+            persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
                 .unwrap();
             let n_f = storage.latest_findings(1000).unwrap().len();
             let n_r = storage.latest_recommendations(1000).unwrap().len();
@@ -419,11 +745,11 @@ mod tests {
     fn replay_does_not_append_duplicate_audit_in_memory() {
         let engine = rieko_recommendations::RecommendationEngine;
         let graph = drained_graph(20_000, 980_000);
-        let findings = detect(&graph);
+        let mut findings = detect(&graph);
         let mut storage = MemoryStorage::new();
-        persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings).unwrap();
+        persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings).unwrap();
         let n1 = storage.recent_audit(1000).unwrap().len();
-        persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings).unwrap();
+        persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings).unwrap();
         let n2 = storage.recent_audit(1000).unwrap().len();
         assert_eq!(
             n1, n2,
@@ -446,11 +772,10 @@ mod tests {
 
         let engine = rieko_recommendations::RecommendationEngine;
         let graph = drained_graph(20_000, 980_000);
-        let findings = detect(&graph);
+        let mut findings = detect(&graph);
         let mut storage = MemoryStorage::new();
-        let recs =
-            persist_and_recommend(&mut storage, &NullClient, &engine, "local-node", &findings)
-                .unwrap();
+        let recs = persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
+            .unwrap();
         assert!(!recs.is_empty(), "expected at least one recommendation");
 
         // Simulate each recommended action exactly as the `simulate` command

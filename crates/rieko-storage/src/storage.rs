@@ -46,21 +46,14 @@ impl From<rusqlite::Error> for StorageError {
 /// Durable storage behind a trait (D6). v1 ships the SQLite implementation;
 /// the trait keeps the DuckDB/Postgres progression possible.
 pub trait Storage: rieko_status::OperationalStateStore + Send {
-    /// Begin a write transaction covering one logical unit (e.g. a detector
-    /// cycle: findings + recommendations + audit). Backends that don't support
-    /// transactions return `Ok(())` and persist immediately.
-    fn begin_transaction(&mut self) -> Result<(), StorageError> {
-        Ok(())
-    }
+    /// Begin a write transaction covering one logical unit, such as a complete
+    /// detector cycle. Every backend must provide real transaction semantics.
+    fn begin_transaction(&mut self) -> Result<(), StorageError>;
     /// Commit the transaction opened by [`Storage::begin_transaction`].
-    fn commit_transaction(&mut self) -> Result<(), StorageError> {
-        Ok(())
-    }
+    fn commit_transaction(&mut self) -> Result<(), StorageError>;
     /// Abort the transaction opened by [`Storage::begin_transaction`],
     /// discarding everything written since it began.
-    fn rollback_transaction(&mut self) -> Result<(), StorageError> {
-        Ok(())
-    }
+    fn rollback_transaction(&mut self) -> Result<(), StorageError>;
 
     /// Current persisted schema version for diagnostics.
     fn schema_version(&mut self) -> Result<i64, StorageError> {
@@ -165,6 +158,19 @@ pub struct MemoryStorage {
     simulation_records: Vec<SimulationRecord>,
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
+    transaction_snapshot: Option<MemoryStorageState>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryStorageState {
+    findings: Vec<Finding>,
+    recommendations: Vec<Recommendation>,
+    audit: Vec<AuditEntry>,
+    channel_snapshots: Vec<ChannelSnapshot>,
+    simulations: Vec<Simulation>,
+    simulation_records: Vec<SimulationRecord>,
+    alert_state: HashMap<String, AlertState>,
+    operational_state: Option<rieko_status::OperationalState>,
 }
 
 impl MemoryStorage {
@@ -174,6 +180,48 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
+    fn begin_transaction(&mut self) -> Result<(), StorageError> {
+        if self.transaction_snapshot.is_some() {
+            return Err(StorageError::Backend("nested transaction attempted".into()));
+        }
+        self.transaction_snapshot = Some(MemoryStorageState {
+            findings: self.findings.clone(),
+            recommendations: self.recommendations.clone(),
+            audit: self.audit.clone(),
+            channel_snapshots: self.channel_snapshots.clone(),
+            simulations: self.simulations.clone(),
+            simulation_records: self.simulation_records.clone(),
+            alert_state: self.alert_state.clone(),
+            operational_state: self.operational_state.clone(),
+        });
+        Ok(())
+    }
+
+    fn commit_transaction(&mut self) -> Result<(), StorageError> {
+        if self.transaction_snapshot.take().is_none() {
+            return Err(StorageError::Backend(
+                "commit with no open transaction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self) -> Result<(), StorageError> {
+        let snapshot = self
+            .transaction_snapshot
+            .take()
+            .ok_or_else(|| StorageError::Backend("rollback with no open transaction".into()))?;
+        self.findings = snapshot.findings;
+        self.recommendations = snapshot.recommendations;
+        self.audit = snapshot.audit;
+        self.channel_snapshots = snapshot.channel_snapshots;
+        self.simulations = snapshot.simulations;
+        self.simulation_records = snapshot.simulation_records;
+        self.alert_state = snapshot.alert_state;
+        self.operational_state = snapshot.operational_state;
+        Ok(())
+    }
+
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
         if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
             // Idempotent replay: refresh explanation/last-seen, never
