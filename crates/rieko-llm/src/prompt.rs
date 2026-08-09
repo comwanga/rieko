@@ -41,6 +41,7 @@ mod tests {
             node: Some("n".into()),
             channel: Some("c".into()),
             evidence: vec![Evidence::number("local_ratio", 0.5)],
+            provenance: None,
             explanation: None,
             timestamp: chrono::Utc::now(),
             first_seen_at: chrono::Utc::now(),

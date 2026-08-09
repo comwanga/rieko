@@ -141,8 +141,8 @@ The release binary embeds the UI at `/`. API endpoints:
 |----------|-------------|
 | `GET /` | Embedded UI |
 | `GET /status` | Operational status |
-| `GET /findings?limit=N` | Recent findings |
-| `GET /findings/channel/:id` | Findings for a channel |
+| `GET /findings?limit=N&lifecycle=active` | Recent findings; lifecycle is `active` (default), `resolved`, or `all` |
+| `GET /findings/channel/:id?lifecycle=active` | Findings for a channel, with the same lifecycle filter |
 | `GET /recommendations?limit=N` | Recent recommendations |
 | `GET /audit?limit=N` | Audit trail |
 | `GET /snapshots?limit=N` | Channel snapshots |

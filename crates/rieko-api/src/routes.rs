@@ -168,18 +168,35 @@ fn source_label(state: &rieko_status::OperationalState) -> String {
 #[derive(Deserialize)]
 pub struct LimitQuery {
     limit: Option<u32>,
+    lifecycle: Option<String>,
 }
 
 fn limit(q: &LimitQuery) -> u32 {
     q.limit.unwrap_or(50).clamp(1, 500)
 }
 
+fn lifecycle(
+    q: &LimitQuery,
+) -> Result<rieko_findings::FindingLifecycleFilter, (StatusCode, String)> {
+    match q.lifecycle.as_deref().unwrap_or("active") {
+        "active" => Ok(rieko_findings::FindingLifecycleFilter::Active),
+        "resolved" => Ok(rieko_findings::FindingLifecycleFilter::Resolved),
+        "all" => Ok(rieko_findings::FindingLifecycleFilter::All),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "lifecycle must be active, resolved, or all".into(),
+        )),
+    }
+}
+
 pub async fn findings(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let lifecycle = lifecycle(&q)?;
     let rows = block_read(api.state.storage.clone(), move |s| {
-        s.latest_findings(limit(&q)).map_err(|e| e.to_string())
+        s.latest_findings_by_lifecycle(limit(&q), lifecycle)
+            .map_err(|e| e.to_string())
     })
     .await?;
     let out: Vec<Value> = rows
@@ -194,8 +211,9 @@ pub async fn findings_for_channel(
     Path(channel_id): Path<String>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let lifecycle = lifecycle(&q)?;
     let rows = block_read(api.state.storage.clone(), move |s| {
-        s.findings_for_channel(&channel_id, limit(&q))
+        s.findings_for_channel_by_lifecycle(&channel_id, limit(&q), lifecycle)
             .map_err(|e| e.to_string())
     })
     .await?;

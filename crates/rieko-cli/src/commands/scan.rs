@@ -77,14 +77,27 @@ pub fn run(args: ScanArgs) -> Result<()> {
     info!(n_nodes, n_channels, "graph loaded");
 
     super::common::record_cycle_attempt(&mut storage)?;
+    let observation_source = source.observation_source()?;
+    let normalizer = source.normalizer();
+    let detector_context = rieko_detectors::DetectorContext {
+        history: None,
+        source: Some(&observation_source),
+        normalizer: Some(&normalizer),
+        node: Some(&args.node),
+    };
     let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
         Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
         Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
     ];
-    let mut findings: Vec<rieko_findings::Finding> = Vec::new();
+    let mut cycles = Vec::new();
     for detector in &detectors {
-        findings.extend(detector.run(&graph, &rieko_detectors::DetectorContext::no_context()));
+        cycles.push(detector.evaluate(&graph, &detector_context)?);
     }
+    let scopes: Vec<_> = cycles.iter().map(|cycle| cycle.scope.clone()).collect();
+    let mut findings: Vec<_> = cycles
+        .into_iter()
+        .flat_map(|cycle| cycle.findings)
+        .collect();
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
     let llm = OpenAiCompatibleClient::from_env().context("building LLM client")?;
@@ -136,6 +149,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
         llm.as_ref().map(|client| client as &dyn LlmClient),
         &engine,
         &args.node,
+        &scopes,
         &mut findings,
     )?;
 

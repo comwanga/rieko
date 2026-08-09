@@ -175,6 +175,7 @@ mod tests {
                 Evidence::text("direction", "outbound"),
                 Evidence::number("local_ratio", 0.02),
             ],
+            provenance: None,
             explanation: None,
             timestamp: now,
             first_seen_at: now,

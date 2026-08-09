@@ -1,9 +1,12 @@
 use chrono::Utc;
 use rieko_domain::{LiquidityImbalance, NodeId};
-use rieko_findings::{finding_identity, Evidence, Finding, Severity};
+use rieko_findings::{
+    channel_state_digest, finding_identity, ChannelSnapshotReference, Evidence, Finding,
+    FindingProvenance, ObservationReference, Severity,
+};
 use rieko_graph::GraphView;
 
-use crate::registry::{Detector, DetectorContext};
+use crate::registry::{provenance_producers, Detector, DetectorContext};
 
 /// Thresholds for the liquidity detector's *severity gate*. These are
 /// documented heuristics, not universal truth (RIEKO-AUDIT-011).
@@ -66,7 +69,7 @@ impl Detector for LiquidityDetector {
         "2"
     }
 
-    fn run(&self, view: &dyn GraphView, _ctx: &DetectorContext) -> Vec<Finding> {
+    fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding> {
         let mut findings = Vec::new();
         for channel in view.channels() {
             if !channel.status.is_open() {
@@ -115,10 +118,8 @@ impl Detector for LiquidityDetector {
                 id: finding_identity(
                     self.id(),
                     self.version(),
-                    severity,
                     Some(self.local_node.as_ref()),
                     Some(channel.id.as_ref()),
-                    &evidence,
                 ),
                 detector: self.id().to_string(),
                 detector_version: self.version().to_string(),
@@ -127,6 +128,17 @@ impl Detector for LiquidityDetector {
                 node: Some(self.local_node.to_string()),
                 channel: Some(channel.id.to_string()),
                 evidence,
+                provenance: ctx.source.map(|source| FindingProvenance {
+                    source: source.clone(),
+                    producers: provenance_producers(ctx.normalizer, self),
+                    observation: ObservationReference::ChannelState {
+                        channel_id: channel.id.to_string(),
+                        snapshot: ChannelSnapshotReference {
+                            observed_at: channel.last_seen,
+                            state_digest: channel_state_digest(channel),
+                        },
+                    },
+                }),
                 explanation: Some(format!(
                     "Liquidity on channel {} is one-sided ({direction} capacity drained, local ratio {:.4}). This is a risk signal, not proof of a fault; confirm the expected role and forwarding demand before acting.",
                     channel.id,
@@ -140,6 +152,13 @@ impl Detector for LiquidityDetector {
         }
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
         findings
+    }
+
+    fn is_complete(&self, view: &dyn GraphView, _ctx: &DetectorContext) -> bool {
+        view.channels().into_iter().all(|channel| {
+            !channel.status.is_open()
+                || channel.liquidity.imbalance != rieko_domain::LiquidityImbalance::Unknown
+        })
     }
 }
 
@@ -444,6 +463,49 @@ mod tests {
             &serde_json::json!(0.05),
             "evidence must show the severity threshold used"
         );
+    }
+
+    #[test]
+    fn changing_measurement_and_severity_preserve_identity() {
+        let warning = graph_with(vec![channel("c1", 8_000, 92_000)]);
+        let critical = graph_with(vec![channel("c1", 2_000, 98_000)]);
+        let detector = LiquidityDetector::new("local-node");
+        let warning = detector.run(&warning, &DetectorContext::no_context());
+        let critical = detector.run(&critical, &DetectorContext::no_context());
+        assert_eq!(warning[0].id, critical[0].id);
+        assert_ne!(warning[0].severity, critical[0].severity);
+        assert_ne!(warning[0].evidence, critical[0].evidence);
+    }
+
+    #[test]
+    fn evaluated_finding_contains_redacted_source_provenance() {
+        let graph = graph_with(vec![channel("c1", 2_000, 98_000)]);
+        let detector = LiquidityDetector::new("local-node");
+        let source = rieko_findings::ObservationSource::Fixture {
+            redacted_hash: "fixture-digest".into(),
+        };
+        let normalizer = rieko_findings::ProducerVersion {
+            name: "normalizer".into(),
+            version: "1".into(),
+            role: rieko_findings::ProducerRole::Normalizer,
+        };
+        let context = DetectorContext {
+            history: None,
+            source: Some(&source),
+            normalizer: Some(&normalizer),
+            node: Some("local-node"),
+        };
+
+        let cycle = detector.evaluate(&graph, &context).unwrap();
+
+        assert!(cycle.scope.complete);
+        let provenance = cycle.findings[0].provenance.as_ref().unwrap();
+        assert_eq!(provenance.source, source);
+        assert_eq!(provenance.producers.len(), 2);
+        assert!(matches!(
+            provenance.observation,
+            rieko_findings::ObservationReference::ChannelState { .. }
+        ));
     }
 
     #[test]

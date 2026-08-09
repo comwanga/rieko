@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 rieko-storage.workspace = true
 rieko-status.workspace = true
+rieko-findings.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
@@ -32,4 +33,3 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 chrono = { version = "0.4", features = ["serde"] }
 rieko-domain.workspace = true
-rieko-findings.workspace = true
