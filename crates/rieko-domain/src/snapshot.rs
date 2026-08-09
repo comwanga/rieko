@@ -8,6 +8,9 @@ use crate::{Channel, ChannelId, ChannelStatus};
 /// later, run what-if simulations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelSnapshot {
+    /// Configured local node identity. Legacy rows may not have one.
+    #[serde(default)]
+    pub node_id: Option<String>,
     pub channel_id: String,
     pub local_ratio: f64,
     pub local_balance_msat: u64,
@@ -26,6 +29,7 @@ pub struct ChannelSnapshot {
 impl ChannelSnapshot {
     pub fn from_channel(channel: &Channel, ts: DateTime<Utc>) -> Self {
         Self {
+            node_id: Some(channel.node.to_string()),
             channel_id: channel.id.to_string(),
             local_ratio: channel.liquidity.local_ratio,
             local_balance_msat: channel.liquidity.local_balance_msat,

@@ -7,7 +7,7 @@ use rieko_findings::{
     ActionStage, AuditEntry, Finding, FindingCycleScope, FindingLifecycle, FindingLifecycleFilter,
     FindingProvenance, Recommendation, Simulation,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::storage::{StorageCounts, StorageError};
@@ -310,6 +310,20 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    fn finding_by_id(&mut self, finding_id: &str) -> Result<Option<Finding>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                        detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                        provenance
+                 FROM findings WHERE id = ?1",
+                [finding_id],
+                Self::row_to_finding,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn latest_findings_by_lifecycle(
         &mut self,
         limit: u32,
@@ -591,8 +605,9 @@ impl Storage for SqliteStorage {
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO channel_snapshots
-             (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat,
+              status_int, spendable_outbound_msat, spendable_inbound_msat, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 snapshot.channel_id,
                 snapshot.ts.to_rfc3339(),
@@ -603,6 +618,7 @@ impl Storage for SqliteStorage {
                 snapshot.status as i64,
                 snapshot.spendable_outbound_msat,
                 snapshot.spendable_inbound_msat,
+                snapshot.node_id,
             ],
         )?;
         Ok(())
@@ -614,22 +630,33 @@ impl Storage for SqliteStorage {
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+                    capacity_msat, status_int, spendable_outbound_msat,
+                    spendable_inbound_msat, node_id
              FROM channel_snapshots WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![channel_id, limit], |row| {
             let status_int: u32 = row.get(6)?;
-            let ts: String = row.get(1)?;
+            let ts_raw: String = row.get(1)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_raw)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    invalid_simulation_column(
+                        1,
+                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
+                    )
+                })?;
             Ok(ChannelSnapshot {
+                node_id: row.get(9)?,
                 channel_id: row.get(0)?,
                 local_ratio: row.get(2)?,
                 local_balance_msat: row.get(3)?,
                 remote_balance_msat: row.get(4)?,
                 capacity_msat: row.get(5)?,
                 status: status_from_i64(status_int),
-                ts: parse_ts(&ts),
-                spendable_outbound_msat: row.get::<_, u64>(7).unwrap_or(0),
-                spendable_inbound_msat: row.get::<_, u64>(8).unwrap_or(0),
+                ts,
+                spendable_outbound_msat: row.get(7)?,
+                spendable_inbound_msat: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -639,24 +666,76 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
-    fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat, spendable_inbound_msat
-             FROM channel_snapshots ORDER BY ts DESC LIMIT ?1",
+    fn recent_channel_snapshots_for_node(
+        &mut self,
+        node_id: &str,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+                    capacity_msat, status_int, spendable_outbound_msat,
+                    spendable_inbound_msat, node_id
+             FROM channel_snapshots
+             WHERE node_id = ?1 AND channel_id = ?2
+             ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map([limit], |row| {
+        let rows = statement.query_map(params![node_id, channel_id, limit], |row| {
             let status_int: u32 = row.get(6)?;
-            let ts: String = row.get(1)?;
+            let ts_raw: String = row.get(1)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_raw)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    invalid_simulation_column(
+                        1,
+                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
+                    )
+                })?;
             Ok(ChannelSnapshot {
+                node_id: row.get(9)?,
                 channel_id: row.get(0)?,
                 local_ratio: row.get(2)?,
                 local_balance_msat: row.get(3)?,
                 remote_balance_msat: row.get(4)?,
                 capacity_msat: row.get(5)?,
                 status: status_from_i64(status_int),
-                ts: parse_ts(&ts),
-                spendable_outbound_msat: row.get::<_, u64>(7).unwrap_or(0),
-                spendable_inbound_msat: row.get::<_, u64>(8).unwrap_or(0),
+                ts,
+                spendable_outbound_msat: row.get(7)?,
+                spendable_inbound_msat: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+                    capacity_msat, status_int, spendable_outbound_msat,
+                    spendable_inbound_msat, node_id
+             FROM channel_snapshots ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            let status_int: u32 = row.get(6)?;
+            let ts_raw: String = row.get(1)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_raw)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    invalid_simulation_column(
+                        1,
+                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
+                    )
+                })?;
+            Ok(ChannelSnapshot {
+                node_id: row.get(9)?,
+                channel_id: row.get(0)?,
+                local_ratio: row.get(2)?,
+                local_balance_msat: row.get(3)?,
+                remote_balance_msat: row.get(4)?,
+                capacity_msat: row.get(5)?,
+                status: status_from_i64(status_int),
+                ts,
+                spendable_outbound_msat: row.get(7)?,
+                spendable_inbound_msat: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -726,7 +805,7 @@ impl Storage for SqliteStorage {
                                 SELECT rowid FROM (
                                     SELECT rowid,
                                            ROW_NUMBER() OVER (
-                                               PARTITION BY channel_id ORDER BY ts DESC
+                                               PARTITION BY node_id, channel_id ORDER BY ts DESC
                                            ) AS rn
                                     FROM channel_snapshots
                                 ) WHERE rn > ?1
@@ -779,8 +858,10 @@ impl Storage for SqliteStorage {
         let projection = serde_json::to_string(&sim.projection)
             .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO simulations (id, action_id, finding_id, action_type, projection, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO simulations
+             (id, action_id, finding_id, action_type, projection, created_at,
+              requested_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
             params![
                 sim.id,
                 sim.action_id,
@@ -796,7 +877,7 @@ impl Storage for SqliteStorage {
     fn recent_simulations(&mut self, limit: u32) -> Result<Vec<Simulation>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, action_id, finding_id, action_type, projection, created_at
-             FROM simulations ORDER BY created_at DESC LIMIT ?",
+             FROM simulations WHERE model_id = 'legacy' ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_simulation)?;
         let mut out = Vec::new();
@@ -809,7 +890,8 @@ impl Storage for SqliteStorage {
     fn simulations_for_action(&mut self, action_id: &str) -> Result<Vec<Simulation>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, action_id, finding_id, action_type, projection, created_at
-             FROM simulations WHERE action_id = ? ORDER BY created_at DESC",
+             FROM simulations WHERE action_id = ? AND model_id = 'legacy'
+             ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([action_id], Self::row_to_simulation)?;
         let mut out = Vec::new();
@@ -822,17 +904,21 @@ impl Storage for SqliteStorage {
     // ── V2 simulation persistence (ADR-0005) ──────────────────────────
 
     fn save_simulation_v2(&mut self, rec: &crate::SimulationRecord) -> Result<(), StorageError> {
+        validate_simulation_record(rec)?;
         let proj = serde_json::to_string(&rec.projection)
             .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
+        let canonical_input = serde_json::to_string(&rec.canonical_input)
+            .map_err(|e| StorageError::Corrupt(format!("canonical simulation input: {e}")))?;
         let assumptions = serde_json::to_string(&rec.assumptions)
             .map_err(|e| StorageError::Corrupt(format!("assumptions: {e}")))?;
         let warnings = serde_json::to_string(&rec.warnings)
             .map_err(|e| StorageError::Corrupt(format!("warnings: {e}")))?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO simulations
+            "INSERT INTO simulations
              (id, action_id, finding_id, action_type, status, model_id, model_version,
-              input_hash, confidence, assumptions, warnings, explanation, projection, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+               input_hash, confidence, assumptions, warnings, explanation, projection, created_at,
+               canonical_input, source_observed_at, requested_at, completed_at, error_code)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 rec.id,
                 rec.action_id,
@@ -848,6 +934,11 @@ impl Storage for SqliteStorage {
                 rec.explanation,
                 proj,
                 rec.created_at,
+                canonical_input,
+                rec.source_observed_at,
+                rec.requested_at,
+                rec.completed_at,
+                rec.error_code,
             ],
         )?;
         Ok(())
@@ -859,7 +950,8 @@ impl Storage for SqliteStorage {
     ) -> Result<Vec<crate::SimulationRecord>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
-                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at
+                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at,
+                    canonical_input, source_observed_at, requested_at, completed_at, error_code
              FROM simulations ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_simulation_v2)?;
@@ -876,7 +968,8 @@ impl Storage for SqliteStorage {
     ) -> Result<Vec<crate::SimulationRecord>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
-                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at
+                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at,
+                    canonical_input, source_observed_at, requested_at, completed_at, error_code
              FROM simulations WHERE action_id = ? ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([action_id], Self::row_to_simulation_v2)?;
@@ -885,6 +978,93 @@ impl Storage for SqliteStorage {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<crate::SimulationRecord>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                        input_hash, confidence, assumptions, warnings, explanation, projection,
+                        created_at, canonical_input, source_observed_at, requested_at,
+                        completed_at, error_code
+                 FROM simulations WHERE id = ?1",
+                [simulation_id],
+                Self::row_to_simulation_v2,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn simulation_v2_by_input_hash(
+        &mut self,
+        input_hash: &str,
+    ) -> Result<Option<crate::SimulationRecord>, StorageError> {
+        if input_hash.is_empty() {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                        input_hash, confidence, assumptions, warnings, explanation, projection,
+                        created_at, canonical_input, source_observed_at, requested_at,
+                        completed_at, error_code
+                 FROM simulations WHERE input_hash = ?1
+                 ORDER BY CASE WHEN projection <> 'null' THEN 0 ELSE 1 END, created_at DESC
+                 LIMIT 1",
+                [input_hash],
+                Self::row_to_simulation_v2,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn append_simulation_event(
+        &mut self,
+        event: &crate::SimulationEvent,
+    ) -> Result<(), StorageError> {
+        validate_simulation_status(&event.status)?;
+        validate_rfc3339("simulation event timestamp", &event.timestamp)?;
+        self.conn.execute(
+            "INSERT INTO simulation_events (id, simulation_id, status, error_code, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.id,
+                event.simulation_id,
+                event.status,
+                event.error_code,
+                event.timestamp
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn simulation_events(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Vec<crate::SimulationEvent>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, simulation_id, status, error_code, ts
+             FROM simulation_events WHERE simulation_id = ?1 ORDER BY ts",
+        )?;
+        let rows = statement.query_map([simulation_id], |row| {
+            let status: String = row.get(2)?;
+            validate_simulation_status(&status)
+                .map_err(|error| invalid_simulation_column(2, error.to_string()))?;
+            let timestamp: String = row.get(4)?;
+            validate_rfc3339("simulation event timestamp", &timestamp)
+                .map_err(|error| invalid_simulation_column(4, error.to_string()))?;
+            Ok(crate::SimulationEvent {
+                id: row.get(0)?,
+                simulation_id: row.get(1)?,
+                status,
+                error_code: row.get(3)?,
+                timestamp,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn counts(&mut self) -> Result<StorageCounts, StorageError> {
@@ -911,47 +1091,258 @@ impl SqliteStorage {
             "update_fee_policy" => ActionType::UpdateFeePolicy,
             "restart_service" => ActionType::RestartService,
             "custom" => ActionType::Custom,
-            _ => ActionType::RebalanceChannel,
+            "rebalance_channel" => ActionType::RebalanceChannel,
+            value => {
+                return Err(invalid_simulation_column(
+                    3,
+                    format!("invalid simulation action type {value:?}"),
+                ))
+            }
         };
-        let projection = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or(
-            rieko_findings::SimulationProjection {
-                local_ratio_before: 0.0,
-                local_ratio_after: 0.0,
-                local_balance_msat_after: 0,
-                remote_balance_msat_after: 0,
-                delta_msat: 0,
-                clears_finding: false,
-                summary: "corrupt projection".into(),
-            },
-        );
+        let projection_raw: String = row.get(4)?;
+        let projection = serde_json::from_str(&projection_raw).map_err(|error| {
+            invalid_simulation_column(4, format!("invalid legacy simulation projection: {error}"))
+        })?;
+        let created_at_raw: String = row.get(5)?;
+        let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|error| {
+                invalid_simulation_column(
+                    5,
+                    format!("invalid simulation timestamp {created_at_raw:?}: {error}"),
+                )
+            })?;
         Ok(Simulation {
             id: row.get(0)?,
             action_id: row.get(1)?,
             finding_id: row.get(2)?,
             action_type,
             projection,
-            created_at: parse_ts(&row.get::<_, String>(5)?),
+            created_at,
         })
     }
 
     fn row_to_simulation_v2(row: &rusqlite::Row) -> rusqlite::Result<crate::SimulationRecord> {
-        Ok(crate::SimulationRecord {
+        let status: String = row.get(4)?;
+        validate_simulation_status(&status)
+            .map_err(|error| invalid_simulation_column(4, error.to_string()))?;
+        let confidence: String = row.get(8)?;
+        if !matches!(confidence.as_str(), "high" | "medium" | "low" | "unknown") {
+            return Err(invalid_simulation_column(
+                8,
+                format!("invalid simulation confidence {confidence:?}"),
+            ));
+        }
+        let parse_json = |index| -> rusqlite::Result<serde_json::Value> {
+            let raw: String = row.get(index)?;
+            serde_json::from_str(&raw).map_err(|error| {
+                invalid_simulation_column(index, format!("invalid simulation JSON: {error}"))
+            })
+        };
+        let created_at: String = row.get(13)?;
+        validate_rfc3339("simulation created_at", &created_at)
+            .map_err(|error| invalid_simulation_column(13, error.to_string()))?;
+        let source_observed_at: Option<String> = row.get(15)?;
+        if let Some(timestamp) = &source_observed_at {
+            validate_rfc3339("simulation source_observed_at", timestamp)
+                .map_err(|error| invalid_simulation_column(15, error.to_string()))?;
+        }
+        let requested_at: String = row.get(16)?;
+        validate_rfc3339("simulation requested_at", &requested_at)
+            .map_err(|error| invalid_simulation_column(16, error.to_string()))?;
+        let completed_at: Option<String> = row.get(17)?;
+        if let Some(timestamp) = &completed_at {
+            validate_rfc3339("simulation completed_at", timestamp)
+                .map_err(|error| invalid_simulation_column(17, error.to_string()))?;
+        }
+        let record = crate::SimulationRecord {
             id: row.get(0)?,
             action_id: row.get(1)?,
             finding_id: row.get(2)?,
             action_type: row.get(3)?,
-            status: row.get(4)?,
+            status,
             model_id: row.get(5)?,
             model_version: row.get(6)?,
             input_hash: row.get(7)?,
-            confidence: row.get(8)?,
-            assumptions: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
-            warnings: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+            confidence,
+            assumptions: parse_json(9)?,
+            warnings: parse_json(10)?,
             explanation: row.get(11)?,
-            projection: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
-            created_at: row.get(13)?,
-        })
+            projection: parse_json(12)?,
+            canonical_input: row
+                .get::<_, Option<String>>(14)?
+                .map(|raw| {
+                    serde_json::from_str(&raw).map_err(|error| {
+                        invalid_simulation_column(
+                            14,
+                            format!("invalid canonical simulation input: {error}"),
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+            source_observed_at,
+            requested_at,
+            completed_at,
+            error_code: row.get(18)?,
+            created_at,
+        };
+        validate_simulation_record(&record)
+            .map_err(|error| invalid_simulation_column(14, error.to_string()))?;
+        Ok(record)
     }
+}
+
+fn validate_simulation_record(rec: &crate::SimulationRecord) -> Result<(), StorageError> {
+    validate_simulation_status(&rec.status)?;
+    if !matches!(
+        rec.confidence.as_str(),
+        "high" | "medium" | "low" | "unknown"
+    ) {
+        return Err(StorageError::Corrupt(format!(
+            "invalid simulation confidence {:?}",
+            rec.confidence
+        )));
+    }
+    if !rec.input_hash.is_empty()
+        && (rec.input_hash.len() != 64
+            || !rec.input_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(StorageError::Corrupt(
+            "invalid simulation input hash".into(),
+        ));
+    }
+    validate_rfc3339("simulation created_at", &rec.created_at)?;
+    validate_rfc3339("simulation requested_at", &rec.requested_at)?;
+    if let Some(timestamp) = &rec.source_observed_at {
+        validate_rfc3339("simulation source_observed_at", timestamp)?;
+    }
+    if let Some(timestamp) = &rec.completed_at {
+        validate_rfc3339("simulation completed_at", timestamp)?;
+    }
+    if !rec.canonical_input.is_null() {
+        use sha2::{Digest, Sha256};
+
+        let canonical = serde_json::to_vec(&rec.canonical_input).map_err(|error| {
+            StorageError::Corrupt(format!("encoding canonical simulation input: {error}"))
+        })?;
+        let mut hash = Sha256::new();
+        hash.update(b"rieko-simulation-input-v3");
+        hash.update((canonical.len() as u64).to_be_bytes());
+        hash.update(canonical);
+        let expected_hash = format!("{:x}", hash.finalize());
+        if rec.input_hash != expected_hash {
+            return Err(StorageError::Corrupt(
+                "simulation input hash does not match canonical input".into(),
+            ));
+        }
+        for (field, expected) in [
+            ("recommendation_id", rec.action_id.as_str()),
+            ("finding_id", rec.finding_id.as_str()),
+            ("model_id", rec.model_id.as_str()),
+            ("model_version", rec.model_version.as_str()),
+        ] {
+            if rec.canonical_input[field].as_str() != Some(expected) {
+                return Err(StorageError::Corrupt(format!(
+                    "canonical simulation input {field} disagrees with record"
+                )));
+            }
+        }
+        let canonical_action_type = match rec.canonical_input["action_type"].as_str() {
+            Some("RebalanceChannel") => "rebalance_channel",
+            Some("UpdateFeePolicy") => "update_fee_policy",
+            Some("RestartService") => "restart_service",
+            Some("Custom") => "custom",
+            _ => {
+                return Err(StorageError::Corrupt(
+                    "canonical simulation input has invalid action_type".into(),
+                ))
+            }
+        };
+        if canonical_action_type != rec.action_type {
+            return Err(StorageError::Corrupt(
+                "canonical simulation action type disagrees with record".into(),
+            ));
+        }
+        let canonical_source = rec.canonical_input["source_snapshot"]["ts"]
+            .as_str()
+            .ok_or_else(|| {
+                StorageError::Corrupt("canonical simulation input has no source timestamp".into())
+            })?;
+        let recorded_source = rec.source_observed_at.as_deref().ok_or_else(|| {
+            StorageError::Corrupt("simulation record has no source timestamp".into())
+        })?;
+        let canonical_source = DateTime::parse_from_rfc3339(canonical_source).map_err(|error| {
+            StorageError::Corrupt(format!("invalid canonical source timestamp: {error}"))
+        })?;
+        let recorded_source = DateTime::parse_from_rfc3339(recorded_source).map_err(|error| {
+            StorageError::Corrupt(format!("invalid recorded source timestamp: {error}"))
+        })?;
+        if canonical_source != recorded_source {
+            return Err(StorageError::Corrupt(format!(
+                "simulation source timestamp {recorded_source} disagrees with canonical input {canonical_source}"
+            )));
+        }
+    }
+    if !rec.canonical_input.is_null() && !rec.projection.is_null() {
+        for (field, expected) in [
+            ("model_id", rec.model_id.as_str()),
+            ("model_version", rec.model_version.as_str()),
+            ("input_hash", rec.input_hash.as_str()),
+        ] {
+            if rec.projection[field].as_str() != Some(expected) {
+                return Err(StorageError::Corrupt(format!(
+                    "simulation projection {field} disagrees with record"
+                )));
+            }
+        }
+        if rec.projection["assumptions"] != rec.assumptions
+            || rec.projection["warnings"] != rec.warnings
+            || rec.projection["confidence"].as_str() != Some(rec.confidence.as_str())
+        {
+            return Err(StorageError::Corrupt(
+                "simulation projection metadata disagrees with record".into(),
+            ));
+        }
+    }
+    match rec.status.as_str() {
+        "completed" if rec.projection.is_null() => {
+            return Err(StorageError::Corrupt(
+                "completed simulation has no deterministic projection".into(),
+            ));
+        }
+        "unsupported" | "invalid_input" | "failed" if !rec.projection.is_null() => {
+            return Err(StorageError::Corrupt(format!(
+                "{} simulation must not contain a projection",
+                rec.status
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_simulation_status(status: &str) -> Result<(), StorageError> {
+    if matches!(
+        status,
+        "requested" | "completed" | "unsupported" | "invalid_input" | "stale" | "failed"
+    ) {
+        Ok(())
+    } else {
+        Err(StorageError::Corrupt(format!(
+            "invalid simulation status {status:?}"
+        )))
+    }
+}
+
+fn validate_rfc3339(label: &str, timestamp: &str) -> Result<(), StorageError> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|_| ())
+        .map_err(|error| StorageError::Corrupt(format!("invalid {label} {timestamp:?}: {error}")))
+}
+
+fn invalid_simulation_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, message.into())
 }
 
 fn status_from_i64(v: u32) -> rieko_domain::ChannelStatus {
@@ -1463,6 +1854,248 @@ mod tests {
         assert!(got[0].projection.clears_finding);
         assert_eq!(s.simulations_for_action("a1").unwrap().len(), 1);
         assert_eq!(s.simulations_for_action("zz").unwrap().len(), 0);
+        let bridged = s.recent_simulations_v2(10).unwrap();
+        assert_eq!(bridged[0].model_id, "legacy");
+        assert!(bridged[0].canonical_input.is_null());
+    }
+
+    fn simulation_record(id: &str) -> crate::SimulationRecord {
+        use sha2::{Digest, Sha256};
+
+        let canonical_input = serde_json::json!({
+            "action_type": "RebalanceChannel",
+            "destination_snapshot": {
+                "capacity_msat": 1000000,
+                "channel_id": "c2",
+                "node_id": "local-node",
+                "local_balance_msat": 700000,
+                "local_ratio": 0.7,
+                "remote_balance_msat": 300000,
+                "spendable_inbound_msat": 290000,
+                "spendable_outbound_msat": 690000,
+                "status": "Active",
+                "ts": "2023-11-14T22:13:20Z"
+            },
+            "finding_id": "f1",
+            "finding_channel": "c1",
+            "model_id": "liquidity-redistribution",
+            "model_version": "2",
+            "node_id": "local-node",
+            "parameters": {
+                "amount_msat": 50000,
+                "destination_channel": "c2",
+                "source_channel": "c1"
+            },
+            "recommendation_id": "a1",
+            "recommendation_target": "c1",
+            "provenance": {
+                "observation": {
+                    "channel_id": "c1",
+                    "kind": "channel_state",
+                    "snapshot": {
+                        "observed_at": "2023-11-14T22:13:20Z",
+                        "state_digest": "state-hash"
+                    }
+                },
+                "producers": [],
+                "source": {
+                    "kind": "fixture",
+                    "redacted_hash": "fixture-hash"
+                }
+            },
+            "source_snapshot": {
+                "capacity_msat": 1000000,
+                "channel_id": "c1",
+                "node_id": "local-node",
+                "local_balance_msat": 200000,
+                "local_ratio": 0.2,
+                "remote_balance_msat": 800000,
+                "spendable_inbound_msat": 790000,
+                "spendable_outbound_msat": 190000,
+                "status": "Active",
+                "ts": "2023-11-14T22:13:20Z"
+            }
+        });
+        let canonical = serde_json::to_vec(&canonical_input).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"rieko-simulation-input-v3");
+        hash.update((canonical.len() as u64).to_be_bytes());
+        hash.update(canonical);
+        let input_hash = format!("{:x}", hash.finalize());
+        let assumptions = serde_json::json!([]);
+        let warnings = serde_json::json!([]);
+        let projection = serde_json::json!({
+            "assumptions": assumptions,
+            "baseline": {
+                "capacity_msat": 1000000,
+                "local_balance_msat": 200000,
+                "local_ratio": 0.2,
+                "remote_balance_msat": 800000
+            },
+            "confidence": "medium",
+            "deltas": [],
+            "input_hash": input_hash,
+            "model_id": "liquidity-redistribution",
+            "model_version": "2",
+            "projected": {
+                "capacity_msat": 1000000,
+                "local_balance_msat": 150000,
+                "local_ratio": 0.15,
+                "remote_balance_msat": 850000
+            },
+            "warnings": warnings
+        });
+        crate::SimulationRecord {
+            id: id.into(),
+            action_id: "a1".into(),
+            finding_id: "f1".into(),
+            action_type: "rebalance_channel".into(),
+            status: "completed".into(),
+            model_id: "liquidity-redistribution".into(),
+            model_version: "2".into(),
+            input_hash,
+            confidence: "medium".into(),
+            assumptions,
+            warnings,
+            explanation: String::new(),
+            canonical_input,
+            projection,
+            source_observed_at: Some("2023-11-14T22:13:20Z".into()),
+            requested_at: "2023-11-14T22:14:20Z".into(),
+            completed_at: Some("2023-11-14T22:14:20Z".into()),
+            error_code: None,
+            created_at: "2023-11-14T22:14:20Z".into(),
+        }
+    }
+
+    #[test]
+    fn replayable_simulation_and_events_roundtrip_atomically() {
+        for mut storage in lifecycle_backends() {
+            let record = simulation_record("sim-v2");
+            let event = crate::SimulationEvent {
+                id: "event-1".into(),
+                simulation_id: record.id.clone(),
+                status: "completed".into(),
+                error_code: None,
+                timestamp: record.requested_at.clone(),
+            };
+            let before = storage.counts().unwrap();
+            storage.begin_transaction().unwrap();
+            storage.save_simulation_v2(&record).unwrap();
+            storage.append_simulation_event(&event).unwrap();
+            storage.commit_transaction().unwrap();
+
+            assert_eq!(
+                storage.simulation_v2_by_id(&record.id).unwrap(),
+                Some(record.clone())
+            );
+            assert_eq!(
+                storage
+                    .simulation_v2_by_input_hash(&record.input_hash)
+                    .unwrap(),
+                Some(record.clone())
+            );
+            assert_eq!(storage.simulation_events(&record.id).unwrap(), vec![event]);
+            let after = storage.counts().unwrap();
+            assert_eq!(after.findings, before.findings);
+            assert_eq!(after.recommendations, before.recommendations);
+            assert_eq!(after.audit, before.audit);
+            assert_eq!(after.simulations, before.simulations + 1);
+        }
+    }
+
+    #[test]
+    fn completed_simulations_are_immutable_and_input_unique() {
+        for mut storage in lifecycle_backends() {
+            let record = simulation_record("sim-v2");
+            storage.save_simulation_v2(&record).unwrap();
+
+            let mut changed = record.clone();
+            changed.status = "failed".into();
+            assert!(storage.save_simulation_v2(&changed).is_err());
+
+            let mut duplicate_input = record.clone();
+            duplicate_input.id = "different-run".into();
+            assert!(storage.save_simulation_v2(&duplicate_input).is_err());
+        }
+    }
+
+    #[test]
+    fn simulation_record_and_lifecycle_events_roll_back_together() {
+        for mut storage in lifecycle_backends() {
+            let record = simulation_record("sim-v2");
+            storage.begin_transaction().unwrap();
+            storage.save_simulation_v2(&record).unwrap();
+            storage
+                .append_simulation_event(&crate::SimulationEvent {
+                    id: "event-1".into(),
+                    simulation_id: record.id.clone(),
+                    status: "completed".into(),
+                    error_code: None,
+                    timestamp: record.requested_at.clone(),
+                })
+                .unwrap();
+            storage.rollback_transaction().unwrap();
+
+            assert!(storage.simulation_v2_by_id(&record.id).unwrap().is_none());
+            assert!(storage.simulation_events(&record.id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupt_simulation_json_hash_and_timestamp_fail_loudly() {
+        for (column, value) in [
+            ("canonical_input", "'not-json'"),
+            ("projection", "'not-json'"),
+            ("input_hash", "'abcd'"),
+            ("requested_at", "'not-a-time'"),
+            ("status", "'executed'"),
+        ] {
+            let mut storage = SqliteStorage::in_memory().unwrap();
+            storage
+                .save_simulation_v2(&simulation_record("sim-v2"))
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    &format!("UPDATE simulations SET {column} = {value} WHERE id = 'sim-v2'"),
+                    [],
+                )
+                .unwrap();
+            assert!(
+                storage.simulation_v2_by_id("sim-v2").is_err(),
+                "{column} decoded silently"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_input_survives_snapshot_retention() {
+        let mut storage = SqliteStorage::in_memory().unwrap();
+        let record = simulation_record("sim-v2");
+        storage.save_simulation_v2(&record).unwrap();
+        let old = snapshot_at(
+            "c1",
+            ChannelStatus::Active,
+            Utc::now() - chrono::Duration::days(60),
+        );
+        storage.save_channel_snapshot(&old).unwrap();
+        storage
+            .prune_channel_snapshots(&crate::RetentionPolicy::default(), Utc::now())
+            .unwrap();
+
+        assert!(storage
+            .recent_channel_snapshots("c1", 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .simulation_v2_by_id("sim-v2")
+                .unwrap()
+                .unwrap()
+                .canonical_input,
+            record.canonical_input
+        );
     }
 
     #[test]
@@ -1496,6 +2129,7 @@ mod tests {
 
     fn snapshot_at(id: &str, status: ChannelStatus, ts: DateTime<Utc>) -> ChannelSnapshot {
         ChannelSnapshot {
+            node_id: Some("local-node".into()),
             channel_id: id.to_string(),
             local_ratio: 0.5,
             local_balance_msat: 500_000,
@@ -1765,6 +2399,7 @@ mod tests {
         let mut s = SqliteStorage::in_memory().unwrap();
         let ts = Utc::now();
         let snap = ChannelSnapshot {
+            node_id: Some("local-node".into()),
             channel_id: "c1".into(),
             local_ratio: 0.42,
             local_balance_msat: 420_000,
@@ -1791,6 +2426,51 @@ mod tests {
         assert_eq!(got[0].status, ChannelStatus::Active);
         assert_eq!(got[1].local_ratio, 0.42);
         assert_eq!(s.recent_channel_snapshots("other", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn same_channel_snapshot_is_isolated_by_node() {
+        let timestamp = Utc::now();
+        for mut storage in lifecycle_backends() {
+            let first = ChannelSnapshot {
+                node_id: Some("node-a".into()),
+                channel_id: "c1".into(),
+                local_ratio: 0.2,
+                local_balance_msat: 200_000,
+                remote_balance_msat: 800_000,
+                capacity_msat: 1_000_000,
+                status: ChannelStatus::Active,
+                ts: timestamp,
+                spendable_outbound_msat: 190_000,
+                spendable_inbound_msat: 790_000,
+            };
+            let second = ChannelSnapshot {
+                node_id: Some("node-b".into()),
+                local_ratio: 0.8,
+                local_balance_msat: 800_000,
+                remote_balance_msat: 200_000,
+                spendable_outbound_msat: 790_000,
+                spendable_inbound_msat: 190_000,
+                ..first.clone()
+            };
+            storage.save_channel_snapshot(&first).unwrap();
+            storage.save_channel_snapshot(&second).unwrap();
+
+            assert_eq!(
+                storage
+                    .recent_channel_snapshots_for_node("node-a", "c1", 1)
+                    .unwrap()[0]
+                    .local_ratio,
+                0.2
+            );
+            assert_eq!(
+                storage
+                    .recent_channel_snapshots_for_node("node-b", "c1", 1)
+                    .unwrap()[0]
+                    .local_ratio,
+                0.8
+            );
+        }
     }
 
     #[test]

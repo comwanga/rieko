@@ -94,6 +94,7 @@ export interface Recommendation {
 }
 
 export interface ChannelSnapshot {
+  node_id: string | null;
   channel_id: string;
   local_ratio: number;
   local_balance_msat: number;
@@ -108,15 +109,20 @@ export interface Simulation {
   action_id: string;
   finding_id: string;
   action_type: string;
-  projection: {
-    local_ratio_before: number;
-    local_ratio_after: number;
-    local_balance_msat_after: number;
-    remote_balance_msat_after: number;
-    delta_msat: number;
-    clears_finding: boolean;
-    summary: string;
-  };
+  status: "requested" | "completed" | "unsupported" | "invalid_input" | "stale" | "failed";
+  model_id: string;
+  model_version: string;
+  input_hash: string;
+  confidence: "high" | "medium" | "low" | "unknown";
+  assumptions: { code: string; description: string; severity: "info" | "warning" | "critical" }[];
+  warnings: { code: string; description: string; severity: "info" | "warning" | "critical" }[];
+  explanation: string;
+  canonical_input: unknown;
+  projection: unknown;
+  source_observed_at: string | null;
+  requested_at: string;
+  completed_at: string | null;
+  error_code: string | null;
   created_at: string;
 }
 

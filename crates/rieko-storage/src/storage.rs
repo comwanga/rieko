@@ -26,8 +26,24 @@ pub struct SimulationRecord {
     pub assumptions: serde_json::Value,
     pub warnings: serde_json::Value,
     pub explanation: String,
+    /// Canonical, replayable input. Legacy rows use JSON null because their
+    /// source state cannot be reconstructed truthfully.
+    pub canonical_input: serde_json::Value,
     pub projection: serde_json::Value,
+    pub source_observed_at: Option<String>,
+    pub requested_at: String,
+    pub completed_at: Option<String>,
+    pub error_code: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationEvent {
+    pub id: String,
+    pub simulation_id: String,
+    pub status: String,
+    pub error_code: Option<String>,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +90,7 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     fn resolve_findings_for_scope(&mut self, scope: &FindingCycleScope)
         -> Result<(), StorageError>;
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError>;
+    fn finding_by_id(&mut self, finding_id: &str) -> Result<Option<Finding>, StorageError>;
     fn latest_findings_by_lifecycle(
         &mut self,
         limit: u32,
@@ -113,6 +130,12 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError>;
+    fn recent_channel_snapshots_for_node(
+        &mut self,
+        node_id: &str,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError>;
     /// Newest-first snapshots across all channels (for the UI channel list).
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError>;
 
@@ -130,6 +153,19 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         &mut self,
         action_id: &str,
     ) -> Result<Vec<SimulationRecord>, StorageError>;
+    fn simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError>;
+    fn simulation_v2_by_input_hash(
+        &mut self,
+        input_hash: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError>;
+    fn append_simulation_event(&mut self, event: &SimulationEvent) -> Result<(), StorageError>;
+    fn simulation_events(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Vec<SimulationEvent>, StorageError>;
 
     /// Apply the retention policy to `channel_snapshots`, transactionally and in
     /// bounded chunks. Only snapshots are ever removed — findings and
@@ -148,7 +184,8 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         Ok(StorageCounts {
             findings: self.latest_findings(crate::COUNT_CAP)?.len(),
             recommendations: self.latest_recommendations(crate::COUNT_CAP)?.len(),
-            simulations: self.recent_simulations(crate::COUNT_CAP)?.len(),
+            simulations: self.recent_simulations(crate::COUNT_CAP)?.len()
+                + self.recent_simulations_v2(crate::COUNT_CAP)?.len(),
             audit: self.recent_audit(crate::COUNT_CAP)?.len(),
             channel_snapshots: self.recent_snapshots_all(crate::COUNT_CAP)?.len(),
         })
@@ -174,6 +211,7 @@ pub struct MemoryStorage {
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
     simulation_records: Vec<SimulationRecord>,
+    simulation_events: Vec<SimulationEvent>,
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
     transaction_snapshot: Option<MemoryStorageState>,
@@ -187,6 +225,7 @@ struct MemoryStorageState {
     channel_snapshots: Vec<ChannelSnapshot>,
     simulations: Vec<Simulation>,
     simulation_records: Vec<SimulationRecord>,
+    simulation_events: Vec<SimulationEvent>,
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
 }
@@ -227,6 +266,7 @@ impl Storage for MemoryStorage {
             channel_snapshots: self.channel_snapshots.clone(),
             simulations: self.simulations.clone(),
             simulation_records: self.simulation_records.clone(),
+            simulation_events: self.simulation_events.clone(),
             alert_state: self.alert_state.clone(),
             operational_state: self.operational_state.clone(),
         });
@@ -253,6 +293,7 @@ impl Storage for MemoryStorage {
         self.channel_snapshots = snapshot.channel_snapshots;
         self.simulations = snapshot.simulations;
         self.simulation_records = snapshot.simulation_records;
+        self.simulation_events = snapshot.simulation_events;
         self.alert_state = snapshot.alert_state;
         self.operational_state = snapshot.operational_state;
         Ok(())
@@ -319,6 +360,14 @@ impl Storage for MemoryStorage {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    fn finding_by_id(&mut self, finding_id: &str) -> Result<Option<Finding>, StorageError> {
+        Ok(self
+            .findings
+            .iter()
+            .find(|finding| finding.id == finding_id)
+            .cloned())
     }
 
     fn latest_findings_by_lifecycle(
@@ -453,6 +502,23 @@ impl Storage for MemoryStorage {
             .collect())
     }
 
+    fn recent_channel_snapshots_for_node(
+        &mut self,
+        node_id: &str,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        Ok(self
+            .channel_snapshots
+            .iter()
+            .rev()
+            .filter(|snapshot| snapshot.node_id.as_deref() == Some(node_id))
+            .filter(|snapshot| snapshot.channel_id == channel_id)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
         Ok(self
             .channel_snapshots
@@ -473,10 +539,11 @@ impl Storage for MemoryStorage {
         // preserves. Rows are never replaced by finds; this touches only the
         // snapshot buffer, never findings/recommendations (RIEKO-AUDIT-016).
         use std::collections::BTreeMap;
-        let mut by_channel: BTreeMap<String, Vec<&ChannelSnapshot>> = BTreeMap::new();
+        let mut by_channel: BTreeMap<(Option<String>, String), Vec<&ChannelSnapshot>> =
+            BTreeMap::new();
         for snap in &self.channel_snapshots {
             by_channel
-                .entry(snap.channel_id.clone())
+                .entry((snap.node_id.clone(), snap.channel_id.clone()))
                 .or_default()
                 .push(snap);
         }
@@ -541,11 +608,28 @@ impl Storage for MemoryStorage {
     }
 
     fn save_simulation_v2(&mut self, rec: &SimulationRecord) -> Result<(), StorageError> {
-        if let Some(existing) = self.simulation_records.iter_mut().find(|s| s.id == rec.id) {
-            *existing = rec.clone();
-        } else {
-            self.simulation_records.push(rec.clone());
+        if let Some(existing) = self.simulation_records.iter().find(|s| s.id == rec.id) {
+            return if existing == rec {
+                Ok(())
+            } else {
+                Err(StorageError::Backend(format!(
+                    "simulation {} is immutable",
+                    rec.id
+                )))
+            };
         }
+        if !rec.input_hash.is_empty()
+            && !rec.projection.is_null()
+            && self.simulation_records.iter().any(|existing| {
+                existing.input_hash == rec.input_hash && !existing.projection.is_null()
+            })
+        {
+            return Err(StorageError::Backend(format!(
+                "simulation input {} already exists",
+                rec.input_hash
+            )));
+        }
+        self.simulation_records.push(rec.clone());
         Ok(())
     }
 
@@ -568,6 +652,56 @@ impl Storage for MemoryStorage {
             .iter()
             .filter(|s| s.action_id == action_id)
             .rev()
+            .cloned()
+            .collect())
+    }
+
+    fn simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
+            .iter()
+            .find(|record| record.id == simulation_id)
+            .cloned())
+    }
+
+    fn simulation_v2_by_input_hash(
+        &mut self,
+        input_hash: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
+            .iter()
+            .filter(|record| !input_hash.is_empty() && record.input_hash == input_hash)
+            .max_by_key(|record| (!record.projection.is_null(), record.created_at.as_str()))
+            .cloned())
+    }
+
+    fn append_simulation_event(&mut self, event: &SimulationEvent) -> Result<(), StorageError> {
+        if self
+            .simulation_events
+            .iter()
+            .any(|existing| existing.id == event.id)
+        {
+            return Err(StorageError::Backend(format!(
+                "duplicate simulation event {}",
+                event.id
+            )));
+        }
+        self.simulation_events.push(event.clone());
+        Ok(())
+    }
+
+    fn simulation_events(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Vec<SimulationEvent>, StorageError> {
+        Ok(self
+            .simulation_events
+            .iter()
+            .filter(|event| event.simulation_id == simulation_id)
             .cloned()
             .collect())
     }

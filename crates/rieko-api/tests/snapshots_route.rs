@@ -16,6 +16,7 @@ use tower::ServiceExt;
 async fn snapshots_path_param_route_reachable() {
     let mut mem = MemoryStorage::new();
     let snap = ChannelSnapshot {
+        node_id: Some("local-node".into()),
         channel_id: "abc123x0".to_string(),
         local_ratio: 0.42,
         local_balance_msat: 420_000,
@@ -43,6 +44,7 @@ async fn snapshots_path_param_route_reachable() {
     assert_eq!(resp.status(), StatusCode::OK, "status route should work");
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/snapshots/channel/abc123x0")
@@ -69,39 +71,57 @@ async fn snapshots_path_param_route_reachable() {
 #[cfg(feature = "simulate")]
 #[tokio::test]
 async fn simulations_route_returns_persisted_sims() {
-    use rieko_findings::{Action, ActionStage, ActionType, Simulation, SimulationProjection};
+    use rieko_findings::{ActionType, Simulation, SimulationProjection};
+    use rieko_storage::SimulationRecord;
 
     let mut mem = MemoryStorage::new();
-    let action = Action::new(
-        ActionType::RebalanceChannel,
-        ActionStage::Recommended,
-        Some("c1".into()),
-        serde_json::json!({ "desired_ratio": 0.5 }),
-        "rebalance",
-    );
-    let sim = Simulation {
+    let now = Utc::now().to_rfc3339();
+    let sim = SimulationRecord {
         id: "sim1".into(),
-        action_id: action.id.clone(),
+        action_id: "action1".into(),
         finding_id: "f1".into(),
+        action_type: "rebalance_channel".into(),
+        status: "completed".into(),
+        model_id: "legacy".into(),
+        model_version: "0".into(),
+        input_hash: String::new(),
+        confidence: "unknown".into(),
+        assumptions: serde_json::json!([]),
+        warnings: serde_json::json!([]),
+        explanation: String::new(),
+        canonical_input: serde_json::Value::Null,
+        projection: serde_json::json!({"clears_finding": true}),
+        source_observed_at: Some("2020-01-01T00:00:00Z".into()),
+        requested_at: now.clone(),
+        completed_at: Some(now.clone()),
+        error_code: None,
+        created_at: now,
+    };
+    mem.save_simulation_v2(&sim).unwrap();
+    mem.save_simulation(&Simulation {
+        id: "legacy-sim".into(),
+        action_id: "legacy-action".into(),
+        finding_id: "legacy-finding".into(),
         action_type: ActionType::RebalanceChannel,
         projection: SimulationProjection {
-            local_ratio_before: 0.1,
-            local_ratio_after: 0.5,
-            local_balance_msat_after: 50_000,
-            remote_balance_msat_after: 50_000,
-            delta_msat: 40_000,
-            clears_finding: true,
-            summary: "would clear the finding".into(),
+            local_ratio_before: 0.2,
+            local_ratio_after: 0.3,
+            local_balance_msat_after: 300,
+            remote_balance_msat_after: 700,
+            delta_msat: 100,
+            clears_finding: false,
+            summary: "legacy projection".into(),
         },
         created_at: Utc::now(),
-    };
-    mem.save_simulation(&sim).unwrap();
+    })
+    .unwrap();
 
     let app = RiekoApi::new(Box::new(mem)).unwrap().router();
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri("/simulations")
+                .uri("/simulations/v2")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -114,6 +134,32 @@ async fn simulations_route_returns_persisted_sims() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["action_id"], sim.action_id);
     assert!(arr[0]["projection"]["clears_finding"].as_bool().unwrap());
+    assert_eq!(arr[0]["status"], "stale");
+
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/simulations/sim1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+
+    let legacy = app
+        .oneshot(
+            Request::builder()
+                .uri("/simulations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(legacy.into_body(), 4096).await.unwrap();
+    let records: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(records[0]["id"], "legacy-sim");
 }
 
 #[cfg(not(feature = "simulate"))]
@@ -221,6 +267,7 @@ async fn status_reports_operational_counts() {
     .unwrap();
 
     mem.save_channel_snapshot(&ChannelSnapshot {
+        node_id: Some("local-node".into()),
         channel_id: "abc123x0".into(),
         local_ratio: 0.5,
         local_balance_msat: 500_000,

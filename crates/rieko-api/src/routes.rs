@@ -264,14 +264,14 @@ pub async fn recent_simulations(
         s.recent_simulations(limit(&q)).map_err(|e| e.to_string())
     })
     .await?;
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(|s| serde_json::to_value(&s).unwrap_or(Value::Null))
-        .collect();
-    Ok(Json(out))
+    Ok(Json(
+        rows.into_iter()
+            .map(|simulation| serde_json::to_value(simulation).unwrap_or(Value::Null))
+            .collect(),
+    ))
 }
 
-/// v2 simulation listing (ADR-0005). Returns SimulationRecords with full metadata.
+/// V2 simulation listing (ADR-0005). Returns replayable simulation records.
 #[cfg(feature = "simulate")]
 pub async fn recent_simulations_v2(
     State(api): State<RiekoApi>,
@@ -282,10 +282,7 @@ pub async fn recent_simulations_v2(
             .map_err(|e| e.to_string())
     })
     .await?;
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
-        .collect();
+    let out: Vec<Value> = rows.into_iter().map(simulation_value).collect();
     Ok(Json(out))
 }
 
@@ -295,17 +292,34 @@ pub async fn simulation_v2_by_id(
     State(api): State<RiekoApi>,
     Path(simulation_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
-        s.recent_simulations_v2(1000).map_err(|e| e.to_string())
+    let record = block_read(api.state.storage.clone(), move |s| {
+        s.simulation_v2_by_id(&simulation_id)
+            .map_err(|e| e.to_string())
     })
     .await?;
-    let rec = rows
-        .into_iter()
-        .find(|r| r.id == simulation_id)
-        .ok_or((StatusCode::NOT_FOUND, "simulation not found".into()))?;
-    let v = serde_json::to_value(&rec)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(v))
+    let rec = record.ok_or((StatusCode::NOT_FOUND, "simulation not found".into()))?;
+    Ok(Json(simulation_value(rec)))
+}
+
+#[cfg(feature = "simulate")]
+fn simulation_value(mut record: rieko_storage::SimulationRecord) -> Value {
+    if record.status == "completed"
+        && record
+            .source_observed_at
+            .as_deref()
+            .is_some_and(|timestamp| {
+                chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .map(|observed_at| {
+                        chrono::Utc::now()
+                            .signed_duration_since(observed_at.with_timezone(&chrono::Utc))
+                            > chrono::Duration::minutes(15)
+                    })
+                    .unwrap_or(false)
+            })
+    {
+        record.status = "stale".into();
+    }
+    serde_json::to_value(record).unwrap_or(Value::Null)
 }
 
 /// Newest-first liquidity history across all channels.
