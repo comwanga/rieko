@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
-use rieko_findings::{ActionStage, AuditEntry, Finding, Recommendation, Simulation};
+use rieko_findings::{
+    ActionStage, AuditEntry, Finding, FindingCycleScope, FindingLifecycle, FindingLifecycleFilter,
+    Recommendation, Simulation, FINDING_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,11 +69,26 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError>;
+    /// Resolve active findings in a detector/node scope before observations
+    /// from a complete cycle are upserted. Incomplete cycles must not resolve.
+    fn resolve_findings_for_scope(&mut self, scope: &FindingCycleScope)
+        -> Result<(), StorageError>;
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError>;
+    fn latest_findings_by_lifecycle(
+        &mut self,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
+    ) -> Result<Vec<Finding>, StorageError>;
     fn findings_for_channel(
         &mut self,
         channel_id: &str,
         limit: u32,
+    ) -> Result<Vec<Finding>, StorageError>;
+    fn findings_for_channel_by_lifecycle(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
     ) -> Result<Vec<Finding>, StorageError>;
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError>;
@@ -179,6 +197,24 @@ impl MemoryStorage {
     }
 }
 
+pub(crate) fn validate_finding_schema(schema_version: u8) -> Result<(), StorageError> {
+    if (1..=FINDING_SCHEMA_VERSION).contains(&schema_version) {
+        Ok(())
+    } else {
+        Err(StorageError::Corrupt(format!(
+            "unsupported finding schema version {schema_version}"
+        )))
+    }
+}
+
+fn lifecycle_matches(finding: &Finding, lifecycle: FindingLifecycleFilter) -> bool {
+    match lifecycle {
+        FindingLifecycleFilter::Active => finding.lifecycle == FindingLifecycle::Active,
+        FindingLifecycleFilter::Resolved => finding.lifecycle == FindingLifecycle::Resolved,
+        FindingLifecycleFilter::All => true,
+    }
+}
+
 impl Storage for MemoryStorage {
     fn begin_transaction(&mut self) -> Result<(), StorageError> {
         if self.transaction_snapshot.is_some() {
@@ -223,18 +259,54 @@ impl Storage for MemoryStorage {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
+        validate_finding_schema(finding.schema_version)?;
+        let first_seen_at = self
+            .findings
+            .iter()
+            .filter(|existing| {
+                existing.detector == finding.detector
+                    && existing.detector_version == finding.detector_version
+                    && existing.node == finding.node
+                    && existing.channel == finding.channel
+            })
+            .map(|existing| existing.first_seen_at)
+            .chain(std::iter::once(finding.first_seen_at))
+            .min()
+            .expect("finding first-seen candidates are non-empty");
         if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
-            // Idempotent replay: refresh explanation/last-seen, never
-            // duplicate. The first-seen timestamp is preserved across updates
-            // and the lifecycle follows the most recent observation.
-            if finding.explanation.is_some() {
+            existing.first_seen_at = existing.first_seen_at.min(first_seen_at);
+            if finding.last_seen_at >= existing.last_seen_at {
+                existing.severity = finding.severity;
+                existing.evidence = finding.evidence.clone();
+                existing.provenance = finding.provenance.clone();
                 existing.explanation = finding.explanation.clone();
+                existing.schema_version = finding.schema_version;
+                existing.timestamp = finding.timestamp;
+                existing.last_seen_at = finding.last_seen_at;
+                existing.lifecycle = FindingLifecycle::Active;
             }
-            existing.timestamp = finding.timestamp;
-            existing.last_seen_at = finding.last_seen_at;
-            existing.lifecycle = finding.lifecycle;
         } else {
-            self.findings.push(finding.clone());
+            let mut finding = finding.clone();
+            finding.first_seen_at = first_seen_at;
+            finding.lifecycle = FindingLifecycle::Active;
+            self.findings.push(finding);
+        }
+        Ok(())
+    }
+
+    fn resolve_findings_for_scope(
+        &mut self,
+        scope: &FindingCycleScope,
+    ) -> Result<(), StorageError> {
+        if scope.complete {
+            for finding in &mut self.findings {
+                if finding.detector == scope.detector
+                    && finding.node == scope.node
+                    && finding.lifecycle == FindingLifecycle::Active
+                {
+                    finding.lifecycle = FindingLifecycle::Resolved;
+                }
+            }
         }
         Ok(())
     }
@@ -244,6 +316,21 @@ impl Storage for MemoryStorage {
             .findings
             .iter()
             .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn latest_findings_by_lifecycle(
+        &mut self,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
+    ) -> Result<Vec<Finding>, StorageError> {
+        Ok(self
+            .findings
+            .iter()
+            .rev()
+            .filter(|finding| lifecycle_matches(finding, lifecycle))
             .take(limit as usize)
             .cloned()
             .collect())
@@ -259,6 +346,23 @@ impl Storage for MemoryStorage {
             .iter()
             .rev()
             .filter(|f| f.channel.as_deref() == Some(channel_id))
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn findings_for_channel_by_lifecycle(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
+    ) -> Result<Vec<Finding>, StorageError> {
+        Ok(self
+            .findings
+            .iter()
+            .rev()
+            .filter(|finding| finding.channel.as_deref() == Some(channel_id))
+            .filter(|finding| lifecycle_matches(finding, lifecycle))
             .take(limit as usize)
             .cloned()
             .collect())

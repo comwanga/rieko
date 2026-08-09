@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rieko_domain::{ChannelSnapshot, NodeId};
-use rieko_findings::{AuditEntry, Finding, Recommendation};
+use rieko_findings::{
+    AuditEntry, Finding, FindingCycleScope, ObservationSource, ProducerRole, ProducerVersion,
+    Recommendation,
+};
 use rieko_graph::{GraphStore, GraphView, InMemoryGraph};
 use rieko_ingest_lnd::{LndChannelResponse, LndClient, Normalizer, ShortChanResolver};
 use rieko_llm::{ExplainRequest, LlmClient};
@@ -24,6 +27,35 @@ pub struct GraphSource {
 }
 
 impl GraphSource {
+    pub fn observation_source(&self) -> Result<ObservationSource> {
+        use sha2::{Digest, Sha256};
+
+        let redacted = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
+        if let Some(rest) = &self.lnd_rest {
+            return Ok(ObservationSource::Lnd {
+                redacted_endpoint: redacted(rest.trim_end_matches('/')),
+                configured_node: self.node.clone(),
+            });
+        }
+        if let Some(fixture) = &self.fixture {
+            let contents = std::fs::read(fixture).with_context(|| {
+                format!("reading fixture provenance from {}", fixture.display())
+            })?;
+            return Ok(ObservationSource::Fixture {
+                redacted_hash: format!("{:x}", Sha256::digest(contents)),
+            });
+        }
+        bail!("provide --fixture or --lnd-rest")
+    }
+
+    pub fn normalizer(&self) -> ProducerVersion {
+        ProducerVersion {
+            name: "rieko-ingest-lnd".into(),
+            version: rieko_ingest_lnd::VERSION.into(),
+            role: ProducerRole::Normalizer,
+        }
+    }
+
     pub fn build(&self) -> Result<InMemoryGraph> {
         let local = NodeId::new(self.node.clone());
         let mut graph = InMemoryGraph::new();
@@ -45,11 +77,10 @@ impl GraphSource {
             let raw = client
                 .raw_channels()
                 .context("fetching channels from LND")?;
+            let observed_at = chrono::Utc::now();
             let channels = raw
                 .iter()
-                .map(|c| {
-                    Normalizer::channel(c, &local, chrono::Utc::now()).map_err(anyhow::Error::from)
-                })
+                .map(|c| Normalizer::channel(c, &local, observed_at).map_err(anyhow::Error::from))
                 .collect::<Result<Vec<_>, _>>()
                 .context("normalizing channels from LND")?;
             graph
@@ -219,9 +250,10 @@ pub fn persist_and_recommend<S: Storage + rieko_status::OperationalStateStore>(
     llm: Option<&dyn LlmClient>,
     engine: &RecommendationEngine,
     node: &str,
+    scopes: &[FindingCycleScope],
     findings: &mut [Finding],
 ) -> Result<Vec<Recommendation>> {
-    persist_cycle(storage, llm, engine, node, &[], findings)
+    persist_cycle(storage, llm, engine, node, &[], scopes, findings)
 }
 
 pub fn persist_monitor_cycle<S: Storage + rieko_status::OperationalStateStore>(
@@ -230,9 +262,10 @@ pub fn persist_monitor_cycle<S: Storage + rieko_status::OperationalStateStore>(
     engine: &RecommendationEngine,
     node: &str,
     snapshots: &[ChannelSnapshot],
+    scopes: &[FindingCycleScope],
     findings: &mut [Finding],
 ) -> Result<Vec<Recommendation>> {
-    persist_cycle(storage, llm, engine, node, snapshots, findings)
+    persist_cycle(storage, llm, engine, node, snapshots, scopes, findings)
 }
 
 fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
@@ -241,6 +274,7 @@ fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
     engine: &RecommendationEngine,
     node: &str,
     snapshots: &[ChannelSnapshot],
+    scopes: &[FindingCycleScope],
     findings: &mut [Finding],
 ) -> Result<Vec<Recommendation>> {
     explain_findings(storage, llm, node, findings)?;
@@ -252,6 +286,9 @@ fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
     let result = (|| {
         for snapshot in snapshots {
             storage.save_channel_snapshot(snapshot)?;
+        }
+        for scope in scopes {
+            storage.resolve_findings_for_scope(scope)?;
         }
         let recommendations = persist_cycle_locked(storage, engine, findings)?;
         record_cycle_success(storage)?;
@@ -347,7 +384,13 @@ fn persist_cycle_locked<S: Storage>(
     for finding in findings {
         storage.save_finding(finding)?;
 
-        for rec in engine.recommend(finding).unwrap_or_default() {
+        let recommendations = engine.recommend(finding).with_context(|| {
+            format!(
+                "recommending for finding {} from detector {} version {}",
+                finding.id, finding.detector, finding.detector_version
+            )
+        })?;
+        for rec in recommendations {
             // Idempotency: a recommendation keyed by its deterministic action id
             // is persisted only once; replays must not duplicate it (D9, inv #6).
             let is_new = storage.recommendation_for_action(&rec.action.id)?.is_none();
@@ -430,7 +473,19 @@ mod tests {
         };
         let graph = source.build().expect("fixture should load");
 
-        let mut findings = detect(&graph);
+        let observation_source = source.observation_source().unwrap();
+        let normalizer = source.normalizer();
+        let context = rieko_detectors::DetectorContext {
+            history: None,
+            source: Some(&observation_source),
+            normalizer: Some(&normalizer),
+            node: Some("local-node"),
+        };
+        let cycle = LiquidityDetector::new("local-node")
+            .evaluate(&graph, &context)
+            .unwrap();
+        let scopes = vec![cycle.scope];
+        let mut findings = cycle.findings;
         // 3 imbalanced channels: one Critical (ratio 0.01), one outbound
         // Warning (0.08), one inbound Warning (0.95); two are Balanced.
         assert_eq!(findings.len(), 3, "findings: {findings:#?}");
@@ -444,11 +499,21 @@ mod tests {
             .count();
         assert_eq!(critical, 1);
         assert_eq!(warning, 2);
+        assert!(findings.iter().all(|finding| finding.provenance.is_some()));
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(!serialized.contains(&fixture_path().to_string_lossy().to_string()));
 
         let mut storage = MemoryStorage::new();
         let engine = rieko_recommendations::RecommendationEngine;
-        let recs = persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
-            .unwrap();
+        let recs = persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &scopes,
+            &mut findings,
+        )
+        .unwrap();
         // The engine may emit more than one recommendation per finding (e.g. a
         // warning channel gets both a fee review and a rebalance review), but
         // every finding must lead to at least one, and nothing may be dropped.
@@ -490,6 +555,30 @@ mod tests {
             storage.latest_recommendations(10).unwrap().len(),
             recs.len()
         );
+    }
+
+    #[test]
+    fn fixture_provenance_tracks_content_without_exposing_path() {
+        use std::io::Write;
+
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        fixture.write_all(b"first observation").unwrap();
+        let source = GraphSource {
+            fixture: Some(fixture.path().to_path_buf()),
+            lnd_rest: None,
+            tls_cert: None,
+            macaroon: None,
+            node: "local-node".into(),
+        };
+        let first = source.observation_source().unwrap();
+        std::fs::write(fixture.path(), b"second observation").unwrap();
+        let second = source.observation_source().unwrap();
+
+        assert_ne!(first, second);
+        for provenance in [first, second] {
+            let json = serde_json::to_string(&provenance).unwrap();
+            assert!(!json.contains(&fixture.path().to_string_lossy().to_string()));
+        }
     }
 
     #[test]
@@ -563,6 +652,7 @@ mod tests {
             Some(&SuccessfulLlm),
             &engine,
             "local-node",
+            &[],
             &mut findings,
         )
         .unwrap();
@@ -595,6 +685,7 @@ mod tests {
             Some(&FailingLlm),
             &engine,
             "local-node",
+            &[],
             &mut findings,
         )
         .unwrap();
@@ -625,6 +716,7 @@ mod tests {
             Some(&probe),
             &engine,
             "local-node",
+            &[],
             &mut findings,
         )
         .unwrap();
@@ -674,6 +766,7 @@ mod tests {
             &engine,
             "local-node",
             &snapshots,
+            &[],
             &mut findings,
         )
         .unwrap();
@@ -682,6 +775,106 @@ mod tests {
         assert!(!storage.latest_findings(10).unwrap().is_empty());
         assert!(!storage.latest_recommendations(10).unwrap().is_empty());
         assert!(!storage.recent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changing_measurements_update_and_resolve_one_logical_finding() {
+        let engine = RecommendationEngine;
+        let scope = FindingCycleScope {
+            detector: "channel_liquidity".into(),
+            node: Some("local-node".into()),
+            complete: true,
+        };
+        let mut storage = MemoryStorage::new();
+        let warning_graph = drained_graph(80_000, 920_000);
+        let mut warning = detect(&warning_graph);
+        persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            std::slice::from_ref(&scope),
+            &mut warning,
+        )
+        .unwrap();
+        let first = storage.latest_findings(10).unwrap().remove(0);
+
+        let critical_graph = drained_graph(20_000, 980_000);
+        let mut critical = detect(&critical_graph);
+        critical[0].timestamp = first.timestamp + chrono::Duration::seconds(1);
+        critical[0].first_seen_at = critical[0].timestamp;
+        critical[0].last_seen_at = critical[0].timestamp;
+        assert_eq!(critical[0].id, first.id);
+        persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            std::slice::from_ref(&scope),
+            &mut critical,
+        )
+        .unwrap();
+
+        let current = storage.latest_findings(10).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].severity, rieko_findings::Severity::Critical);
+        assert_eq!(current[0].first_seen_at, first.first_seen_at);
+        assert_eq!(storage.recent_audit(10).unwrap().len(), 1);
+
+        let mut recovered = Vec::new();
+        persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &[scope],
+            &mut recovered,
+        )
+        .unwrap();
+        assert_eq!(
+            storage.latest_findings(10).unwrap()[0].lifecycle,
+            rieko_findings::FindingLifecycle::Resolved
+        );
+    }
+
+    #[test]
+    fn malformed_finding_rolls_back_complete_monitor_cycle() {
+        let engine = RecommendationEngine;
+        let graph = drained_graph(20_000, 980_000);
+        let mut findings = detect(&graph);
+        findings[0]
+            .evidence
+            .retain(|evidence| evidence.key != "direction");
+        let snapshot = ChannelSnapshot::from_channel(graph.channels()[0], chrono::Utc::now());
+        let scope = FindingCycleScope {
+            detector: "channel_liquidity".into(),
+            node: Some("local-node".into()),
+            complete: true,
+        };
+        let mut storage = MemoryStorage::new();
+        record_cycle_attempt(&mut storage).unwrap();
+
+        let result = persist_monitor_cycle(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &[snapshot],
+            &[scope],
+            &mut findings,
+        );
+
+        assert!(result.is_err());
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+        assert!(storage.recent_snapshots_all(10).unwrap().is_empty());
+        assert!(storage.latest_recommendations(10).unwrap().is_empty());
+        assert!(storage.recent_audit(10).unwrap().is_empty());
+        assert!(storage
+            .read_operational_state()
+            .unwrap()
+            .unwrap()
+            .last_cycle_success
+            .is_none());
     }
 
     #[test]
@@ -722,8 +915,15 @@ mod tests {
         let run = |db_path: &std::path::Path| -> (usize, usize, usize) {
             let mut storage = SqliteStorage::open(db_path).unwrap();
             let mut findings = detect(&graph);
-            persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
-                .unwrap();
+            persist_and_recommend(
+                &mut storage,
+                None,
+                &engine,
+                "local-node",
+                &[],
+                &mut findings,
+            )
+            .unwrap();
             let n_f = storage.latest_findings(1000).unwrap().len();
             let n_r = storage.latest_recommendations(1000).unwrap().len();
             let n_a = storage.recent_audit(1000).unwrap().len();
@@ -747,9 +947,25 @@ mod tests {
         let graph = drained_graph(20_000, 980_000);
         let mut findings = detect(&graph);
         let mut storage = MemoryStorage::new();
-        persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings).unwrap();
+        persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &[],
+            &mut findings,
+        )
+        .unwrap();
         let n1 = storage.recent_audit(1000).unwrap().len();
-        persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings).unwrap();
+        persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &[],
+            &mut findings,
+        )
+        .unwrap();
         let n2 = storage.recent_audit(1000).unwrap().len();
         assert_eq!(
             n1, n2,
@@ -774,8 +990,15 @@ mod tests {
         let graph = drained_graph(20_000, 980_000);
         let mut findings = detect(&graph);
         let mut storage = MemoryStorage::new();
-        let recs = persist_and_recommend(&mut storage, None, &engine, "local-node", &mut findings)
-            .unwrap();
+        let recs = persist_and_recommend(
+            &mut storage,
+            None,
+            &engine,
+            "local-node",
+            &[],
+            &mut findings,
+        )
+        .unwrap();
         assert!(!recs.is_empty(), "expected at least one recommendation");
 
         // Simulate each recommended action exactly as the `simulate` command

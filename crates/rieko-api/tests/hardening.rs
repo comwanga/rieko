@@ -162,6 +162,7 @@ async fn list_endpoints_enforce_the_limit_clamp() {
             node: None,
             channel: Some("c1".into()),
             evidence: vec![Evidence::string("local_ratio", "0.5")],
+            provenance: None,
             explanation: None,
             timestamp: chrono::Utc::now(),
             first_seen_at: chrono::Utc::now(),
@@ -191,4 +192,60 @@ async fn list_endpoints_enforce_the_limit_clamp() {
         "the limit must be clamped to the 500-row ceiling for untrusted input"
     );
     assert!(arr.len() <= 500, "route must not exceed the bounded limit");
+}
+
+#[tokio::test]
+async fn findings_lifecycle_filter_defaults_active_and_validates_input() {
+    use rieko_findings::{
+        Evidence, Finding, FindingCycleScope, FindingLifecycle, FINDING_SCHEMA_VERSION,
+    };
+
+    let finding = |id: &str, detector: &str| Finding {
+        id: id.into(),
+        detector: detector.into(),
+        detector_version: "1".into(),
+        severity: rieko_findings::Severity::Warning,
+        schema_version: FINDING_SCHEMA_VERSION,
+        node: Some("local-node".into()),
+        channel: Some("c1".into()),
+        evidence: vec![Evidence::string("local_ratio", "0.5")],
+        provenance: None,
+        explanation: None,
+        timestamp: chrono::Utc::now(),
+        first_seen_at: chrono::Utc::now(),
+        last_seen_at: chrono::Utc::now(),
+        lifecycle: FindingLifecycle::Active,
+    };
+    let mut mem = MemoryStorage::new();
+    mem.save_finding(&finding("resolved", "old_detector"))
+        .unwrap();
+    mem.resolve_findings_for_scope(&FindingCycleScope {
+        detector: "old_detector".into(),
+        node: Some("local-node".into()),
+        complete: true,
+    })
+    .unwrap();
+    mem.save_finding(&finding("active", "current_detector"))
+        .unwrap();
+    let app = RiekoApi::new(Box::new(mem)).unwrap().router();
+
+    for (uri, expected) in [
+        ("/findings", vec!["active"]),
+        ("/findings?lifecycle=resolved", vec!["resolved"]),
+        ("/findings?lifecycle=all", vec!["active", "resolved"]),
+        ("/findings/channel/c1?lifecycle=resolved", vec!["resolved"]),
+    ] {
+        let response = get(&app, uri, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let findings: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<_> = findings
+            .iter()
+            .map(|finding| finding["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected, "unexpected lifecycle results for {uri}");
+    }
+
+    let response = get(&app, "/findings?lifecycle=unknown", None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

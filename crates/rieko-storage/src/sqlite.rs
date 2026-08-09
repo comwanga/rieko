@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
 use rieko_domain::ChannelSnapshot;
 use rieko_findings::{
-    ActionStage, AuditEntry, Finding, FindingLifecycle, Recommendation, Simulation,
-    FINDING_SCHEMA_VERSION,
+    ActionStage, AuditEntry, Finding, FindingCycleScope, FindingLifecycle, FindingLifecycleFilter,
+    FindingProvenance, Recommendation, Simulation,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -70,7 +70,13 @@ impl SqliteStorage {
         let severity = match severity {
             0 => Severity::Info,
             1 => Severity::Warning,
-            _ => Severity::Critical,
+            2 => Severity::Critical,
+            value => {
+                return Err(invalid_finding_column(
+                    2,
+                    format!("invalid severity {value}"),
+                ))
+            }
         };
         let evidence_json: String = row.get(5)?;
         // Strict decode: malformed persisted evidence is corrupt data, never a
@@ -98,10 +104,12 @@ impl SqliteStorage {
         let detector_version: String = row
             .get::<_, Option<String>>(8)?
             .unwrap_or_else(|| "1".to_string());
-        let _schema_version: u8 = row
-            .get::<_, Option<i64>>(9)?
-            .map(|v| v.clamp(0, u8::MAX as i64) as u8)
-            .unwrap_or(FINDING_SCHEMA_VERSION);
+        let schema_raw: i64 = row.get(9)?;
+        let schema_version = u8::try_from(schema_raw).map_err(|_| {
+            invalid_finding_column(9, format!("invalid schema version {schema_raw}"))
+        })?;
+        crate::storage::validate_finding_schema(schema_version)
+            .map_err(|e| invalid_finding_column(9, e.to_string()))?;
         let first_string: String = row.get(10)?;
         let first_seen_at = DateTime::parse_from_rfc3339(&first_string)
             .map(|d| d.with_timezone(&Utc))
@@ -124,18 +132,33 @@ impl SqliteStorage {
             })?;
         let lifecycle: String = row.get(12)?;
         let lifecycle = match lifecycle.as_str() {
+            "active" => FindingLifecycle::Active,
             "resolved" => FindingLifecycle::Resolved,
-            _ => FindingLifecycle::Active,
+            value => {
+                return Err(invalid_finding_column(
+                    12,
+                    format!("invalid lifecycle {value:?}"),
+                ))
+            }
         };
+        let provenance_json: Option<String> = row.get(13)?;
+        let provenance: Option<FindingProvenance> = provenance_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    invalid_finding_column(13, format!("invalid provenance {json:?}: {e}"))
+                })
+            })
+            .transpose()?;
         Ok(Finding {
             id: row.get(0)?,
             detector: row.get(1)?,
             detector_version,
-            schema_version: FINDING_SCHEMA_VERSION,
+            schema_version,
             severity,
             node: row.get::<_, Option<String>>(3)?,
             channel: row.get::<_, Option<String>>(4)?,
             evidence,
+            provenance,
             explanation: row.get::<_, Option<String>>(6)?,
             timestamp,
             first_seen_at,
@@ -202,20 +225,43 @@ impl Storage for SqliteStorage {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
+        crate::storage::validate_finding_schema(finding.schema_version)?;
         let severity = finding.severity as i64;
         let evidence = serde_json::to_string(&finding.evidence)
             .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
+        let provenance = finding
+            .provenance
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StorageError::Corrupt(format!("finding provenance: {e}")))?;
         self.conn.execute(
             "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
-                    evidence, explanation, ts, first_seen_at, last_seen_at, lifecycle)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
+                    lifecycle, schema_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     MIN(?11, COALESCE((
+                        SELECT MIN(first_seen_at) FROM findings
+                        WHERE detector = ?2 AND detector_version = ?3
+                          AND node_id IS ?5 AND channel_id IS ?6
+                     ), ?11)), ?12, 'active', ?13)
              ON CONFLICT(id) DO UPDATE SET
-                detector_version = excluded.detector_version,
-                explanation = COALESCE(excluded.explanation, findings.explanation),
-                first_seen_at = COALESCE(findings.first_seen_at, excluded.first_seen_at),
-                ts = excluded.ts,
-                last_seen_at = excluded.last_seen_at,
-                lifecycle = excluded.lifecycle",
+                first_seen_at = MIN(findings.first_seen_at, excluded.first_seen_at),
+                severity = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.severity ELSE findings.severity END,
+                evidence = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.evidence ELSE findings.evidence END,
+                provenance = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.provenance ELSE findings.provenance END,
+                explanation = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.explanation ELSE findings.explanation END,
+                schema_version = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.schema_version ELSE findings.schema_version END,
+                ts = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.ts ELSE findings.ts END,
+                last_seen_at = MAX(findings.last_seen_at, excluded.last_seen_at),
+                lifecycle = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN 'active' ELSE findings.lifecycle END",
             params![
                 finding.id,
                 finding.detector,
@@ -224,20 +270,36 @@ impl Storage for SqliteStorage {
                 finding.node,
                 finding.channel,
                 evidence,
+                provenance,
                 finding.explanation,
                 finding.timestamp.to_rfc3339(),
                 finding.first_seen_at.to_rfc3339(),
                 finding.last_seen_at.to_rfc3339(),
-                lifecycle_str(finding.lifecycle),
+                finding.schema_version,
             ],
         )?;
+        Ok(())
+    }
+
+    fn resolve_findings_for_scope(
+        &mut self,
+        scope: &FindingCycleScope,
+    ) -> Result<(), StorageError> {
+        if scope.complete {
+            self.conn.execute(
+                "UPDATE findings SET lifecycle = 'resolved'
+                 WHERE detector = ?1 AND node_id IS ?2 AND lifecycle = 'active'",
+                params![scope.detector, scope.node],
+            )?;
+        }
         Ok(())
     }
 
     fn latest_findings(&mut self, limit: u32) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
-                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                    provenance
              FROM findings ORDER BY ts DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_finding)?;
@@ -248,6 +310,33 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    fn latest_findings_by_lifecycle(
+        &mut self,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
+    ) -> Result<Vec<Finding>, StorageError> {
+        let sql = match lifecycle {
+            FindingLifecycleFilter::Active => {
+                "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                        detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                        provenance
+                 FROM findings WHERE lifecycle = 'active' ORDER BY ts DESC LIMIT ?"
+            }
+            FindingLifecycleFilter::Resolved => {
+                "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                        detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                        provenance
+                 FROM findings WHERE lifecycle = 'resolved' ORDER BY ts DESC LIMIT ?"
+            }
+            FindingLifecycleFilter::All => {
+                return self.latest_findings(limit);
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([limit], Self::row_to_finding)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn findings_for_channel(
         &mut self,
         channel_id: &str,
@@ -255,7 +344,8 @@ impl Storage for SqliteStorage {
     ) -> Result<Vec<Finding>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
-                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle
+                    detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                    provenance
              FROM findings WHERE channel_id = ? ORDER BY ts DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(rusqlite::params![channel_id, limit], Self::row_to_finding)?;
@@ -264,6 +354,36 @@ impl Storage for SqliteStorage {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn findings_for_channel_by_lifecycle(
+        &mut self,
+        channel_id: &str,
+        limit: u32,
+        lifecycle: FindingLifecycleFilter,
+    ) -> Result<Vec<Finding>, StorageError> {
+        let sql = match lifecycle {
+            FindingLifecycleFilter::Active => {
+                "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                        detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                        provenance
+                 FROM findings WHERE channel_id = ?1 AND lifecycle = 'active'
+                 ORDER BY ts DESC LIMIT ?2"
+            }
+            FindingLifecycleFilter::Resolved => {
+                "SELECT id, detector, severity, node_id, channel_id, evidence, explanation, ts,
+                        detector_version, schema_version, first_seen_at, last_seen_at, lifecycle,
+                        provenance
+                 FROM findings WHERE channel_id = ?1 AND lifecycle = 'resolved'
+                 ORDER BY ts DESC LIMIT ?2"
+            }
+            FindingLifecycleFilter::All => {
+                return self.findings_for_channel(channel_id, limit);
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![channel_id, limit], Self::row_to_finding)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError> {
@@ -1161,11 +1281,8 @@ fn status_str(s: rieko_alerts::DeliveryStatus) -> &'static str {
     }
 }
 
-fn lifecycle_str(s: FindingLifecycle) -> &'static str {
-    match s {
-        FindingLifecycle::Active => "active",
-        FindingLifecycle::Resolved => "resolved",
-    }
+fn invalid_finding_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, message.into())
 }
 
 #[cfg(test)]
@@ -1173,7 +1290,10 @@ mod tests {
     use super::*;
     use crate::MemoryStorage;
     use rieko_domain::ChannelStatus;
-    use rieko_findings::{Action, ActionStage, ActionType, Evidence, Rationale, Severity};
+    use rieko_findings::{
+        Action, ActionStage, ActionType, Evidence, FindingProvenance, ObservationReference,
+        ObservationSource, ProducerRole, ProducerVersion, Rationale, Severity,
+    };
 
     fn test_rec(finding_id: &str, action: Action) -> Recommendation {
         Recommendation {
@@ -1189,11 +1309,28 @@ mod tests {
             id: "f1".into(),
             detector: "channel_liquidity".into(),
             detector_version: "1".into(),
-            schema_version: FINDING_SCHEMA_VERSION,
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
             severity: Severity::Critical,
             node: Some("local-node".into()),
             channel: Some("c1".into()),
             evidence: vec![Evidence::number("local_ratio", 0.02)],
+            provenance: Some(FindingProvenance {
+                source: ObservationSource::Fixture {
+                    redacted_hash: "fixture-hash".into(),
+                },
+                producers: vec![ProducerVersion {
+                    name: "channel_liquidity".into(),
+                    version: "1".into(),
+                    role: ProducerRole::Detector,
+                }],
+                observation: ObservationReference::ChannelState {
+                    channel_id: "c1".into(),
+                    snapshot: rieko_findings::ChannelSnapshotReference {
+                        observed_at: now,
+                        state_digest: "state-hash".into(),
+                    },
+                },
+            }),
             explanation: None,
             timestamp: now,
             first_seen_at: now,
@@ -1205,7 +1342,8 @@ mod tests {
     #[test]
     fn roundtrips_findings_recommendations_audit() {
         let mut s = SqliteStorage::in_memory().unwrap();
-        s.save_finding(&sample_finding()).unwrap();
+        let finding = sample_finding();
+        s.save_finding(&finding).unwrap();
 
         let rec = test_rec(
             "f1",
@@ -1238,9 +1376,13 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::Critical);
         // Lifecycle metadata survives the roundtrip (WP2.3).
         assert_eq!(findings[0].detector_version, "1");
-        assert_eq!(findings[0].schema_version, FINDING_SCHEMA_VERSION);
+        assert_eq!(
+            findings[0].schema_version,
+            rieko_findings::FINDING_SCHEMA_VERSION
+        );
         assert_eq!(findings[0].lifecycle, FindingLifecycle::Active);
         assert_eq!(findings[0].first_seen_at, findings[0].last_seen_at);
+        assert_eq!(findings[0].provenance, finding.provenance);
 
         let recs = s.latest_recommendations(10).unwrap();
         assert_eq!(recs.len(), 1);
@@ -2011,17 +2153,238 @@ mod tests {
         let f = sample_finding();
         let evidence = f.evidence.clone();
         s.save_finding(&f).unwrap();
-        // Detector no longer observes the condition: mark resolved, keep the
-        // original evidence required by the model.
-        let mut resolved = f.clone();
-        resolved.lifecycle = FindingLifecycle::Resolved;
-        s.save_finding(&resolved).unwrap();
+        s.resolve_findings_for_scope(&FindingCycleScope {
+            detector: f.detector.clone(),
+            node: f.node.clone(),
+            complete: true,
+        })
+        .unwrap();
 
         let got = s.latest_findings(10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].lifecycle, FindingLifecycle::Resolved);
         assert_eq!(got[0].evidence, evidence, "evidence retained on resolve");
         assert_eq!(got[0].first_seen_at, f.first_seen_at);
+    }
+
+    fn lifecycle_backends() -> Vec<Box<dyn Storage>> {
+        vec![
+            Box::new(MemoryStorage::new()),
+            Box::new(SqliteStorage::in_memory().unwrap()),
+        ]
+    }
+
+    fn finding_by_id(storage: &mut dyn Storage, id: &str) -> Finding {
+        storage
+            .latest_findings(100)
+            .unwrap()
+            .into_iter()
+            .find(|finding| finding.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn stable_updates_ignore_older_replay_and_reactivate_recurrence() {
+        for mut storage in lifecycle_backends() {
+            let original = sample_finding();
+            storage.save_finding(&original).unwrap();
+            storage
+                .resolve_findings_for_scope(&FindingCycleScope {
+                    detector: original.detector.clone(),
+                    node: original.node.clone(),
+                    complete: true,
+                })
+                .unwrap();
+
+            let later = original.last_seen_at + chrono::Duration::minutes(1);
+            let mut recurrence = original.clone();
+            recurrence.severity = Severity::Warning;
+            recurrence.evidence = vec![Evidence::number("local_ratio", 0.15)];
+            recurrence.provenance = Some(FindingProvenance {
+                source: ObservationSource::Fixture {
+                    redacted_hash: "new-fixture-hash".into(),
+                },
+                producers: vec![ProducerVersion {
+                    name: "channel_liquidity".into(),
+                    version: "1".into(),
+                    role: ProducerRole::Detector,
+                }],
+                observation: ObservationReference::ChannelWindow {
+                    channel_id: "c1".into(),
+                    snapshots: Vec::new(),
+                },
+            });
+            recurrence.explanation = Some("new evidence".into());
+            recurrence.timestamp = later;
+            recurrence.last_seen_at = later;
+            recurrence.lifecycle = FindingLifecycle::Resolved;
+            storage.save_finding(&recurrence).unwrap();
+
+            let mut replay = original.clone();
+            replay.severity = Severity::Info;
+            replay.evidence = vec![Evidence::number("local_ratio", 0.99)];
+            replay.provenance = None;
+            replay.explanation = Some("stale".into());
+            replay.timestamp -= chrono::Duration::minutes(1);
+            replay.last_seen_at -= chrono::Duration::minutes(1);
+            replay.first_seen_at -= chrono::Duration::minutes(2);
+            storage.save_finding(&replay).unwrap();
+
+            let stored = finding_by_id(storage.as_mut(), &original.id);
+            assert_eq!(stored.lifecycle, FindingLifecycle::Active);
+            assert_eq!(stored.severity, Severity::Warning);
+            assert_eq!(stored.evidence, recurrence.evidence);
+            assert_eq!(stored.provenance, recurrence.provenance);
+            assert_eq!(stored.explanation, recurrence.explanation);
+            assert_eq!(stored.timestamp, recurrence.timestamp);
+            assert_eq!(stored.last_seen_at, recurrence.last_seen_at);
+            assert_eq!(stored.first_seen_at, replay.first_seen_at);
+        }
+    }
+
+    #[test]
+    fn reconciliation_is_complete_cycle_and_scope_isolated() {
+        for mut storage in lifecycle_backends() {
+            let target = sample_finding();
+            let mut other_node = target.clone();
+            other_node.id = "other-node".into();
+            other_node.node = Some("other".into());
+            let mut node_less = target.clone();
+            node_less.id = "node-less".into();
+            node_less.node = None;
+            let mut other_detector = target.clone();
+            other_detector.id = "other-detector".into();
+            other_detector.detector = "drift".into();
+            for finding in [&target, &other_node, &node_less, &other_detector] {
+                storage.save_finding(finding).unwrap();
+            }
+
+            let mut scope = FindingCycleScope {
+                detector: target.detector.clone(),
+                node: target.node.clone(),
+                complete: false,
+            };
+            storage.resolve_findings_for_scope(&scope).unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &target.id).lifecycle,
+                FindingLifecycle::Active
+            );
+
+            scope.complete = true;
+            storage.resolve_findings_for_scope(&scope).unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &target.id).lifecycle,
+                FindingLifecycle::Resolved
+            );
+            for id in ["other-node", "node-less", "other-detector"] {
+                assert_eq!(
+                    finding_by_id(storage.as_mut(), id).lifecycle,
+                    FindingLifecycle::Active
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_cycle_supersedes_prior_detector_version() {
+        for mut storage in lifecycle_backends() {
+            let old = sample_finding();
+            storage.save_finding(&old).unwrap();
+            storage
+                .resolve_findings_for_scope(&FindingCycleScope {
+                    detector: old.detector.clone(),
+                    node: old.node.clone(),
+                    complete: true,
+                })
+                .unwrap();
+            let mut new = old.clone();
+            new.id = "version-2".into();
+            new.detector_version = "2".into();
+            new.last_seen_at += chrono::Duration::minutes(1);
+            new.timestamp = new.last_seen_at;
+            storage.save_finding(&new).unwrap();
+
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &old.id).lifecycle,
+                FindingLifecycle::Resolved
+            );
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &new.id).lifecycle,
+                FindingLifecycle::Active
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_rolls_back_in_both_backends() {
+        for mut storage in lifecycle_backends() {
+            let finding = sample_finding();
+            storage.save_finding(&finding).unwrap();
+            storage.begin_transaction().unwrap();
+            storage
+                .resolve_findings_for_scope(&FindingCycleScope {
+                    detector: finding.detector.clone(),
+                    node: finding.node.clone(),
+                    complete: true,
+                })
+                .unwrap();
+            storage.rollback_transaction().unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &finding.id).lifecycle,
+                FindingLifecycle::Active
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_row_bridges_first_seen_without_fabricating_provenance() {
+        let mut storage = SqliteStorage::in_memory().unwrap();
+        let legacy_first = "2020-01-01T00:00:00+00:00";
+        storage
+            .conn
+            .execute(
+                "INSERT INTO findings
+                 (id, detector, detector_version, schema_version, severity, node_id, channel_id,
+                  evidence, provenance, explanation, ts, first_seen_at, last_seen_at, lifecycle)
+                 VALUES ('legacy-id', 'channel_liquidity', '1', 1, 1, 'local-node', 'c1',
+                         '[]', NULL, NULL, ?1, ?1, ?1, 'resolved')",
+                [legacy_first],
+            )
+            .unwrap();
+
+        let mut current = sample_finding();
+        current.id = "stable-v2-id".into();
+        storage.save_finding(&current).unwrap();
+        let legacy = finding_by_id(&mut storage, "legacy-id");
+        let bridged = finding_by_id(&mut storage, "stable-v2-id");
+        assert_eq!(legacy.provenance, None);
+        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(bridged.first_seen_at, legacy.first_seen_at);
+        assert_eq!(bridged.provenance, current.provenance);
+    }
+
+    #[test]
+    fn malformed_finding_enums_schema_and_provenance_fail_loudly() {
+        for (column, value) in [
+            ("severity", "99"),
+            ("lifecycle", "'unknown'"),
+            ("schema_version", "3"),
+            ("provenance", "'not-json'"),
+        ] {
+            let mut storage = SqliteStorage::in_memory().unwrap();
+            storage.save_finding(&sample_finding()).unwrap();
+            storage
+                .conn
+                .execute(
+                    &format!("UPDATE findings SET {column} = {value} WHERE id = 'f1'"),
+                    [],
+                )
+                .unwrap();
+            assert!(
+                storage.latest_findings(1).is_err(),
+                "{column} decoded silently"
+            );
+        }
     }
 
     #[test]

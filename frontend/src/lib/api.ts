@@ -43,12 +43,40 @@ export interface Status {
 export interface Finding {
   id: string;
   detector: string;
+  detector_version: string;
+  schema_version: number;
   severity: Severity;
   node: string | null;
   channel: string | null;
   evidence: { key: string; value: unknown }[];
+  provenance: FindingProvenance | null;
   explanation: string | null;
   timestamp: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  lifecycle: "active" | "resolved";
+}
+
+export interface FindingProvenance {
+  source:
+    | { kind: "fixture"; redacted_hash: string }
+    | { kind: "lnd"; redacted_endpoint: string; configured_node: string };
+  producers: {
+    name: string;
+    version: string;
+    role: "ingest" | "normalizer" | "detector";
+  }[];
+  observation:
+    | {
+        kind: "channel_state";
+        channel_id: string;
+        snapshot: { observed_at: string; state_digest: string };
+      }
+    | {
+        kind: "channel_window";
+        channel_id: string;
+        snapshots: { observed_at: string; state_digest: string }[];
+      };
 }
 
 export interface Recommendation {

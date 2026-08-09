@@ -1,9 +1,12 @@
 use chrono::Utc;
 use rieko_domain::NodeId;
-use rieko_findings::{finding_identity, Evidence, Finding, Severity};
+use rieko_findings::{
+    channel_snapshot_state_digest, finding_identity, ChannelSnapshotReference, Evidence, Finding,
+    FindingProvenance, ObservationReference, Severity,
+};
 use rieko_graph::GraphView;
 
-use crate::registry::{Detector, DetectorContext};
+use crate::registry::{provenance_producers, Detector, DetectorContext};
 
 /// Tunable thresholds for the liquidity-drift detector.
 #[derive(Debug, Clone, Copy)]
@@ -112,15 +115,12 @@ impl Detector for DriftDetector {
             ];
 
             let now = Utc::now();
-            let first_seen = snaps.last().map(|s| s.ts).unwrap_or(now);
             findings.push(Finding {
                 id: finding_identity(
                     self.id(),
                     self.version(),
-                    severity,
                     Some(self.local_node.as_ref()),
                     Some(channel.id.as_ref()),
-                    &evidence,
                 ),
                 detector: self.id().to_string(),
                 detector_version: self.version().to_string(),
@@ -129,15 +129,44 @@ impl Detector for DriftDetector {
                 node: Some(self.local_node.to_string()),
                 channel: Some(channel.id.to_string()),
                 evidence,
+                provenance: ctx.source.map(|source| FindingProvenance {
+                    source: source.clone(),
+                    producers: provenance_producers(ctx.normalizer, self),
+                    observation: ObservationReference::ChannelWindow {
+                        channel_id: channel.id.to_string(),
+                        snapshots: snaps
+                            .iter()
+                            .rev()
+                            .map(|snapshot| ChannelSnapshotReference {
+                                observed_at: snapshot.ts,
+                                state_digest: channel_snapshot_state_digest(snapshot),
+                            })
+                            .collect(),
+                    },
+                }),
                 explanation: None,
                 timestamp: now,
-                first_seen_at: first_seen,
+                first_seen_at: now,
                 last_seen_at: now,
                 lifecycle: rieko_findings::FindingLifecycle::Active,
             });
         }
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
         findings
+    }
+
+    fn is_complete(&self, view: &dyn GraphView, ctx: &DetectorContext) -> bool {
+        let Some(history) = ctx.history else {
+            return false;
+        };
+        view.channels().into_iter().all(|channel| {
+            !channel.status.is_open()
+                || (channel.liquidity.imbalance != rieko_domain::LiquidityImbalance::Unknown
+                    && history
+                        .recent_channel_snapshots(&channel.id, self.thresholds.window)
+                        .len()
+                        >= self.thresholds.min_history)
+        })
     }
 }
 
@@ -185,7 +214,12 @@ mod tests {
     }
 
     fn ctx<'a>(h: &'a InMemoryHistory) -> DetectorContext<'a> {
-        DetectorContext { history: Some(h) }
+        DetectorContext {
+            history: Some(h),
+            source: None,
+            normalizer: None,
+            node: None,
+        }
     }
 
     #[test]
@@ -194,6 +228,22 @@ mod tests {
         g.upsert_channel(channel("c1", 0.10)).unwrap();
         let d = DriftDetector::new("local-node");
         assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+    }
+
+    #[test]
+    fn missing_history_marks_detector_cycle_incomplete() {
+        let mut graph = InMemoryGraph::new();
+        graph.upsert_channel(channel("c1", 0.10)).unwrap();
+        let detector = DriftDetector::new("local-node");
+        let context = DetectorContext {
+            history: None,
+            source: None,
+            normalizer: None,
+            node: Some("local-node"),
+        };
+        let cycle = detector.evaluate(&graph, &context).unwrap();
+        assert!(!cycle.scope.complete);
+        assert!(cycle.findings.is_empty());
     }
 
     #[test]

@@ -178,6 +178,7 @@ async fn status_reports_operational_counts() {
         node: None,
         channel: Some("abc123x0".into()),
         evidence: vec![Evidence::string("local_ratio", "0.9")],
+        provenance: None,
         explanation: None,
         timestamp: Utc::now(),
         first_seen_at: Utc::now(),

@@ -1,14 +1,85 @@
 use rieko_findings::{
-    Action, ActionType, Actionability, Finding, Rationale, Recommendation, Severity,
+    Action, ActionType, Actionability, Finding, FindingLifecycle, Rationale, Recommendation,
+    Severity, FINDING_SCHEMA_VERSION,
 };
+use std::collections::HashSet;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum RecommendationEngineError {
-    #[error("cannot recommend for finding {0}: unsupported detector")]
-    UnsupportedDetector(String),
-    #[error("cannot recommend for finding {0}: no target channel")]
-    MissingChannel(String),
+    #[error("cannot recommend for finding {finding_id}: unsupported detector {detector}")]
+    UnsupportedDetector {
+        finding_id: String,
+        detector: String,
+    },
+    #[error(
+        "cannot recommend for finding {finding_id}: unsupported {detector} detector version {version}"
+    )]
+    UnsupportedDetectorVersion {
+        finding_id: String,
+        detector: String,
+        version: String,
+    },
+    #[error(
+        "cannot recommend for finding {finding_id}: unsupported finding schema version {version} (current {current})"
+    )]
+    UnsupportedSchemaVersion {
+        finding_id: String,
+        version: u8,
+        current: u8,
+    },
+    #[error("cannot recommend for finding {finding_id}: finding is not active")]
+    InactiveFinding { finding_id: String },
+    #[error("cannot recommend for finding {finding_id}: unsupported severity {severity:?}")]
+    UnsupportedSeverity {
+        finding_id: String,
+        severity: Severity,
+    },
+    #[error("cannot recommend for finding {finding_id}: no target channel")]
+    MissingChannel { finding_id: String },
+    #[error("cannot recommend for finding {finding_id}: target channel is empty")]
+    EmptyChannel { finding_id: String },
+    #[error("cannot recommend for finding {finding_id}: evidence key at index {index} is empty")]
+    EmptyEvidenceKey { finding_id: String, index: usize },
+    #[error("cannot recommend for finding {finding_id}: duplicate evidence key {key}")]
+    DuplicateEvidenceKey { finding_id: String, key: String },
+    #[error("cannot recommend for finding {finding_id}: missing evidence {key}")]
+    MissingEvidence {
+        finding_id: String,
+        key: &'static str,
+    },
+    #[error("cannot recommend for finding {finding_id}: evidence {key} must be {expected}")]
+    InvalidEvidence {
+        finding_id: String,
+        key: &'static str,
+        expected: &'static str,
+    },
+    #[error("cannot recommend for finding {finding_id}: unknown direction {direction}")]
+    UnknownDirection {
+        finding_id: String,
+        direction: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LiquidityDirection {
+    Outbound,
+    Inbound,
+}
+
+struct ChannelLiquidityInput {
+    channel: String,
+    direction: LiquidityDirection,
+    evidence_refs: Vec<String>,
+}
+
+struct LiquidityTrendInput {
+    channel: String,
+    start_ratio: f64,
+    current_ratio: f64,
+    decline: f64,
+    window: u64,
+    evidence_refs: Vec<String>,
 }
 
 /// Maps findings to concrete actions. v1: every action is created at
@@ -23,98 +94,55 @@ impl RecommendationEngine {
         finding: &Finding,
     ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
         match finding.detector.as_str() {
-            "channel_liquidity" => self.recommend_liquidity(finding),
-            "liquidity_trend" => self.recommend_liquidity_trend(finding),
-            other => Err(RecommendationEngineError::UnsupportedDetector(
-                other.to_string(),
-            )),
+            "channel_liquidity" => {
+                let input = ChannelLiquidityInput::parse(finding)?;
+                Ok(self.recommend_liquidity(finding, input))
+            }
+            "liquidity_trend" => {
+                let input = LiquidityTrendInput::parse(finding)?;
+                Ok(self.recommend_liquidity_trend(finding, input))
+            }
+            detector => Err(RecommendationEngineError::UnsupportedDetector {
+                finding_id: finding.id.clone(),
+                detector: detector.to_string(),
+            }),
         }
     }
 
     fn recommend_liquidity(
         &self,
         finding: &Finding,
-    ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
-        let channel = finding
-            .channel
-            .clone()
-            .ok_or_else(|| RecommendationEngineError::MissingChannel(finding.id.clone()))?;
-
-        let direction = finding
-            .evidence_value("direction")
-            .and_then(|v| v.as_str())
-            .unwrap_or("outbound");
-
-        // Evidence extracted from the finding, never invented. Only numbers
-        // presented are those already in the evidence.
-        let evidence_refs: Vec<String> = finding
-            .evidence
-            .iter()
-            .map(|e| format!("{}={}", e.key, e.value))
-            .collect();
-
-        let mut out = Vec::new();
-        match direction {
-            "outbound" => out.push(build_rebased_review(
+        input: ChannelLiquidityInput,
+    ) -> Vec<Recommendation> {
+        match input.direction {
+            LiquidityDirection::Outbound => vec![build_rebased_review(
                 finding,
-                channel.clone(),
+                input.channel,
                 "outbound",
-                &evidence_refs,
-            )),
-            "inbound" => {
-                out.push(build_fee_review(
-                    finding,
-                    &channel,
-                    "inbound",
-                    &evidence_refs,
-                ));
-                if finding.severity >= Severity::Warning {
-                    out.push(build_rebased_review(
-                        finding,
-                        channel,
-                        "inbound",
-                        &evidence_refs,
-                    ));
-                }
-            }
-            _ => {}
+                &input.evidence_refs,
+            )],
+            LiquidityDirection::Inbound => vec![
+                build_fee_review(finding, &input.channel, "inbound", &input.evidence_refs),
+                build_rebased_review(finding, input.channel, "inbound", &input.evidence_refs),
+            ],
         }
-        Ok(out)
     }
 
     fn recommend_liquidity_trend(
         &self,
         finding: &Finding,
-    ) -> Result<Vec<Recommendation>, RecommendationEngineError> {
-        let channel = finding
-            .channel
-            .clone()
-            .ok_or_else(|| RecommendationEngineError::MissingChannel(finding.id.clone()))?;
+        input: LiquidityTrendInput,
+    ) -> Vec<Recommendation> {
+        let LiquidityTrendInput {
+            channel,
+            start_ratio,
+            current_ratio,
+            decline,
+            window,
+            evidence_refs,
+        } = input;
 
-        let decline = finding
-            .evidence_value("decline")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let start_ratio = finding
-            .evidence_value("start_ratio")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let current_ratio = finding
-            .evidence_value("current_ratio")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let window = finding
-            .evidence_value("window")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-
-        let evidence_refs: Vec<String> = finding
-            .evidence
-            .iter()
-            .map(|e| format!("{}={}", e.key, e.value))
-            .collect();
-
-        Ok(vec![Recommendation {
+        vec![Recommendation {
             finding_id: finding.id.clone(),
             action: Action::for_recommendation(
                 &finding.id,
@@ -125,14 +153,14 @@ impl RecommendationEngine {
                     "decline": decline,
                     "start_ratio": start_ratio,
                     "current_ratio": current_ratio,
-                    "window": window as u64,
+                    "window": window,
                 }),
                 format!(
                     "Channel {channel} is trending toward outbound drain: local ratio declined \
                      from {:.4} to {:.4} over the last {} snapshots. \
                      Inspect recent forwarding activity to confirm whether the trend \
                      is expected.",
-                    start_ratio, current_ratio, window as u64,
+                    start_ratio, current_ratio, window,
                 ),
             ),
             rationale: Rationale {
@@ -159,13 +187,247 @@ impl RecommendationEngine {
                     format!(
                         "The window covers only the last {} snapshots; longer-term trends \
                              may look different.",
-                        window as u64
+                        window
                     ),
                 ],
                 actionability: Actionability::OperatorActionable,
             },
-        }])
+        }]
     }
+}
+
+impl ChannelLiquidityInput {
+    fn parse(finding: &Finding) -> Result<Self, RecommendationEngineError> {
+        let version = validate_common(finding)?;
+        let channel = channel(finding)?;
+        let direction = match required_text(finding, "direction")? {
+            "outbound" => LiquidityDirection::Outbound,
+            "inbound" => LiquidityDirection::Inbound,
+            direction => {
+                return Err(RecommendationEngineError::UnknownDirection {
+                    finding_id: finding.id.clone(),
+                    direction: direction.to_string(),
+                })
+            }
+        };
+
+        required_ratio(finding, "local_ratio")?;
+        required_nonnegative_number(finding, "local_balance_msat")?;
+        required_nonnegative_number(finding, "remote_balance_msat")?;
+        required_positive_number(finding, "capacity_msat")?;
+        required_nonempty_text(finding, "peer")?;
+        if version == 2 {
+            required_ratio(finding, "severity_threshold")?;
+        }
+
+        Ok(Self {
+            channel,
+            direction,
+            evidence_refs: evidence_refs(finding),
+        })
+    }
+}
+
+impl LiquidityTrendInput {
+    fn parse(finding: &Finding) -> Result<Self, RecommendationEngineError> {
+        validate_common(finding)?;
+        let channel = channel(finding)?;
+        let direction = required_text(finding, "direction")?;
+        if direction != "draining" {
+            return Err(RecommendationEngineError::UnknownDirection {
+                finding_id: finding.id.clone(),
+                direction: direction.to_string(),
+            });
+        }
+
+        let start_ratio = required_ratio(finding, "start_ratio")?;
+        let current_ratio = required_ratio(finding, "current_ratio")?;
+        let decline = required_ratio(finding, "decline")?;
+        required_ratio(finding, "min_in_window")?;
+        required_nonempty_text(finding, "peer")?;
+        let raw_window = required_number(finding, "window", "a positive integral number")?;
+        if raw_window <= 0.0 || raw_window.fract() != 0.0 || raw_window >= u64::MAX as f64 {
+            return Err(invalid_evidence(
+                finding,
+                "window",
+                "a positive integral number",
+            ));
+        }
+
+        Ok(Self {
+            channel,
+            start_ratio,
+            current_ratio,
+            decline,
+            window: raw_window as u64,
+            evidence_refs: evidence_refs(finding),
+        })
+    }
+}
+
+fn validate_common(finding: &Finding) -> Result<u8, RecommendationEngineError> {
+    let version = match finding.detector_version.as_str() {
+        "1" => 1,
+        "2" => 2,
+        _ => {
+            return Err(RecommendationEngineError::UnsupportedDetectorVersion {
+                finding_id: finding.id.clone(),
+                detector: finding.detector.clone(),
+                version: finding.detector_version.clone(),
+            })
+        }
+    };
+    if !(1..=FINDING_SCHEMA_VERSION).contains(&finding.schema_version) {
+        return Err(RecommendationEngineError::UnsupportedSchemaVersion {
+            finding_id: finding.id.clone(),
+            version: finding.schema_version,
+            current: FINDING_SCHEMA_VERSION,
+        });
+    }
+    if finding.lifecycle != FindingLifecycle::Active {
+        return Err(RecommendationEngineError::InactiveFinding {
+            finding_id: finding.id.clone(),
+        });
+    }
+    if !matches!(finding.severity, Severity::Warning | Severity::Critical) {
+        return Err(RecommendationEngineError::UnsupportedSeverity {
+            finding_id: finding.id.clone(),
+            severity: finding.severity,
+        });
+    }
+
+    let mut keys = HashSet::with_capacity(finding.evidence.len());
+    for (index, evidence) in finding.evidence.iter().enumerate() {
+        if evidence.key.trim().is_empty() {
+            return Err(RecommendationEngineError::EmptyEvidenceKey {
+                finding_id: finding.id.clone(),
+                index,
+            });
+        }
+        if !keys.insert(evidence.key.as_str()) {
+            return Err(RecommendationEngineError::DuplicateEvidenceKey {
+                finding_id: finding.id.clone(),
+                key: evidence.key.clone(),
+            });
+        }
+    }
+    Ok(version)
+}
+
+fn channel(finding: &Finding) -> Result<String, RecommendationEngineError> {
+    let channel =
+        finding
+            .channel
+            .as_ref()
+            .ok_or_else(|| RecommendationEngineError::MissingChannel {
+                finding_id: finding.id.clone(),
+            })?;
+    if channel.trim().is_empty() {
+        return Err(RecommendationEngineError::EmptyChannel {
+            finding_id: finding.id.clone(),
+        });
+    }
+    Ok(channel.clone())
+}
+
+fn required_value<'a>(
+    finding: &'a Finding,
+    key: &'static str,
+) -> Result<&'a serde_json::Value, RecommendationEngineError> {
+    finding
+        .evidence_value(key)
+        .ok_or_else(|| RecommendationEngineError::MissingEvidence {
+            finding_id: finding.id.clone(),
+            key,
+        })
+}
+
+fn required_text<'a>(
+    finding: &'a Finding,
+    key: &'static str,
+) -> Result<&'a str, RecommendationEngineError> {
+    required_value(finding, key)?
+        .as_str()
+        .ok_or_else(|| invalid_evidence(finding, key, "a string"))
+}
+
+fn required_nonempty_text<'a>(
+    finding: &'a Finding,
+    key: &'static str,
+) -> Result<&'a str, RecommendationEngineError> {
+    let value = required_text(finding, key)?;
+    if value.trim().is_empty() {
+        return Err(invalid_evidence(finding, key, "a non-empty string"));
+    }
+    Ok(value)
+}
+
+fn required_number(
+    finding: &Finding,
+    key: &'static str,
+    expected: &'static str,
+) -> Result<f64, RecommendationEngineError> {
+    let value = required_value(finding, key)?
+        .as_f64()
+        .ok_or_else(|| invalid_evidence(finding, key, expected))?;
+    if !value.is_finite() {
+        return Err(invalid_evidence(finding, key, expected));
+    }
+    Ok(value)
+}
+
+fn required_ratio(finding: &Finding, key: &'static str) -> Result<f64, RecommendationEngineError> {
+    let value = required_number(finding, key, "a finite number in 0..=1")?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(invalid_evidence(finding, key, "a finite number in 0..=1"));
+    }
+    Ok(value)
+}
+
+fn required_nonnegative_number(
+    finding: &Finding,
+    key: &'static str,
+) -> Result<f64, RecommendationEngineError> {
+    let value = required_number(finding, key, "a finite non-negative number")?;
+    if value < 0.0 {
+        return Err(invalid_evidence(
+            finding,
+            key,
+            "a finite non-negative number",
+        ));
+    }
+    Ok(value)
+}
+
+fn required_positive_number(
+    finding: &Finding,
+    key: &'static str,
+) -> Result<f64, RecommendationEngineError> {
+    let value = required_number(finding, key, "a finite positive number")?;
+    if value <= 0.0 {
+        return Err(invalid_evidence(finding, key, "a finite positive number"));
+    }
+    Ok(value)
+}
+
+fn invalid_evidence(
+    finding: &Finding,
+    key: &'static str,
+    expected: &'static str,
+) -> RecommendationEngineError {
+    RecommendationEngineError::InvalidEvidence {
+        finding_id: finding.id.clone(),
+        key,
+        expected,
+    }
+}
+
+fn evidence_refs(finding: &Finding) -> Vec<String> {
+    finding
+        .evidence
+        .iter()
+        .map(|e| format!("{}={}", e.key, e.value))
+        .collect()
 }
 
 /// A deliberately modest, evidence-backed rebalance review. It never names a
@@ -273,14 +535,55 @@ mod tests {
             evidence: vec![
                 Evidence::text("direction", direction),
                 Evidence::number("local_ratio", 0.1),
+                Evidence::number("local_balance_msat", 100_000.0),
+                Evidence::number("remote_balance_msat", 900_000.0),
                 Evidence::number("capacity_msat", 1_000_000.0),
+                Evidence::text("peer", "peer-1"),
             ],
+            provenance: None,
             explanation: None,
             timestamp: now,
             first_seen_at: now,
             last_seen_at: now,
             lifecycle: rieko_findings::FindingLifecycle::Active,
         }
+    }
+
+    fn trend_finding() -> Finding {
+        let now = chrono::Utc::now();
+        Finding {
+            id: "f2".into(),
+            detector: "liquidity_trend".into(),
+            detector_version: "2".into(),
+            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
+            severity: Severity::Warning,
+            node: Some("local-node".into()),
+            channel: Some("c2".into()),
+            evidence: vec![
+                Evidence::text("direction", "draining"),
+                Evidence::number("start_ratio", 0.35),
+                Evidence::number("current_ratio", 0.24),
+                Evidence::number("decline", 0.11),
+                Evidence::number("min_in_window", 0.24),
+                Evidence::number("window", 12.0),
+                Evidence::text("peer", "peer-1"),
+            ],
+            provenance: None,
+            explanation: None,
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: rieko_findings::FindingLifecycle::Active,
+        }
+    }
+
+    fn set_evidence(finding: &mut Finding, key: &str, value: serde_json::Value) {
+        finding
+            .evidence
+            .iter_mut()
+            .find(|e| e.key == key)
+            .unwrap()
+            .value = value;
     }
 
     #[test]
@@ -311,7 +614,228 @@ mod tests {
         let engine = RecommendationEngine;
         let mut f = finding("c1", "outbound", Severity::Warning);
         f.detector = "magic".into();
-        assert!(engine.recommend(&f).is_err());
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::UnsupportedDetector { detector, .. })
+                if detector == "magic"
+        ));
+    }
+
+    #[test]
+    fn all_supported_typed_paths_produce_actions() {
+        let engine = RecommendationEngine;
+        for version in ["1", "2"] {
+            for direction in ["outbound", "inbound"] {
+                for severity in [Severity::Warning, Severity::Critical] {
+                    let mut f = finding("c1", direction, severity);
+                    f.detector_version = version.into();
+                    if version == "2" {
+                        f.evidence
+                            .push(Evidence::number("severity_threshold", 0.05));
+                    }
+                    assert!(!engine.recommend(&f).unwrap().is_empty());
+                }
+            }
+
+            for severity in [Severity::Warning, Severity::Critical] {
+                let mut f = trend_finding();
+                f.detector_version = version.into();
+                f.severity = severity;
+                assert!(!engine.recommend(&f).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn v1_liquidity_evidence_remains_compatible() {
+        let f = finding("c1", "outbound", Severity::Warning);
+        assert_eq!(f.detector_version, "1");
+        assert!(f.evidence_value("severity_threshold").is_none());
+        assert_eq!(RecommendationEngine.recommend(&f).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v2_liquidity_requires_its_added_evidence() {
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        f.detector_version = "2".into();
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::MissingEvidence {
+                key: "severity_threshold",
+                ..
+            })
+        ));
+        f.evidence
+            .push(Evidence::number("severity_threshold", 0.05));
+        assert!(!RecommendationEngine.recommend(&f).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_versions_and_ineligible_findings_are_rejected() {
+        let engine = RecommendationEngine;
+        let base = finding("c1", "outbound", Severity::Warning);
+
+        let mut f = base.clone();
+        f.detector_version = "3".into();
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::UnsupportedDetectorVersion { .. })
+        ));
+
+        for schema_version in [0, rieko_findings::FINDING_SCHEMA_VERSION + 1] {
+            let mut f = base.clone();
+            f.schema_version = schema_version;
+            assert!(matches!(
+                engine.recommend(&f),
+                Err(RecommendationEngineError::UnsupportedSchemaVersion { .. })
+            ));
+        }
+
+        let mut f = base.clone();
+        f.lifecycle = rieko_findings::FindingLifecycle::Resolved;
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::InactiveFinding { .. })
+        ));
+
+        let mut f = base;
+        f.severity = Severity::Info;
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::UnsupportedSeverity { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_or_empty_channel_is_rejected() {
+        let engine = RecommendationEngine;
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        f.channel = None;
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::MissingChannel { .. })
+        ));
+
+        f.channel = Some("  ".into());
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::EmptyChannel { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_keys_must_be_nonempty_and_unique() {
+        let engine = RecommendationEngine;
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        f.evidence.push(Evidence::text(" ", "value"));
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::EmptyEvidenceKey { .. })
+        ));
+
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        f.evidence.push(Evidence::text("direction", "inbound"));
+        assert!(matches!(
+            engine.recommend(&f),
+            Err(RecommendationEngineError::DuplicateEvidenceKey { key, .. })
+                if key == "direction"
+        ));
+    }
+
+    #[test]
+    fn liquidity_required_evidence_is_fail_closed() {
+        let required = [
+            "direction",
+            "local_ratio",
+            "local_balance_msat",
+            "remote_balance_msat",
+            "capacity_msat",
+            "peer",
+        ];
+        for key in required {
+            let mut f = finding("c1", "outbound", Severity::Warning);
+            f.evidence.retain(|e| e.key != key);
+            assert!(matches!(
+                RecommendationEngine.recommend(&f),
+                Err(RecommendationEngineError::MissingEvidence { key: missing, .. })
+                    if missing == key
+            ));
+        }
+
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        set_evidence(&mut f, "local_ratio", serde_json::json!(1.01));
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::InvalidEvidence {
+                key: "local_ratio",
+                ..
+            })
+        ));
+
+        let mut f = finding("c1", "outbound", Severity::Warning);
+        set_evidence(&mut f, "capacity_msat", serde_json::json!(0));
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::InvalidEvidence {
+                key: "capacity_msat",
+                ..
+            })
+        ));
+
+        let f = finding("c1", "sideways", Severity::Warning);
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::UnknownDirection { .. })
+        ));
+    }
+
+    #[test]
+    fn trend_required_evidence_and_window_are_fail_closed() {
+        let required = [
+            "direction",
+            "start_ratio",
+            "current_ratio",
+            "decline",
+            "min_in_window",
+            "window",
+            "peer",
+        ];
+        for key in required {
+            let mut f = trend_finding();
+            f.evidence.retain(|e| e.key != key);
+            assert!(matches!(
+                RecommendationEngine.recommend(&f),
+                Err(RecommendationEngineError::MissingEvidence { key: missing, .. })
+                    if missing == key
+            ));
+        }
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut f = trend_finding();
+            set_evidence(&mut f, "window", invalid);
+            assert!(matches!(
+                RecommendationEngine.recommend(&f),
+                Err(RecommendationEngineError::InvalidEvidence { key: "window", .. })
+            ));
+        }
+
+        let mut f = trend_finding();
+        set_evidence(&mut f, "direction", serde_json::json!("growing"));
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::UnknownDirection { .. })
+        ));
+
+        let mut f = trend_finding();
+        set_evidence(&mut f, "decline", serde_json::json!("0.11"));
+        assert!(matches!(
+            RecommendationEngine.recommend(&f),
+            Err(RecommendationEngineError::InvalidEvidence { key: "decline", .. })
+        ));
     }
 
     // --- RIEKO-AUDIT-010 required tests ---
@@ -338,27 +862,32 @@ mod tests {
     #[test]
     fn no_unsupported_mutation_parameter_appears() {
         let engine = RecommendationEngine;
+        let mut all_recommendations = Vec::new();
         for direction in ["outbound", "inbound"] {
             for severity in [Severity::Warning, Severity::Critical] {
-                let recs = engine
-                    .recommend(&finding("c1", direction, severity))
-                    .unwrap();
-                for rec in recs {
-                    let params = &rec.action.params;
-                    for banned in [
-                        "desired_ratio",
-                        "fee_rate_ppm",
-                        "base_fee_msat",
-                        "cltv_delta",
-                        "method",
-                        "chan_point",
-                    ] {
-                        assert!(
-                            params.get(banned).is_none(),
-                            "banned mutation parameter {banned} in {params}"
-                        );
-                    }
-                }
+                all_recommendations.extend(
+                    engine
+                        .recommend(&finding("c1", direction, severity))
+                        .unwrap(),
+                );
+            }
+        }
+        all_recommendations.extend(engine.recommend(&trend_finding()).unwrap());
+
+        for rec in all_recommendations {
+            let params = &rec.action.params;
+            for banned in [
+                "desired_ratio",
+                "fee_rate_ppm",
+                "base_fee_msat",
+                "cltv_delta",
+                "method",
+                "chan_point",
+            ] {
+                assert!(
+                    params.get(banned).is_none(),
+                    "banned mutation parameter {banned} in {params}"
+                );
             }
         }
     }
@@ -433,29 +962,7 @@ mod tests {
 
     #[test]
     fn drift_trend_produces_modest_investigation_recommendation() {
-        let now = chrono::Utc::now();
-        let finding = Finding {
-            id: "f2".into(),
-            detector: "liquidity_trend".into(),
-            detector_version: "2".into(),
-            schema_version: rieko_findings::FINDING_SCHEMA_VERSION,
-            severity: Severity::Warning,
-            node: Some("local-node".into()),
-            channel: Some("c2".into()),
-            evidence: vec![
-                Evidence::text("direction", "draining"),
-                Evidence::number("start_ratio", 0.35),
-                Evidence::number("current_ratio", 0.24),
-                Evidence::number("decline", 0.11),
-                Evidence::number("window", 12.0),
-                Evidence::text("peer", "peer-1"),
-            ],
-            explanation: None,
-            timestamp: now,
-            first_seen_at: now,
-            last_seen_at: now,
-            lifecycle: rieko_findings::FindingLifecycle::Active,
-        };
+        let finding = trend_finding();
         let engine = RecommendationEngine;
         let recs = engine.recommend(&finding).unwrap();
         assert_eq!(recs.len(), 1);

@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -53,6 +53,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 8,
         sql: V8_SIMULATION_V2,
+    },
+    Migration {
+        version: 9,
+        sql: V9_FINDING_PROVENANCE,
     },
 ];
 
@@ -248,6 +252,14 @@ ALTER TABLE simulations ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE simulations ADD COLUMN explanation TEXT NOT NULL DEFAULT '';
 "#;
 
+/// v9: optional evidence provenance and the reconciliation lookup path. Legacy
+/// rows remain NULL because their origin cannot be reconstructed truthfully.
+const V9_FINDING_PROVENANCE: &str = r#"
+ALTER TABLE findings ADD COLUMN provenance TEXT;
+CREATE INDEX IF NOT EXISTS idx_findings_scope_lifecycle
+    ON findings (detector, node_id, lifecycle);
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -378,6 +390,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn v9_adds_nullable_provenance_and_scope_lifecycle_index() {
+        let mut conn = bare_conn();
+        conn.execute_batch(
+            "CREATE TABLE findings (
+                id TEXT PRIMARY KEY, detector TEXT NOT NULL, detector_version TEXT NOT NULL,
+                schema_version INTEGER NOT NULL, severity INTEGER NOT NULL, node_id TEXT,
+                channel_id TEXT, evidence TEXT NOT NULL, explanation TEXT, ts TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, lifecycle TEXT NOT NULL
+             );
+             INSERT INTO findings VALUES
+                ('legacy', 'detector', '1', 1, 0, NULL, NULL, '[]', NULL,
+                 '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z',
+                 '2020-01-01T00:00:00Z', 'active');
+             PRAGMA user_version = 8;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        let provenance: Option<String> = conn
+            .query_row(
+                "SELECT provenance FROM findings WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance, None, "legacy provenance must remain unknown");
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_findings_scope_lifecycle'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
     }
 
     #[test]

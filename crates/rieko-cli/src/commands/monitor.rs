@@ -166,6 +166,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         Box::new(LiquidityDetector::new(args.node.clone())),
         Box::new(DriftDetector::new(args.node.clone())),
     ];
+    let normalizer = source.normalizer();
 
     // Retention is operator-overridable and defaults to a documented upper
     // bound (RIEKO-AUDIT-016).
@@ -204,23 +205,31 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
         // Record this cycle's channel states, both in-memory (for detectors)
         // and durably (for the API and future trend queries).
-        let now = chrono::Utc::now();
         let channels = graph.channels();
         let snapshots: Vec<_> = channels
             .iter()
-            .map(|channel| rieko_domain::ChannelSnapshot::from_channel(channel, now))
+            .map(|channel| rieko_domain::ChannelSnapshot::from_channel(channel, channel.last_seen))
             .collect();
         for snapshot in &snapshots {
             history.push(snapshot.clone());
         }
 
+        let observation_source = source.observation_source()?;
         let ctx = DetectorContext {
             history: Some(&history),
+            source: Some(&observation_source),
+            normalizer: Some(&normalizer),
+            node: Some(&args.node),
         };
-        let mut findings: Vec<Finding> = Vec::new();
+        let mut cycles = Vec::new();
         for detector in &detectors {
-            findings.extend(detector.run(&graph, &ctx));
+            cycles.push(detector.evaluate(&graph, &ctx)?);
         }
+        let scopes: Vec<_> = cycles.iter().map(|cycle| cycle.scope.clone()).collect();
+        let mut findings: Vec<Finding> = cycles
+            .into_iter()
+            .flat_map(|cycle| cycle.findings)
+            .collect();
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
         let recommendations = persist_monitor_cycle(
@@ -229,6 +238,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             &engine,
             &args.node,
             &snapshots,
+            &scopes,
             &mut findings,
         )?;
 
