@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -65,6 +65,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 11,
         sql: V11_SNAPSHOT_IDENTITY,
+    },
+    Migration {
+        version: 12,
+        sql: V12_CONSECUTIVE_ABSENT,
     },
 ];
 
@@ -380,6 +384,10 @@ CREATE INDEX idx_snapshots_node_channel_ts
     ON channel_snapshots (node_id, channel_id, ts DESC);
 CREATE INDEX idx_snapshots_network_channel_ts
     ON channel_snapshots (network_id, node_id, channel_id, ts DESC);
+"#;
+
+const V12_CONSECUTIVE_ABSENT: &str = r#"
+ALTER TABLE findings ADD COLUMN consecutive_absent INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).

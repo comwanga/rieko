@@ -305,7 +305,7 @@ impl Storage for SqliteStorage {
         self.conn.execute(
             "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
                      evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
-                     lifecycle, schema_version)
+                     lifecycle, schema_version, consecutive_absent)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                       MIN(?11, COALESCE((
                          SELECT MIN(first_seen_at) FROM findings
@@ -313,7 +313,7 @@ impl Storage for SqliteStorage {
                            AND node_id IS ?5 AND channel_id IS ?6
                            AND json_extract(provenance, '$.network') IS
                                json_extract(?8, '$.network')
-                      ), ?11)), ?12, 'active', ?13)
+                      ), ?11)), ?12, 'active', ?13, 0)
               ON CONFLICT(id) DO UPDATE SET
                 first_seen_at = MIN(findings.first_seen_at, excluded.first_seen_at),
                 severity = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
@@ -330,7 +330,9 @@ impl Storage for SqliteStorage {
                     THEN excluded.ts ELSE findings.ts END,
                 last_seen_at = MAX(findings.last_seen_at, excluded.last_seen_at),
                 lifecycle = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN 'active' ELSE findings.lifecycle END",
+                    THEN 'active' ELSE findings.lifecycle END,
+                consecutive_absent = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN 0 ELSE findings.consecutive_absent END",
             params![
                 finding.id,
                 finding.detector,
@@ -355,11 +357,27 @@ impl Storage for SqliteStorage {
         scope: &FindingCycleScope,
     ) -> Result<(), StorageError> {
         if scope.complete {
+            // Hysteresis: only resolve findings that have been absent for at
+            // least 2 consecutive complete cycles. Findings absent for exactly
+            // 0–1 cycles get their counter incremented instead.
             self.conn.execute(
-                "UPDATE findings SET lifecycle = 'resolved'
+                "UPDATE findings SET lifecycle = 'resolved', consecutive_absent = 0
                  WHERE detector = ?1 AND node_id IS ?2
                    AND json_extract(provenance, '$.network') IS ?3
-                   AND lifecycle = 'active'",
+                   AND lifecycle = 'active'
+                   AND consecutive_absent >= 2",
+                params![
+                    scope.detector,
+                    scope.node,
+                    scope.network.map(|network| network.to_string())
+                ],
+            )?;
+            self.conn.execute(
+                "UPDATE findings SET consecutive_absent = consecutive_absent + 1
+                 WHERE detector = ?1 AND node_id IS ?2
+                   AND json_extract(provenance, '$.network') IS ?3
+                   AND lifecycle = 'active'
+                   AND consecutive_absent < 2",
                 params![
                     scope.detector,
                     scope.node,
@@ -1881,6 +1899,7 @@ mod tests {
                 network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
+                    configured_node: "node-1".into(),
                 },
                 producers: vec![ProducerVersion {
                     name: "channel_liquidity".into(),
@@ -3258,6 +3277,20 @@ mod tests {
             complete: true,
         })
         .unwrap();
+        s.resolve_findings_for_scope(&FindingCycleScope {
+            detector: f.detector.clone(),
+            network: f.provenance.as_ref().and_then(|p| p.network),
+            node: f.node.clone(),
+            complete: true,
+        })
+        .unwrap();
+        s.resolve_findings_for_scope(&FindingCycleScope {
+            detector: f.detector.clone(),
+            network: f.provenance.as_ref().and_then(|p| p.network),
+            node: f.node.clone(),
+            complete: true,
+        })
+        .unwrap();
 
         let got = s.latest_findings(10).unwrap();
         assert_eq!(got.len(), 1);
@@ -3304,6 +3337,7 @@ mod tests {
                 network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "new-fixture-hash".into(),
+                    configured_node: "node-1".into(),
                 },
                 producers: vec![ProducerVersion {
                     name: "channel_liquidity".into(),
@@ -3374,6 +3408,8 @@ mod tests {
 
             scope.complete = true;
             storage.resolve_findings_for_scope(&scope).unwrap();
+            storage.resolve_findings_for_scope(&scope).unwrap();
+            storage.resolve_findings_for_scope(&scope).unwrap();
             assert_eq!(
                 finding_by_id(storage.as_mut(), &target.id).lifecycle,
                 FindingLifecycle::Resolved
@@ -3402,14 +3438,16 @@ mod tests {
             storage.save_finding(&regtest).unwrap();
             storage.save_finding(&mainnet).unwrap();
 
-            storage
-                .resolve_findings_for_scope(&FindingCycleScope {
-                    detector: regtest.detector.clone(),
-                    network: Some(BitcoinNetwork::Regtest),
-                    node: regtest.node.clone(),
-                    complete: true,
-                })
-                .unwrap();
+            for _ in 0..3 {
+                storage
+                    .resolve_findings_for_scope(&FindingCycleScope {
+                        detector: regtest.detector.clone(),
+                        network: Some(BitcoinNetwork::Regtest),
+                        node: regtest.node.clone(),
+                        complete: true,
+                    })
+                    .unwrap();
+            }
             assert_eq!(
                 finding_by_id(storage.as_mut(), &regtest.id).lifecycle,
                 FindingLifecycle::Resolved
@@ -3426,14 +3464,16 @@ mod tests {
         for mut storage in lifecycle_backends() {
             let old = sample_finding();
             storage.save_finding(&old).unwrap();
-            storage
-                .resolve_findings_for_scope(&FindingCycleScope {
-                    detector: old.detector.clone(),
-                    network: old.provenance.as_ref().and_then(|p| p.network),
-                    node: old.node.clone(),
-                    complete: true,
-                })
-                .unwrap();
+            for _ in 0..3 {
+                storage
+                    .resolve_findings_for_scope(&FindingCycleScope {
+                        detector: old.detector.clone(),
+                        network: old.provenance.as_ref().and_then(|p| p.network),
+                        node: old.node.clone(),
+                        complete: true,
+                    })
+                    .unwrap();
+            }
             let mut new = old.clone();
             new.id = "version-2".into();
             new.detector_version = "2".into();

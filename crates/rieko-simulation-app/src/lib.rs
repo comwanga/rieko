@@ -993,6 +993,7 @@ mod tests {
             .unwrap();
         let source = ObservationSource::Fixture {
             redacted_hash: "fixture-hash".into(),
+            configured_node: "node-1".into(),
         };
         let detector = LiquidityDetector::new("local-node");
         let cycle = detector

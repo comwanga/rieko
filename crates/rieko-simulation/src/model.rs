@@ -706,6 +706,7 @@ mod tests {
                 network: Some(BitcoinNetwork::Regtest),
                 source: rieko_findings::ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
+                    configured_node: "node-1".into(),
                 },
                 producers: Vec::new(),
                 observation: rieko_findings::ObservationReference::ChannelState {
