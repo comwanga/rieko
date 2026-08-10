@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::sink::{Alert, AlertError, AlertSink};
-use crate::state::{AlertState, AlertStateStore, DeliveryStatus};
+use crate::state::{AlertState, AlertStateStore, DeliveryOutcome, DeliveryStatus};
 
 /// A sink wrapper that suppresses repeats of the same alert within a cooldown,
 /// with the cooldown and last-seen severity persisted across restarts.
@@ -67,7 +67,7 @@ impl<S> PersistentDedupingSink<S> {
 }
 
 impl<S: AlertSink> AlertSink for PersistentDedupingSink<S> {
-    fn send(&mut self, alert: &Alert) -> Result<(), AlertError> {
+    fn send(&mut self, alert: &Alert) -> Result<DeliveryOutcome, AlertError> {
         let key = self.key(alert);
         let now = (self.clock)();
         let stored = self.store.read(&key)?.unwrap_or(AlertState::never());
@@ -81,9 +81,6 @@ impl<S: AlertSink> AlertSink for PersistentDedupingSink<S> {
             .unwrap_or(false);
 
         if in_cooldown && !escalated {
-            // Suppressed inside the window; nothing is delivered and nothing
-            // changes. The persisted last_sent_at stays put, so the window is
-            // not extended by the suppressed attempt.
             self.store.write(
                 &key,
                 &AlertState {
@@ -91,20 +88,33 @@ impl<S: AlertSink> AlertSink for PersistentDedupingSink<S> {
                     ..stored
                 },
             )?;
-            return Ok(());
+            return Ok(DeliveryOutcome::Suppressed);
         }
 
-        self.inner.send(alert)?;
-        self.store.write(
-            &key,
-            &AlertState {
-                last_sent_at: Some(now),
-                last_severity: Some(alert.severity),
-                last_status: DeliveryStatus::Success,
-            },
-        )?;
-        self.sent_count += 1;
-        Ok(())
+        match self.inner.send(alert) {
+            Ok(inner_outcome) => {
+                self.store.write(
+                    &key,
+                    &AlertState {
+                        last_sent_at: Some(now),
+                        last_severity: Some(alert.severity),
+                        last_status: DeliveryStatus::Success,
+                    },
+                )?;
+                self.sent_count += 1;
+                Ok(inner_outcome)
+            }
+            Err(e) => {
+                self.store.write(
+                    &key,
+                    &AlertState {
+                        last_status: DeliveryStatus::Failed,
+                        ..stored
+                    },
+                )?;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -133,17 +143,17 @@ impl<S> DedupingSink<S> {
 }
 
 impl<S: AlertSink> AlertSink for DedupingSink<S> {
-    fn send(&mut self, alert: &Alert) -> Result<(), AlertError> {
+    fn send(&mut self, alert: &Alert) -> Result<DeliveryOutcome, AlertError> {
         if let Some(last) = self.last_sent.get(&alert.dedup_key) {
             if last.elapsed() < self.cooldown {
-                return Ok(());
+                return Ok(DeliveryOutcome::Suppressed);
             }
         }
         self.inner.send(alert)?;
         self.last_sent
             .insert(alert.dedup_key.clone(), Instant::now());
         self.sent_count += 1;
-        Ok(())
+        Ok(DeliveryOutcome::Delivered)
     }
 }
 
@@ -165,9 +175,9 @@ mod tests {
     }
 
     impl AlertSink for RecordingSink {
-        fn send(&mut self, alert: &Alert) -> Result<(), AlertError> {
+        fn send(&mut self, alert: &Alert) -> Result<DeliveryOutcome, AlertError> {
             self.sent.borrow_mut().push(alert.dedup_key.clone());
-            Ok(())
+            Ok(DeliveryOutcome::Delivered)
         }
     }
 
@@ -302,7 +312,7 @@ mod tests {
     fn failed_delivery_does_not_consume_cooldown() {
         struct FailingSink;
         impl AlertSink for FailingSink {
-            fn send(&mut self, _: &Alert) -> Result<(), AlertError> {
+            fn send(&mut self, _: &Alert) -> Result<DeliveryOutcome, AlertError> {
                 Err(AlertError::Sink("nope".into()))
             }
         }
@@ -332,10 +342,73 @@ mod tests {
             sent: RefCell::new(Vec::new()),
         };
         let mut sink = DedupingSink::new(inner, Duration::from_secs(60));
-        sink.send(&alert("a|1", rieko_findings::Severity::Warning))
+        let outcome = sink
+            .send(&alert("a|1", rieko_findings::Severity::Warning))
             .unwrap();
+        assert_eq!(outcome, DeliveryOutcome::Delivered);
+        let outcome = sink
+            .send(&alert("a|1", rieko_findings::Severity::Warning))
+            .unwrap();
+        assert_eq!(outcome, DeliveryOutcome::Suppressed);
+        assert_eq!(sink.sent_count(), 1);
+    }
+
+    #[test]
+    fn persistent_failed_delivery_persists_failed_status() {
+        struct FailingSink;
+        impl AlertSink for FailingSink {
+            fn send(&mut self, _: &Alert) -> Result<DeliveryOutcome, AlertError> {
+                Err(AlertError::Sink("nope".into()))
+            }
+        }
+        let store = MemoryStore::default();
+        let (_cell, clock) = clock();
+        let mut sink = PersistentDedupingSink::new(
+            FailingSink,
+            Box::new(store.clone()),
+            Duration::from_secs(60),
+        )
+        .with_clock(clock);
+        assert!(sink
+            .send(&alert("a|1", rieko_findings::Severity::Warning))
+            .is_err());
+        let stored = store.0.borrow();
+        let state = stored.get("a|1").copied().unwrap_or_else(AlertState::never);
+        assert_eq!(
+            state.last_status,
+            DeliveryStatus::Failed,
+            "failed delivery must persist Failed status"
+        );
+        assert_eq!(state.last_sent_at, None);
+    }
+
+    #[test]
+    fn suppressed_send_does_not_increment_sent_count() {
+        let store = MemoryStore::default();
+        let (_cell, clock) = clock();
+        let mut sink = PersistentDedupingSink::new(
+            RecordingSink {
+                sent: RefCell::new(Vec::new()),
+            },
+            Box::new(store),
+            Duration::from_secs(60),
+        )
+        .with_clock(clock);
         sink.send(&alert("a|1", rieko_findings::Severity::Warning))
             .unwrap();
         assert_eq!(sink.sent_count(), 1);
+        let outcome = sink
+            .send(&alert("a|1", rieko_findings::Severity::Warning))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Suppressed,
+            "cooldown skip must return Suppressed"
+        );
+        assert_eq!(
+            sink.sent_count(),
+            1,
+            "sent_count must not increase on suppression"
+        );
     }
 }

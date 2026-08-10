@@ -43,6 +43,15 @@ pub enum DeliveryStatus {
     None,
 }
 
+/// Whether a send attempt delivered the alert to the underlying transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The alert was sent to the sink.
+    Delivered,
+    /// The alert was suppressed inside the cooldown window.
+    Suppressed,
+}
+
 /// Storage boundary for [`AlertState`], kept narrow so a cooldown/severity
 /// survives across process restarts. Implemented by the durable backends.
 pub trait AlertStateStore {

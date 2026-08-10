@@ -609,42 +609,53 @@ impl Storage for MemoryStorage {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::PruneSummary, StorageError> {
         let before = self.channel_snapshots.len();
-        // Group by channel, newest first, then keep only the rows each rule
-        // preserves. Rows are never replaced by finds; this touches only the
-        // snapshot buffer, never findings/recommendations (RIEKO-AUDIT-016).
         use std::collections::BTreeMap;
-        let mut by_channel: BTreeMap<(Option<String>, String), Vec<&ChannelSnapshot>> =
-            BTreeMap::new();
+        type ChannelKey = (Option<BitcoinNetwork>, Option<String>, String);
+        let active_cutoff = now
+            - chrono::Duration::from_std(policy.snapshot_max_age)
+                .unwrap_or(chrono::Duration::zero());
+        let closed_cutoff = now
+            - chrono::Duration::from_std(policy.closed_channel_max_age)
+                .unwrap_or(chrono::Duration::zero());
+        let mut kept: Vec<ChannelSnapshot> = Vec::with_capacity(before);
+        // Group by (network, node, channel), matching the SQLite PARTITION BY.
+        let mut by_channel: BTreeMap<ChannelKey, Vec<&ChannelSnapshot>> = BTreeMap::new();
         for snap in &self.channel_snapshots {
             by_channel
-                .entry((snap.node_id.clone(), snap.channel_id.clone()))
+                .entry((snap.network, snap.node_id.clone(), snap.channel_id.clone()))
                 .or_default()
                 .push(snap);
         }
-        let mut kept: Vec<ChannelSnapshot> = Vec::with_capacity(before);
-        let to_chrono = |d: std::time::Duration| {
-            chrono::Duration::from_std(d).unwrap_or(chrono::Duration::zero())
-        };
-        let active_cutoff = now - to_chrono(policy.snapshot_max_age);
-        let closed_cutoff = now - to_chrono(policy.closed_channel_max_age);
         for mut snaps in by_channel.into_values() {
             snaps.sort_by_key(|b| std::cmp::Reverse(b.ts));
-            if let Some(cap) = policy.max_snapshots_per_channel {
-                snaps.truncate(cap);
-            }
             for snap in snaps {
                 let cutoff = if snap.status.is_closed() {
                     closed_cutoff
                 } else {
                     active_cutoff
                 };
-                if snap.ts >= cutoff {
-                    kept.push(snap.clone());
+                if snap.ts < cutoff {
+                    continue;
                 }
+                kept.push(snap.clone());
+            }
+        }
+        if let Some(cap) = policy.max_snapshots_per_channel {
+            let mut capped: BTreeMap<ChannelKey, Vec<ChannelSnapshot>> = BTreeMap::new();
+            for snap in &kept {
+                capped
+                    .entry((snap.network, snap.node_id.clone(), snap.channel_id.clone()))
+                    .or_default()
+                    .push(snap.clone());
+            }
+            kept.clear();
+            for mut snaps in capped.into_values() {
+                snaps.sort_by_key(|b| std::cmp::Reverse(b.ts));
+                snaps.truncate(cap);
+                kept.append(&mut snaps);
             }
         }
         if let Some(total) = policy.max_total_snapshots {
-            // Keep the newest `total` across all channels.
             kept.sort_by_key(|b| std::cmp::Reverse(b.ts));
             kept.truncate(total);
         }
@@ -837,5 +848,14 @@ impl rieko_status::OperationalStateStore for MemoryStorage {
     ) -> Result<(), rieko_status::OperationalStateError> {
         self.operational_state = Some(state.clone());
         Ok(())
+    }
+
+    fn update_operational_state(
+        &mut self,
+        f: &dyn Fn(&mut rieko_status::OperationalState),
+    ) -> Result<(), rieko_status::OperationalStateError> {
+        let mut state = self.read_operational_state()?.unwrap_or_default();
+        f(&mut state);
+        self.write_operational_state(&state)
     }
 }

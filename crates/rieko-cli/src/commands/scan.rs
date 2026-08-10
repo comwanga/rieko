@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_alerts::{Alert, AlertSink, DedupingSink, TelegramSink};
+use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
 use rieko_domain::BitcoinNetwork;
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_storage::SqliteStorage;
@@ -122,13 +122,18 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let mut alert_sink = if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
             Ok(sink) => {
+                let store: Box<dyn AlertStateStore> =
+                    Box::new(SqliteStorage::open(&db_path).with_context(|| {
+                        format!("opening alert-state db {}", db_path.display())
+                    })?);
                 super::common::record_component(
                     &mut storage,
                     super::common::ComponentKind::AlertSink,
-                    rieko_status::ComponentState::Healthy,
+                    rieko_status::ComponentState::Configured,
                 )?;
-                Some(DedupingSink::new(
+                Some(PersistentDedupingSink::new(
                     sink,
+                    store,
                     Duration::from_secs(args.alert_cooldown),
                 ))
             }
@@ -176,7 +181,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
                     .unwrap_or_else(|| summarize_finding(finding)),
             );
             match sink.send(&alert) {
-                Ok(()) => {
+                Ok(rieko_alerts::DeliveryOutcome::Delivered) => {
                     n_alerts += 1;
                     super::common::record_component(
                         &mut storage,
@@ -184,6 +189,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
                         rieko_status::ComponentState::Healthy,
                     )?;
                 }
+                Ok(rieko_alerts::DeliveryOutcome::Suppressed) => {}
                 Err(e) => {
                     // A delivery failure must surface in operational status
                     // (RIEKO-AUDIT-013) while findings stay persisted.
@@ -197,6 +203,9 @@ pub fn run(args: ScanArgs) -> Result<()> {
             }
         }
     }
+
+    let retention = rieko_storage::RetentionPolicy::default();
+    super::common::run_cleanup_if_due(&mut storage, &retention)?;
 
     if args.verbose || findings.is_empty() {
         info!(

@@ -12,6 +12,13 @@ pub trait OperationalStateStore {
         &mut self,
         state: &OperationalState,
     ) -> Result<(), OperationalStateError>;
+    /// Read, mutate, and write the operational state atomically. Implementations
+    /// must ensure no concurrent reader or writer can observe or interleave a
+    /// partially-applied update.
+    fn update_operational_state(
+        &mut self,
+        f: &dyn Fn(&mut OperationalState),
+    ) -> Result<(), OperationalStateError>;
 }
 
 #[derive(Debug, Error)]

@@ -9,8 +9,7 @@ use rieko_domain::BitcoinNetwork;
 use rieko_findings::{channel_snapshot_state_digest, Finding};
 use rieko_graph::{GraphView, InMemoryGraph, InMemoryHistory};
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
-use rieko_status::OperationalStateStore;
-use rieko_storage::{SqliteStorage, Storage};
+use rieko_storage::SqliteStorage;
 use tracing::{info, warn};
 
 use super::common::{persist_monitor_cycle, GraphSource};
@@ -138,7 +137,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 super::common::record_component(
                     &mut storage,
                     super::common::ComponentKind::AlertSink,
-                    rieko_status::ComponentState::Healthy,
+                    rieko_status::ComponentState::Configured,
                 )?;
                 Some(PersistentDedupingSink::new(
                     sink,
@@ -187,7 +186,6 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     };
 
     let mut cycle: u64 = 0;
-    let mut last_cleanup: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         cycle += 1;
         let Some(graph) = ingest_with_retry(
@@ -257,39 +255,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             &mut findings,
         )?;
 
-        // Retention: bounded cleanup at most once per cleanup_interval
-        // (RIEKO-AUDIT-016). Cleanup only touches channel_snapshots and is
-        // transactional; the outcome is recorded so /status reports failures.
-        if last_cleanup.map_or(true, |t| {
-            chrono::Utc::now() - t
-                >= chrono::Duration::from_std(retention.cleanup_interval)
-                    .unwrap_or(chrono::Duration::zero())
-        }) {
-            let now = chrono::Utc::now();
-            let mut op = storage
-                .read_operational_state()
-                .context("reading operational state")?
-                .unwrap_or_default();
-            op.last_cleanup_attempt = Some(now);
-            match storage.prune_channel_snapshots(&retention, now) {
-                Ok(summary) => {
-                    op.cleanup = rieko_status::ComponentState::Healthy;
-                    op.last_cleanup_success = Some(now);
-                    info!(
-                        deleted_snapshots = summary.deleted_snapshots,
-                        "retention cleanup complete"
-                    );
-                    last_cleanup = Some(now);
-                }
-                Err(e) => {
-                    op.cleanup = rieko_status::ComponentState::Failing;
-                    warn!(error = %e, "retention cleanup failed");
-                }
-            }
-            storage
-                .write_operational_state(&op)
-                .context("recording cleanup state")?;
-        }
+        super::common::run_cleanup_if_due(&mut storage, &retention)?;
 
         // Cooldown and severity-escalation are enforced by the persistent
         // sink, so the loop only decides *what* to say, not *whether*.
@@ -309,7 +275,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                         .unwrap_or_else(|| summarize_finding(finding)),
                 );
                 match sink.send(&alert) {
-                    Ok(()) => {
+                    Ok(rieko_alerts::DeliveryOutcome::Delivered) => {
                         n_alerts += 1;
                         super::common::record_component(
                             &mut storage,
@@ -317,6 +283,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                             rieko_status::ComponentState::Healthy,
                         )?;
                     }
+                    Ok(rieko_alerts::DeliveryOutcome::Suppressed) => {}
                     Err(e) => {
                         // A delivery failure must surface in operational status
                         // (RIEKO-AUDIT-013) while findings stay persisted.
