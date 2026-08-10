@@ -20,6 +20,7 @@ rieko-findings.workspace = true
 rieko-detectors.workspace = true
 rieko-recommendations.workspace = true
 rieko-simulation = { workspace = true, optional = true }
+rieko-simulation-app = { workspace = true, optional = true }
 rieko-execution = { workspace = true, optional = true }
 rieko-alerts.workspace = true
 rieko-llm.workspace = true
@@ -45,7 +46,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # `future` is the combined legacy gate, preserved for compatibility.
 [features]
 default = ["simulate"]
-simulate = ["rieko-simulation"]
+simulate = ["rieko-simulation", "rieko-simulation-app", "rieko-api/simulate"]
 execute = ["rieko-execution", "rieko-api/execute"]
 future = ["simulate", "execute"]
 

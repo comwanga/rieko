@@ -12,6 +12,7 @@ repository.workspace = true
 rieko-storage.workspace = true
 rieko-status.workspace = true
 rieko-findings.workspace = true
+rieko-simulation-app = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
@@ -25,7 +26,7 @@ subtle = "2"
 # `simulate` enables the simulation API surface. Default on in v2.
 [features]
 default = ["simulate"]
-simulate = []
+simulate = ["dep:rieko-simulation-app"]
 execute = []
 
 [dev-dependencies]

@@ -10,6 +10,7 @@ members = [
     "crates/rieko-detectors",
     "crates/rieko-recommendations",
     "crates/rieko-simulation",
+    "crates/rieko-simulation-app",
     "crates/rieko-execution",
     "crates/rieko-alerts",
     "crates/rieko-llm",
@@ -41,13 +42,14 @@ rieko-ingest-core = { path = "crates/rieko-ingest-core", version = "0.1.0" }
 rieko-detectors = { path = "crates/rieko-detectors", version = "0.1.0" }
 rieko-recommendations = { path = "crates/rieko-recommendations", version = "0.1.0" }
 rieko-simulation = { path = "crates/rieko-simulation", version = "0.1.0" }
+rieko-simulation-app = { path = "crates/rieko-simulation-app", version = "0.1.0" }
 rieko-execution = { path = "crates/rieko-execution", version = "0.1.0" }
 rieko-alerts = { path = "crates/rieko-alerts", version = "0.1.0" }
 rieko-llm = { path = "crates/rieko-llm", version = "0.1.0" }
 rieko-status = { path = "crates/rieko-status", version = "0.1.0" }
 
 # API + CLI
-rieko-api = { path = "crates/rieko-api", version = "0.1.0" }
+rieko-api = { path = "crates/rieko-api", version = "0.1.0", default-features = false }
 rieko-cli = { path = "crates/rieko-cli", version = "0.1.0" }
 
 # third-party

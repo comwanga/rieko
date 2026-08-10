@@ -1,0 +1,23 @@
+[package]
+name = "rieko-simulation-app"
+description = "Application service for deterministic Rieko simulations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rieko-domain.workspace = true
+rieko-findings.workspace = true
+rieko-simulation.workspace = true
+rieko-storage.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

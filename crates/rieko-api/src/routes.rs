@@ -5,8 +5,20 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::app::{block_read, VERSION};
+use crate::app::{block_storage, VERSION};
 use crate::RiekoApi;
+
+#[cfg(feature = "simulate")]
+use crate::app::{MAX_BODY_BYTES, REQUEST_TIMEOUT};
+#[cfg(feature = "simulate")]
+use axum::extract::rejection::JsonRejection;
+#[cfg(feature = "simulate")]
+use axum::extract::Request;
+#[cfg(feature = "simulate")]
+use rieko_simulation_app::{
+    CompareSimulationsCommand, CreateSimulationOutcome, SimulationAppError, SimulationAppErrorKind,
+    SimulationComparison, SimulationView,
+};
 
 #[derive(Serialize)]
 pub struct Status {
@@ -47,7 +59,7 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
     // so a large table cannot stall the runtime (RIEKO-AUDIT-014). Queries are
     // bounded aggregates (schema version, quick_check, COUNT(*), one row).
     let (schema_version, integrity_ok, counts, operational) =
-        block_read(api.state.storage.clone(), |s| {
+        block_storage(api.state.storage.clone(), |s| {
             let schema = s.schema_version().map_err(|e| e.to_string())?;
             let integrity = s.integrity_check().is_ok();
             let counts = s.counts().map_err(|e| e.to_string())?;
@@ -194,7 +206,7 @@ pub async fn findings(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
     let lifecycle = lifecycle(&q)?;
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.latest_findings_by_lifecycle(limit(&q), lifecycle)
             .map_err(|e| e.to_string())
     })
@@ -212,7 +224,7 @@ pub async fn findings_for_channel(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
     let lifecycle = lifecycle(&q)?;
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.findings_for_channel_by_lifecycle(&channel_id, limit(&q), lifecycle)
             .map_err(|e| e.to_string())
     })
@@ -228,7 +240,7 @@ pub async fn recommendations(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.latest_recommendations(limit(&q))
             .map_err(|e| e.to_string())
     })
@@ -244,7 +256,7 @@ pub async fn audit(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.recent_audit(limit(&q)).map_err(|e| e.to_string())
     })
     .await?;
@@ -260,7 +272,7 @@ pub async fn recent_simulations(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.recent_simulations(limit(&q)).map_err(|e| e.to_string())
     })
     .await?;
@@ -277,13 +289,12 @@ pub async fn recent_simulations_v2(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.recent_simulations_v2(limit(&q))
             .map_err(|e| e.to_string())
     })
     .await?;
-    let out: Vec<Value> = rows.into_iter().map(simulation_value).collect();
-    Ok(Json(out))
+    Ok(Json(rows.into_iter().map(simulation_value).collect()))
 }
 
 /// v2 simulation detail by ID.
@@ -292,7 +303,7 @@ pub async fn simulation_v2_by_id(
     State(api): State<RiekoApi>,
     Path(simulation_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let record = block_read(api.state.storage.clone(), move |s| {
+    let record = block_storage(api.state.storage.clone(), move |s| {
         s.simulation_v2_by_id(&simulation_id)
             .map_err(|e| e.to_string())
     })
@@ -322,12 +333,222 @@ fn simulation_value(mut record: rieko_storage::SimulationRecord) -> Value {
     serde_json::to_value(record).unwrap_or(Value::Null)
 }
 
+#[cfg(feature = "simulate")]
+pub async fn simulation_views(
+    State(api): State<RiekoApi>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<Vec<SimulationView>>, (StatusCode, Json<SimulationErrorResponse>)> {
+    let result = block_storage(api.state.storage.clone(), move |storage| {
+        Ok(rieko_simulation_app::list_simulations(storage, limit(&q)))
+    })
+    .await
+    .map_err(blocking_simulation_error)?;
+    result
+        .map(Json)
+        .map_err(|error| simulation_error_response(simulation_error_status(error.kind), error))
+}
+
+#[cfg(feature = "simulate")]
+pub async fn simulation_view_by_id(
+    State(api): State<RiekoApi>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<SimulationView>, (StatusCode, Json<SimulationErrorResponse>)> {
+    let requested_id = simulation_id.clone();
+    let result = block_storage(api.state.storage.clone(), move |storage| {
+        Ok(rieko_simulation_app::get_simulation(
+            storage,
+            &simulation_id,
+        ))
+    })
+    .await
+    .map_err(blocking_simulation_error)?;
+    let simulation = result
+        .map_err(|error| simulation_error_response(simulation_error_status(error.kind), error))?
+        .ok_or_else(|| {
+            simulation_error_response(
+                StatusCode::NOT_FOUND,
+                SimulationAppError {
+                    kind: SimulationAppErrorKind::SimulationNotFound,
+                    message: format!("no simulation with id {requested_id}"),
+                    simulation: None,
+                },
+            )
+        })?;
+    Ok(Json(simulation))
+}
+
+#[cfg(feature = "simulate")]
+#[derive(Serialize)]
+pub struct SimulationErrorResponse {
+    error: SimulationErrorBody,
+}
+
+#[cfg(feature = "simulate")]
+#[derive(Serialize)]
+pub struct SimulationErrorBody {
+    code: SimulationAppErrorKind,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    simulation: Option<Box<SimulationView>>,
+}
+
+#[cfg(feature = "simulate")]
+pub async fn create_simulation_v2(
+    State(api): State<RiekoApi>,
+    request: Request,
+) -> Result<(StatusCode, Json<CreateSimulationOutcome>), (StatusCode, Json<SimulationErrorResponse>)>
+{
+    let command = read_simulation_json(request).await?;
+    let result = block_storage(api.state.storage.clone(), move |storage| {
+        Ok(rieko_simulation_app::create_simulation(storage, command))
+    })
+    .await
+    .map_err(blocking_simulation_error)?;
+    match result {
+        Ok(outcome) => Ok((
+            if outcome.reused {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            Json(outcome),
+        )),
+        Err(error) => Err(simulation_error_response(
+            simulation_error_status(error.kind),
+            error,
+        )),
+    }
+}
+
+#[cfg(feature = "simulate")]
+pub async fn compare_simulations_v2(
+    State(api): State<RiekoApi>,
+    payload: Result<Json<CompareSimulationsCommand>, JsonRejection>,
+) -> Result<Json<SimulationComparison>, (StatusCode, Json<SimulationErrorResponse>)> {
+    let Json(command) = payload.map_err(json_rejection_response)?;
+    let result = block_storage(api.state.storage.clone(), move |storage| {
+        Ok(rieko_simulation_app::compare_simulations(storage, command))
+    })
+    .await
+    .map_err(blocking_simulation_error)?;
+    result
+        .map(Json)
+        .map_err(|error| simulation_error_response(simulation_error_status(error.kind), error))
+}
+
+#[cfg(feature = "simulate")]
+fn simulation_error_status(kind: SimulationAppErrorKind) -> StatusCode {
+    match kind {
+        SimulationAppErrorKind::RecommendationNotFound
+        | SimulationAppErrorKind::FindingNotFound
+        | SimulationAppErrorKind::SimulationNotFound
+        | SimulationAppErrorKind::SnapshotNotFound => StatusCode::NOT_FOUND,
+        SimulationAppErrorKind::FindingInactive | SimulationAppErrorKind::StaleInput => {
+            StatusCode::CONFLICT
+        }
+        SimulationAppErrorKind::Storage | SimulationAppErrorKind::ModelFailure => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        SimulationAppErrorKind::IncompatibleSimulations => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+#[cfg(feature = "simulate")]
+fn simulation_error_response(
+    status: StatusCode,
+    error: SimulationAppError,
+) -> (StatusCode, Json<SimulationErrorResponse>) {
+    (
+        status,
+        Json(SimulationErrorResponse {
+            error: SimulationErrorBody {
+                code: error.kind,
+                message: error.message,
+                simulation: error.simulation,
+            },
+        }),
+    )
+}
+
+#[cfg(feature = "simulate")]
+fn json_rejection_response(
+    rejection: JsonRejection,
+) -> (StatusCode, Json<SimulationErrorResponse>) {
+    simulation_error_response(
+        rejection.status(),
+        SimulationAppError {
+            kind: SimulationAppErrorKind::InvalidRequest,
+            message: rejection.body_text(),
+            simulation: None,
+        },
+    )
+}
+
+#[cfg(feature = "simulate")]
+fn blocking_simulation_error(
+    (status, message): (StatusCode, String),
+) -> (StatusCode, Json<SimulationErrorResponse>) {
+    simulation_error_response(
+        status,
+        SimulationAppError {
+            kind: SimulationAppErrorKind::Storage,
+            message,
+            simulation: None,
+        },
+    )
+}
+
+#[cfg(feature = "simulate")]
+async fn read_simulation_json<T: serde::de::DeserializeOwned>(
+    request: Request,
+) -> Result<T, (StatusCode, Json<SimulationErrorResponse>)> {
+    let is_json = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return Err(transport_simulation_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content type must be application/json",
+        ));
+    }
+    let bytes = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    .map_err(|_| transport_simulation_error(StatusCode::REQUEST_TIMEOUT, "request body timed out"))?
+    .map_err(|error| {
+        transport_simulation_error(StatusCode::PAYLOAD_TOO_LARGE, error.to_string())
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| transport_simulation_error(StatusCode::BAD_REQUEST, error.to_string()))
+}
+
+#[cfg(feature = "simulate")]
+fn transport_simulation_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<SimulationErrorResponse>) {
+    simulation_error_response(
+        status,
+        SimulationAppError {
+            kind: SimulationAppErrorKind::InvalidRequest,
+            message: message.into(),
+            simulation: None,
+        },
+    )
+}
+
 /// Newest-first liquidity history across all channels.
 pub async fn all_snapshots(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.recent_snapshots_all(limit(&q)).map_err(|e| e.to_string())
     })
     .await?;
@@ -344,7 +565,7 @@ pub async fn channel_snapshots(
     Path(channel_id): Path<String>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = block_read(api.state.storage.clone(), move |s| {
+    let rows = block_storage(api.state.storage.clone(), move |s| {
         s.recent_channel_snapshots(&channel_id, limit(&q))
             .map_err(|e| e.to_string())
     })
