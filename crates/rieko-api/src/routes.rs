@@ -385,6 +385,43 @@ pub async fn simulation_view_by_id(
 }
 
 #[cfg(feature = "simulate")]
+pub async fn simulation_report_by_id(
+    State(api): State<RiekoApi>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<rieko_simulation_app::SimulationReport>, (StatusCode, Json<SimulationErrorResponse>)>
+{
+    use crate::app::VERSION;
+    use rieko_simulation_app::simulation_report;
+
+    let requested_id = simulation_id.clone();
+    let result = block_storage(api.state.storage.clone(), move |storage| {
+        Ok(rieko_simulation_app::get_simulation(
+            storage,
+            &simulation_id,
+        ))
+    })
+    .await
+    .map_err(blocking_simulation_error)?;
+    let simulation = result
+        .map_err(|error| simulation_error_response(simulation_error_status(error.kind), error))?
+        .ok_or_else(|| {
+            simulation_error_response(
+                StatusCode::NOT_FOUND,
+                SimulationAppError {
+                    kind: SimulationAppErrorKind::SimulationNotFound,
+                    message: format!("no simulation with id {requested_id}"),
+                    simulation: None,
+                },
+            )
+        })?;
+    Ok(Json(simulation_report(
+        &simulation,
+        VERSION,
+        chrono::Utc::now(),
+    )))
+}
+
+#[cfg(feature = "simulate")]
 #[derive(Serialize)]
 pub struct SimulationErrorResponse {
     error: SimulationErrorBody,
