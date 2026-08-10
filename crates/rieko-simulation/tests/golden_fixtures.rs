@@ -51,6 +51,7 @@ fn provenance(net: Option<BitcoinNetwork>, channel: &str, digest: &str) -> Findi
         network: net,
         source: ObservationSource::Fixture {
             redacted_hash: "hash".into(),
+            configured_node: "node-1".into(),
         },
         producers: Vec::new(),
         observation: ObservationReference::ChannelState {

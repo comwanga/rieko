@@ -472,6 +472,7 @@ mod tests {
         let detector = LiquidityDetector::new("local-node");
         let source = rieko_findings::ObservationSource::Fixture {
             redacted_hash: "fixture-digest".into(),
+            configured_node: "node-1".into(),
         };
         let normalizer = rieko_findings::ProducerVersion {
             name: "normalizer".into(),

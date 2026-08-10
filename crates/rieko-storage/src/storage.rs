@@ -260,6 +260,7 @@ pub struct MemoryStorage {
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
     transaction_snapshot: Option<MemoryStorageState>,
+    finding_absent: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +363,7 @@ impl Storage for MemoryStorage {
             .min()
             .expect("finding first-seen candidates are non-empty");
         if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
+            self.finding_absent.remove(&finding.id);
             existing.first_seen_at = existing.first_seen_at.min(first_seen_at);
             if finding.last_seen_at >= existing.last_seen_at {
                 existing.severity = finding.severity;
@@ -393,7 +395,15 @@ impl Storage for MemoryStorage {
                     && finding.node == scope.node
                     && finding.lifecycle == FindingLifecycle::Active
                 {
-                    finding.lifecycle = FindingLifecycle::Resolved;
+                    let count = self
+                        .finding_absent
+                        .entry(finding.id.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                    if *count >= 3 {
+                        finding.lifecycle = FindingLifecycle::Resolved;
+                        self.finding_absent.remove(&finding.id);
+                    }
                 }
             }
         }

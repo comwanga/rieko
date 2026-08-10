@@ -9,7 +9,7 @@ use rieko_domain::BitcoinNetwork;
 use rieko_findings::{channel_snapshot_state_digest, Finding};
 use rieko_graph::{GraphView, InMemoryGraph, InMemoryHistory};
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
-use rieko_storage::SqliteStorage;
+use rieko_storage::{SqliteStorage, Storage};
 use tracing::{info, warn};
 
 use super::common::{persist_monitor_cycle, GraphSource};
@@ -224,6 +224,23 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             .collect();
         for snapshot in &snapshots {
             history.push(snapshot.clone());
+        }
+
+        // Warm history from persisted snapshots on the first cycle so drift
+        // detection survives a restart (first cycle only — subsequent cycles
+        // already have in-memory history from previous pushes).
+        if cycle == 1 {
+            for channel in &channels {
+                let persisted = storage
+                    .recent_channel_snapshots_for_network(
+                        source.network,
+                        Some(&args.node),
+                        channel.id.as_ref(),
+                        200,
+                    )
+                    .unwrap_or_default();
+                history.warm_from_snapshots(&persisted);
+            }
         }
 
         let observation_source = source.observation_source()?;

@@ -88,6 +88,7 @@ fn seeded_app_for(
                 network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
+                    configured_node: "node-1".into(),
                 },
                 producers: Vec::new(),
                 observation: ObservationReference::ChannelState {

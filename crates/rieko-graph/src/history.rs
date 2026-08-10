@@ -29,6 +29,24 @@ impl InMemoryHistory {
         }
     }
 
+    /// Seed the history buffer from persisted snapshots so trend detection
+    /// survives a restart. Each channel's history is populated from the newest
+    /// `max_per_channel` persisted snapshots (oldest-first order so push() works
+    /// correctly).
+    pub fn warm_from_snapshots(&mut self, snapshots: &[ChannelSnapshot]) {
+        if snapshots.is_empty() {
+            return;
+        }
+        let channel_id = snapshots[0].channel_id();
+        let mut newest_first: Vec<&ChannelSnapshot> = snapshots.iter().collect();
+        newest_first.sort_by_key(|s| std::cmp::Reverse(s.ts));
+        newest_first.truncate(self.max_per_channel);
+        let bucket = self.snapshots.entry(channel_id).or_default();
+        for s in newest_first.into_iter().rev() {
+            bucket.push_back(s.clone());
+        }
+    }
+
     pub fn push(&mut self, snapshot: ChannelSnapshot) {
         let bucket = self.snapshots.entry(snapshot.channel_id()).or_default();
         bucket.push_back(snapshot);

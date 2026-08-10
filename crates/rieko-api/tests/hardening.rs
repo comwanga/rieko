@@ -219,13 +219,15 @@ async fn findings_lifecycle_filter_defaults_active_and_validates_input() {
     let mut mem = MemoryStorage::new();
     mem.save_finding(&finding("resolved", "old_detector"))
         .unwrap();
-    mem.resolve_findings_for_scope(&FindingCycleScope {
-        detector: "old_detector".into(),
-        network: None,
-        node: Some("local-node".into()),
-        complete: true,
-    })
-    .unwrap();
+    for _ in 0..3 {
+        mem.resolve_findings_for_scope(&FindingCycleScope {
+            detector: "old_detector".into(),
+            network: None,
+            node: Some("local-node".into()),
+            complete: true,
+        })
+        .unwrap();
+    }
     mem.save_finding(&finding("active", "current_detector"))
         .unwrap();
     let app = RiekoApi::new(Box::new(mem)).unwrap().router();

@@ -44,6 +44,7 @@ impl GraphSource {
             })?;
             return Ok(ObservationSource::Fixture {
                 redacted_hash: format!("{:x}", Sha256::digest(contents)),
+                configured_node: self.node.clone(),
             });
         }
         bail!("provide --fixture or --lnd-rest")
@@ -104,6 +105,9 @@ impl GraphSource {
         }
 
         if let Some(fixture) = &self.fixture {
+            if self.network == BitcoinNetwork::Mainnet {
+                bail!("fixture data cannot represent mainnet production evidence; use --network regtest, testnet, or signet with --fixture");
+            }
             let channels = load_fixture(fixture, &local)?;
             graph
                 .upsert_channels(channels)
@@ -120,11 +124,14 @@ fn load_fixture(path: &Path, local: &NodeId) -> Result<Vec<rieko_domain::Channel
         .with_context(|| format!("reading fixture {}", path.display()))?;
     let parsed: LndChannelResponse =
         serde_json::from_str(&body).context("parsing fixture as LND channel response")?;
-    let now = chrono::Utc::now();
+    let observed_at = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .unwrap_or_else(|_| chrono::Utc::now());
     parsed
         .channels
         .iter()
-        .map(|c| Normalizer::channel(c, local, now).map_err(|e| anyhow!(e.to_string())))
+        .map(|c| Normalizer::channel(c, local, observed_at).map_err(|e| anyhow!(e.to_string())))
         .collect()
 }
 
@@ -859,15 +866,17 @@ mod tests {
         assert_eq!(storage.recent_audit(10).unwrap().len(), 1);
 
         let mut recovered = Vec::new();
-        persist_and_recommend(
-            &mut storage,
-            None,
-            &engine,
-            "local-node",
-            &[scope],
-            &mut recovered,
-        )
-        .unwrap();
+        for _ in 0..3 {
+            persist_and_recommend(
+                &mut storage,
+                None,
+                &engine,
+                "local-node",
+                std::slice::from_ref(&scope),
+                &mut recovered,
+            )
+            .unwrap();
+        }
         assert_eq!(
             storage.latest_findings(10).unwrap()[0].lifecycle,
             rieko_findings::FindingLifecycle::Resolved

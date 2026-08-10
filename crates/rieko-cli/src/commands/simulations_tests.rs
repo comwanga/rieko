@@ -83,6 +83,7 @@ fn seed_at_with_snapshots(
                 network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
+                    configured_node: "node-1".into(),
                 },
                 producers: Vec::new(),
                 observation: ObservationReference::ChannelState {

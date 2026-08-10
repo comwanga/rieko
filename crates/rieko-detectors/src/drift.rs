@@ -290,4 +290,44 @@ mod tests {
         let d = DriftDetector::new("local-node");
         assert!(d.run(&g, &ctx(&h)).is_empty());
     }
+
+    #[test]
+    fn exact_threshold_decline_is_not_warned() {
+        let declines = vec![0.25; 10];
+        let mut last = 0.25;
+        last -= 0.05;
+        let h = history_for("c1", &declines);
+        let mut g = InMemoryGraph::new();
+        g.upsert_channel(channel("c1", last)).unwrap();
+        let d = DriftDetector::new("local-node");
+        let findings = d.run(&g, &ctx(&h));
+        assert!(findings.is_empty(), "exactly 0.05 decline must not fire");
+    }
+
+    #[test]
+    fn current_ratio_at_bar_is_not_warned() {
+        let h = history_for("c1", &[0.60, 0.55, 0.50, 0.45, 0.40]);
+        let mut g = InMemoryGraph::new();
+        g.upsert_channel(channel("c1", 0.25)).unwrap();
+        let d = DriftDetector::new("local-node");
+        let findings = d.run(&g, &ctx(&h));
+        assert!(
+            findings.is_empty(),
+            "local_ratio at bar (0.25) must not fire"
+        );
+    }
+
+    #[test]
+    fn critical_decline_at_boundary_fires() {
+        let declines = vec![0.39; 10];
+        let mut last = 0.39;
+        last -= 0.15;
+        let h = history_for("c1", &declines);
+        let mut g = InMemoryGraph::new();
+        g.upsert_channel(channel("c1", last)).unwrap();
+        let d = DriftDetector::new("local-node");
+        let findings = d.run(&g, &ctx(&h));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+    }
 }

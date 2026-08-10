@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum ObservationSource {
     Fixture {
         redacted_hash: String,
+        configured_node: String,
     },
     Lnd {
         redacted_endpoint: String,
@@ -299,11 +300,12 @@ mod tests {
     fn fixture_source_serializes_only_a_redacted_hash() {
         let source = ObservationSource::Fixture {
             redacted_hash: "sha256:abc".into(),
+            configured_node: "node-1".into(),
         };
         let json = serde_json::to_value(&source).unwrap();
 
         assert_eq!(json["kind"], "fixture");
         assert_eq!(json["redacted_hash"], "sha256:abc");
-        assert_eq!(json.as_object().unwrap().len(), 2);
+        assert_eq!(json.as_object().unwrap().len(), 3);
     }
 }
