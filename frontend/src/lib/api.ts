@@ -68,6 +68,9 @@ export interface Status {
     simulations: number;
     audit: number;
     channel_snapshots: number;
+    simulation_completed: number;
+    simulation_failed: number;
+    simulation_stale: number;
   };
 }
 

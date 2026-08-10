@@ -218,6 +218,12 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
                 + self.recent_simulations_v2(crate::COUNT_CAP)?.len(),
             audit: self.recent_audit(crate::COUNT_CAP)?.len(),
             channel_snapshots: self.recent_snapshots_all(crate::COUNT_CAP)?.len(),
+            simulation_counts: SimulationCounts {
+                completed: 0,
+                failed: 0,
+                stale: 0,
+                other: 0,
+            },
         })
     }
 }
@@ -230,6 +236,15 @@ pub struct StorageCounts {
     pub simulations: usize,
     pub audit: usize,
     pub channel_snapshots: usize,
+    pub simulation_counts: SimulationCounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulationCounts {
+    pub completed: usize,
+    pub failed: usize,
+    pub stale: usize,
+    pub other: usize,
 }
 
 /// In-memory implementation for tests and fixtures.

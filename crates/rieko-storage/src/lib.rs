@@ -7,7 +7,8 @@ pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use retention::{PruneSummary, RetentionPolicy};
 pub use sqlite::{SqliteStorage, WriterLock};
 pub use storage::{
-    MemoryStorage, SimulationEvent, SimulationRecord, Storage, StorageCounts, StorageError,
+    MemoryStorage, SimulationCounts, SimulationEvent, SimulationRecord, Storage, StorageCounts,
+    StorageError,
 };
 
 /// Cap for table row counts loaded by the default `counts()` fallback. Real

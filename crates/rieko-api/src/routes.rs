@@ -52,6 +52,9 @@ pub struct StatusCounts {
     pub simulations: usize,
     pub audit: usize,
     pub channel_snapshots: usize,
+    pub simulation_completed: usize,
+    pub simulation_failed: usize,
+    pub simulation_stale: usize,
 }
 
 pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (StatusCode, String)> {
@@ -157,6 +160,9 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
             simulations: counts.simulations,
             audit: counts.audit,
             channel_snapshots: counts.channel_snapshots,
+            simulation_completed: counts.simulation_counts.completed,
+            simulation_failed: counts.simulation_counts.failed,
+            simulation_stale: counts.simulation_counts.stale,
         },
     }))
 }
@@ -442,6 +448,10 @@ pub async fn create_simulation_v2(
     request: Request,
 ) -> Result<(StatusCode, Json<CreateSimulationOutcome>), (StatusCode, Json<SimulationErrorResponse>)>
 {
+    api.state
+        .check_simulation_rate()
+        .await
+        .map_err(|(status, message)| transport_simulation_error(status, message))?;
     let command = read_simulation_json(request).await?;
     let result = block_storage(api.state.storage.clone(), move |storage| {
         Ok(rieko_simulation_app::create_simulation(storage, command))
