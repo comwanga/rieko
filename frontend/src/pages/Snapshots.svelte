@@ -37,7 +37,7 @@
 {:else}
   <table>
     <thead>
-       <tr><th>Network</th><th>Node</th><th>Channel</th><th>Status</th><th>Local</th><th>Capacity</th><th></th></tr>
+       <tr><th scope="col">Network</th><th scope="col">Node</th><th scope="col">Channel</th><th scope="col">Status</th><th scope="col">Local</th><th scope="col">Capacity</th><th scope="col"></th></tr>
     </thead>
     <tbody>
       {#each latest as { key, snaps }}
