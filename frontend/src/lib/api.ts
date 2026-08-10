@@ -232,6 +232,7 @@ export interface SimulationView {
   stale: boolean;
   confidence: SimulationConfidence;
   result: SimulationResult | null;
+  explanation: string;
   error_code: string | null;
   requested_at: string;
   completed_at: string | null;
@@ -258,6 +259,33 @@ export interface SimulationComparison {
   right: SimulationView;
   projected_local_ratio_delta: number;
   projected_local_balance_delta_msat: number;
+  no_action_executed: boolean;
+  freshness_delta_seconds: number;
+  confidence_left: SimulationConfidence;
+  confidence_right: SimulationConfidence;
+  warnings_left: number;
+  warnings_right: number;
+}
+
+export interface SimulationReport {
+  rieko_version: string;
+  model_id: string;
+  model_version: string;
+  simulation_id: string;
+  input_hash: string;
+  recommendation_id: string;
+  finding_id: string;
+  snapshot_observed_at: string;
+  parameters: LiquidityRedistributionParameters;
+  baseline: ProjectedState | null;
+  projected: ProjectedState | null;
+  deltas: ProjectedDelta[];
+  assumptions: Assumption[];
+  warnings: SimulationWarning[];
+  confidence: SimulationConfidence;
+  stale: boolean;
+  explanation: string;
+  generated_at: string;
   no_action_executed: boolean;
 }
 

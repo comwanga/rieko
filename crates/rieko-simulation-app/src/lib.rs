@@ -44,6 +44,7 @@ pub struct SimulationView {
     pub stale: bool,
     pub confidence: SimulationConfidence,
     pub result: Option<SimulationResult>,
+    pub explanation: String,
     pub error_code: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -70,6 +71,34 @@ pub struct SimulationComparison {
     pub right: SimulationView,
     pub projected_local_ratio_delta: f64,
     pub projected_local_balance_delta_msat: i64,
+    pub no_action_executed: bool,
+    pub freshness_delta_seconds: i64,
+    pub confidence_left: SimulationConfidence,
+    pub confidence_right: SimulationConfidence,
+    pub warnings_left: usize,
+    pub warnings_right: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationReport {
+    pub rieko_version: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub simulation_id: String,
+    pub input_hash: String,
+    pub recommendation_id: String,
+    pub finding_id: String,
+    pub snapshot_observed_at: DateTime<Utc>,
+    pub parameters: LiquidityRedistributionParameters,
+    pub baseline: Option<rieko_simulation::model::ProjectedState>,
+    pub projected: Option<rieko_simulation::model::ProjectedState>,
+    pub deltas: Vec<rieko_simulation::model::ProjectedDelta>,
+    pub assumptions: Vec<rieko_simulation::model::Assumption>,
+    pub warnings: Vec<rieko_simulation::model::SimulationWarning>,
+    pub confidence: SimulationConfidence,
+    pub stale: bool,
+    pub explanation: String,
+    pub generated_at: DateTime<Utc>,
     pub no_action_executed: bool,
 }
 
@@ -490,6 +519,11 @@ pub fn compare_simulations(
             "projected balance difference exceeds the supported comparison range",
         )
     })?;
+    let freshness_delta = (right.source_observed_at - left.source_observed_at).num_seconds();
+    let confidence_left = left_result.confidence;
+    let confidence_right = right_result.confidence;
+    let warnings_left = left_result.warnings.len();
+    let warnings_right = right_result.warnings.len();
     Ok(SimulationComparison {
         recommendation_id: left.recommendation_id.clone(),
         projected_local_ratio_delta: right_result.projected.local_ratio
@@ -498,6 +532,11 @@ pub fn compare_simulations(
         left,
         right,
         no_action_executed: true,
+        freshness_delta_seconds: freshness_delta,
+        confidence_left,
+        confidence_right,
+        warnings_left,
+        warnings_right,
     })
 }
 
@@ -555,6 +594,7 @@ pub fn simulation_view(
         stale,
         confidence,
         result,
+        explanation: record.explanation.clone(),
         error_code: record.error_code.clone(),
         requested_at,
         completed_at,
@@ -722,7 +762,7 @@ fn simulation_record(
             .transpose()
             .map_err(json_error)?
             .unwrap_or_else(|| serde_json::json!([])),
-        explanation: String::new(),
+        explanation: generate_summary(input, result),
         canonical_input: serde_json::to_value(input).map_err(json_error)?,
         projection: result
             .map(serde_json::to_value)
@@ -818,6 +858,92 @@ fn model_error(error: ModelError) -> SimulationAppError {
 
 fn json_error(error: serde_json::Error) -> SimulationAppError {
     SimulationAppError::new(SimulationAppErrorKind::Storage, error.to_string())
+}
+
+fn generate_summary(input: &SimulationInput, result: Option<&SimulationResult>) -> String {
+    let Some(result) = result else {
+        return String::new();
+    };
+    let amount = input.parameters.amount_msat;
+    let from = &input.parameters.source_channel;
+    let to = &input.parameters.destination_channel;
+    let baseline_local = result.baseline.local_balance_msat;
+    let projected_local = result.projected.local_balance_msat;
+    let delta = projected_local as i128 - baseline_local as i128;
+    let mut summary = format!(
+        "Simulated a rebalance of {} sats from channel {} to {}. ",
+        amount / 1000,
+        &from[..from.len().min(8)],
+        &to[..to.len().min(8)],
+    );
+    summary.push_str(&format!(
+        "Baseline local balance: {} msat. Projected local balance: {} msat. ",
+        baseline_local, projected_local,
+    ));
+    if delta > 0 {
+        summary.push_str(&format!("Net increase: +{} msat. ", delta));
+    } else if delta < 0 {
+        summary.push_str(&format!("Net decrease: {} msat. ", delta));
+    } else {
+        summary.push_str("No net change. ");
+    }
+    let has_assumptions = !result.assumptions.is_empty();
+    if has_assumptions {
+        summary.push_str("Assumptions: ");
+        for a in &result.assumptions {
+            summary.push_str(&format!("[{}] {}; ", a.code, a.description));
+        }
+    }
+    let has_warnings = !result.warnings.is_empty();
+    if has_warnings {
+        summary.push_str("Warnings: ");
+        for w in &result.warnings {
+            summary.push_str(&format!("[{}] {}; ", w.code, w.description));
+        }
+    }
+    summary.push_str(&format!("Confidence: {}. ", result.confidence.as_str()));
+    summary.push_str("This is a deterministic projection. Rieko did not execute any action.");
+    summary
+}
+
+pub fn simulation_report(
+    view: &SimulationView,
+    version: &str,
+    now: DateTime<Utc>,
+) -> SimulationReport {
+    SimulationReport {
+        rieko_version: version.into(),
+        model_id: view.model_id.clone(),
+        model_version: view.model_version.clone(),
+        simulation_id: view.id.clone(),
+        input_hash: view.input_hash.clone(),
+        recommendation_id: view.recommendation_id.clone(),
+        finding_id: view.finding_id.clone(),
+        snapshot_observed_at: view.source_observed_at,
+        parameters: view.parameters.clone(),
+        baseline: view.result.as_ref().map(|r| r.baseline.clone()),
+        projected: view.result.as_ref().map(|r| r.projected.clone()),
+        deltas: view
+            .result
+            .as_ref()
+            .map(|r| r.deltas.clone())
+            .unwrap_or_default(),
+        assumptions: view
+            .result
+            .as_ref()
+            .map(|r| r.assumptions.clone())
+            .unwrap_or_default(),
+        warnings: view
+            .result
+            .as_ref()
+            .map(|r| r.warnings.clone())
+            .unwrap_or_default(),
+        confidence: view.confidence,
+        stale: view.stale,
+        explanation: view.explanation.clone(),
+        generated_at: now,
+        no_action_executed: view.no_action_executed,
+    }
 }
 
 #[cfg(test)]

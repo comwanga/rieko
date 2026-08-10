@@ -191,6 +191,7 @@ async fn creates_reuses_and_reports_a_stable_projection() {
             "completed_at",
             "confidence",
             "error_code",
+            "explanation",
             "finding_id",
             "id",
             "input_hash",

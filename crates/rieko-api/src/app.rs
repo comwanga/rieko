@@ -162,7 +162,7 @@ impl RiekoApi {
             )
             .route(
                 "/api/v2/simulations/:simulation_id/report",
-                axum::routing::get(crate::routes::simulation_view_by_id),
+                axum::routing::get(crate::routes::simulation_report_by_id),
             )
             .route(
                 "/api/v2/simulations/compare",
