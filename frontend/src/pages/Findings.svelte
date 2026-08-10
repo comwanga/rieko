@@ -25,7 +25,7 @@
 {:else}
   <table>
     <thead>
-      <tr><th>Severity</th><th>State</th><th>Detector</th><th>Channel</th><th>Ratio</th><th>Last seen</th></tr>
+      <tr><th scope="col">Severity</th><th scope="col">State</th><th scope="col">Detector</th><th scope="col">Channel</th><th scope="col">Ratio</th><th scope="col">Last seen</th></tr>
     </thead>
     <tbody>
       {#each $q.data ?? [] as f}

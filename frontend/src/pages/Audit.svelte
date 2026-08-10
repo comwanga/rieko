@@ -39,7 +39,7 @@
 {:else}
   <table>
     <thead>
-      <tr><th>Stage</th><th>Type</th><th>Action</th><th>Actor</th><th>Details</th><th>Time</th></tr>
+      <tr><th scope="col">Stage</th><th scope="col">Type</th><th scope="col">Action</th><th scope="col">Actor</th><th scope="col">Details</th><th scope="col">Time</th></tr>
     </thead>
     <tbody>
       {#each $q.data ?? [] as e}

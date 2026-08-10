@@ -16,6 +16,28 @@ export async function get<T>(path: string): Promise<T> {
   return (await resp.json()) as T;
 }
 
+export async function post<T>(path: string, body: unknown): Promise<T> {
+  const resp = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.message === "string") detail = parsed.message;
+    } catch {
+      /* use raw text */
+    }
+    throw new Error(`${resp.status} ${detail}`);
+  }
+  return (await resp.json()) as T;
+}
+
+// ─── Base types shared across routes ───
+
 export type Severity = "Info" | "Warning" | "Critical";
 export type ActionStage =
   | "Recommended"
@@ -53,6 +75,8 @@ export interface OperationTimes {
   attempt: string | null;
   success: string | null;
 }
+
+// ─── Finding ───
 
 export interface Finding {
   id: string;
@@ -102,6 +126,8 @@ export interface FindingProvenance {
       };
 }
 
+// ─── Recommendation ───
+
 export interface Recommendation {
   finding_id: string;
   action: {
@@ -116,6 +142,8 @@ export interface Recommendation {
   };
 }
 
+// ─── ChannelSnapshot ───
+
 export interface ChannelSnapshot {
   node_id: string | null;
   network: "mainnet" | "testnet" | "signet" | "regtest" | null;
@@ -129,29 +157,116 @@ export interface ChannelSnapshot {
   ts: string;
 }
 
-export interface Simulation {
+// ─── Simulation domain types ───
+
+export type SimulationStatus =
+  | "requested"
+  | "completed"
+  | "unsupported"
+  | "invalid_input"
+  | "stale"
+  | "failed";
+
+export type SimulationConfidence = "high" | "medium" | "low" | "unknown";
+
+export type SimulationNoticeSeverity = "info" | "warning" | "critical";
+
+export interface LiquidityRedistributionParameters {
+  source_channel: string;
+  destination_channel: string;
+  amount_msat: number;
+}
+
+export interface ProjectedState {
+  local_ratio: number;
+  local_balance_msat: number;
+  remote_balance_msat: number;
+  capacity_msat: number;
+}
+
+export interface ProjectedDelta {
+  channel_id: string;
+  local_before_msat: number;
+  local_after_msat: number;
+  remote_before_msat: number;
+  remote_after_msat: number;
+  delta_msat: number;
+  clears_finding: boolean;
+}
+
+export interface Assumption {
+  code: string;
+  description: string;
+  severity: SimulationNoticeSeverity;
+}
+
+export interface SimulationWarning {
+  code: string;
+  description: string;
+  severity: SimulationNoticeSeverity;
+}
+
+export interface SimulationResult {
+  model_id: string;
+  model_version: string;
+  input_hash: string;
+  baseline: ProjectedState;
+  projected: ProjectedState;
+  deltas: ProjectedDelta[];
+  assumptions: Assumption[];
+  warnings: SimulationWarning[];
+  confidence: SimulationConfidence;
+}
+
+export interface SimulationView {
   id: string;
   recommendation_id: string;
   finding_id: string;
   action_type: string;
-  status: "requested" | "completed" | "unsupported" | "invalid_input" | "stale" | "failed";
+  status: SimulationStatus;
   model_id: string;
   model_version: string;
   input_hash: string;
-  parameters: {
-    source_channel: string;
-    destination_channel: string;
-    amount_msat: number;
-  };
+  parameters: LiquidityRedistributionParameters;
   source_observed_at: string;
   stale: boolean;
-  confidence: "high" | "medium" | "low" | "unknown";
-  result: unknown | null;
-  no_action_executed: true;
+  confidence: SimulationConfidence;
+  result: SimulationResult | null;
+  error_code: string | null;
   requested_at: string;
   completed_at: string | null;
-  error_code: string | null;
+  no_action_executed: boolean;
 }
+
+export interface CreateSimulationCommand {
+  recommendation_id: string;
+  model_id: string;
+  source_channel: string;
+  destination_channel: string;
+  amount_sats: number;
+  allow_stale?: boolean;
+}
+
+export interface CreateSimulationOutcome {
+  simulation: SimulationView;
+  reused: boolean;
+}
+
+export interface SimulationComparison {
+  recommendation_id: string;
+  left: SimulationView;
+  right: SimulationView;
+  projected_local_ratio_delta: number;
+  projected_local_balance_delta_msat: number;
+  no_action_executed: boolean;
+}
+
+export interface CompareSimulationsCommand {
+  left_simulation_id: string;
+  right_simulation_id: string;
+}
+
+// ─── Audit ───
 
 export interface AuditEntry {
   id: string;
