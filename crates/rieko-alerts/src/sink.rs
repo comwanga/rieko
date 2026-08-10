@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use rieko_findings::Severity;
 use thiserror::Error;
 
+use crate::state::DeliveryOutcome;
+
 /// A human-facing alert derived from a finding. `dedup_key` identifies an
 /// alert for cooldown purposes; it is derived from the finding's dedup key
 /// plus severity so identical anomalies don't spam (D9).
@@ -42,5 +44,5 @@ pub enum AlertError {
 
 /// Where alerts go (Telegram, and later email/webhook/API).
 pub trait AlertSink {
-    fn send(&mut self, alert: &Alert) -> Result<(), AlertError>;
+    fn send(&mut self, alert: &Alert) -> Result<DeliveryOutcome, AlertError>;
 }

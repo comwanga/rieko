@@ -1724,6 +1724,33 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             .map(|_| ())
             .map_err(|e| OperationalStateError::Store(e.to_string()))
     }
+
+    fn update_operational_state(
+        &mut self,
+        f: &dyn Fn(&mut rieko_status::OperationalState),
+    ) -> Result<(), rieko_status::OperationalStateError> {
+        use rieko_status::OperationalStateError;
+        if !self.in_transaction {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+        }
+        let result = (|| -> Result<(), OperationalStateError> {
+            let mut state = self.read_operational_state()?.unwrap_or_default();
+            f(&mut state);
+            self.write_operational_state(&state)
+        })();
+        if !self.in_transaction {
+            if result.is_ok() {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| OperationalStateError::Store(e.to_string()))?;
+            } else {
+                self.conn.execute_batch("ROLLBACK").ok();
+            }
+        }
+        result
+    }
 }
 
 fn parse_source(s: &str, connected: Option<i64>) -> Result<rieko_status::SourceState, String> {

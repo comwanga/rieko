@@ -128,15 +128,6 @@ fn load_fixture(path: &Path, local: &NodeId) -> Result<Vec<rieko_domain::Channel
         .collect()
 }
 
-fn read_operational_state<S: rieko_status::OperationalStateStore>(
-    storage: &S,
-) -> Result<rieko_status::OperationalState> {
-    storage
-        .read_operational_state()
-        .context("reading operational state")
-        .map(|state| state.unwrap_or_default())
-}
-
 fn source_state(source: &GraphSource, connected: bool) -> rieko_status::SourceState {
     if source.lnd_rest.is_some() {
         rieko_status::SourceState::LndRest { connected }
@@ -149,16 +140,15 @@ pub fn record_ingestion_attempt<S: rieko_status::OperationalStateStore>(
     storage: &mut S,
     source: &GraphSource,
 ) -> Result<()> {
-    let mut state = read_operational_state(storage)?;
-    let was_connected = matches!(
-        state.source,
-        rieko_status::SourceState::LndRest { connected: true }
-    );
-    state.source = source_state(source, was_connected);
-    state.last_ingestion_attempt = Some(chrono::Utc::now());
-    storage
-        .write_operational_state(&state)
-        .context("recording ingestion attempt")?;
+    let source = source.clone();
+    storage.update_operational_state(&|state: &mut _| {
+        let was_connected = matches!(
+            state.source,
+            rieko_status::SourceState::LndRest { connected: true }
+        );
+        state.source = super::common::source_state(&source, was_connected);
+        state.last_ingestion_attempt = Some(chrono::Utc::now());
+    })?;
     Ok(())
 }
 
@@ -167,14 +157,15 @@ pub fn record_ingestion_success<S: rieko_status::OperationalStateStore>(
     source: &GraphSource,
     source_data_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    let source = source.clone();
     let now = chrono::Utc::now();
-    let mut state = read_operational_state(storage)?;
-    state.source = source_state(source, true);
-    state.last_ingestion_success = Some(now);
-    state.source_data_at = source_data_at;
-    storage
-        .write_operational_state(&state)
-        .context("recording ingestion success")?;
+    storage.update_operational_state(&|state: &mut _| {
+        state.source = super::common::source_state(&source, true);
+        state.last_ingestion_success = Some(now);
+        if source_data_at.is_some() {
+            state.source_data_at = source_data_at;
+        }
+    })?;
     Ok(())
 }
 
@@ -182,11 +173,10 @@ pub fn record_ingestion_failure<S: rieko_status::OperationalStateStore>(
     storage: &mut S,
     source: &GraphSource,
 ) -> Result<()> {
-    let mut state = read_operational_state(storage)?;
-    state.source = source_state(source, false);
-    storage
-        .write_operational_state(&state)
-        .context("recording ingestion failure")?;
+    let source = source.clone();
+    storage.update_operational_state(&|state: &mut _| {
+        state.source = super::common::source_state(&source, false);
+    })?;
     Ok(())
 }
 
@@ -211,11 +201,10 @@ pub fn newest_source_data_at(graph: &dyn GraphView) -> Option<chrono::DateTime<c
 }
 
 pub fn record_cycle_attempt<S: rieko_status::OperationalStateStore>(storage: &mut S) -> Result<()> {
-    let mut state = read_operational_state(storage)?;
-    state.last_cycle_attempt = Some(chrono::Utc::now());
-    storage
-        .write_operational_state(&state)
-        .context("recording cycle attempt")?;
+    let now = chrono::Utc::now();
+    storage.update_operational_state(&|state: &mut _| {
+        state.last_cycle_attempt = Some(now);
+    })?;
     Ok(())
 }
 
@@ -224,22 +213,59 @@ pub fn record_cycle_attempt<S: rieko_status::OperationalStateStore>(storage: &mu
 pub fn record_component<S: rieko_status::OperationalStateStore>(
     storage: &mut S,
     kind: ComponentKind,
-    state: rieko_status::ComponentState,
+    component_state: rieko_status::ComponentState,
 ) -> Result<()> {
-    let mut op = read_operational_state(storage)?;
-    match kind {
-        ComponentKind::Llm => op.llm = state,
-        ComponentKind::AlertSink => op.alert_sink = state,
-    }
-    storage
-        .write_operational_state(&op)
-        .context("recording operational state")?;
+    storage.update_operational_state(&|op: &mut _| match kind {
+        ComponentKind::Llm => op.llm = component_state,
+        ComponentKind::AlertSink => op.alert_sink = component_state,
+    })?;
     Ok(())
 }
 
 pub enum ComponentKind {
     Llm,
     AlertSink,
+}
+
+/// Run channel_snapshot retention cleanup at most once per
+/// `policy.cleanup_interval`. Uses the persisted `last_cleanup_success` so the
+/// schedule survives restarts and is shared by both `scan` and `monitor`.
+/// Returns `true` when a cleanup pass actually executed.
+pub fn run_cleanup_if_due<S: Storage + rieko_status::OperationalStateStore>(
+    storage: &mut S,
+    policy: &rieko_storage::RetentionPolicy,
+) -> Result<bool> {
+    let now = chrono::Utc::now();
+    let last = storage
+        .read_operational_state()
+        .unwrap_or(None)
+        .and_then(|op| op.last_cleanup_success);
+    let interval =
+        chrono::Duration::from_std(policy.cleanup_interval).unwrap_or(chrono::Duration::zero());
+    if last.is_some_and(|t| now - t < interval) {
+        return Ok(false);
+    }
+    storage.update_operational_state(&|op: &mut _| {
+        op.last_cleanup_attempt = Some(now);
+    })?;
+    let outcome = storage
+        .prune_channel_snapshots(policy, now)
+        .map_err(|e| anyhow!("cleanup: {}", e));
+    storage.update_operational_state(&|op: &mut _| match &outcome {
+        Ok(summary) => {
+            op.cleanup = rieko_status::ComponentState::Healthy;
+            op.last_cleanup_success = Some(now);
+            info!(
+                deleted_snapshots = summary.deleted_snapshots,
+                "retention cleanup complete"
+            );
+        }
+        Err(e) => {
+            op.cleanup = rieko_status::ComponentState::Failing;
+            warn!(error = %e, "retention cleanup failed");
+        }
+    })?;
+    outcome.map(|_| true)
 }
 
 /// Shared per-finding pipeline used by scan and monitor: persist, ask the LLM
@@ -365,12 +391,10 @@ fn record_cycle_success<S: Storage + rieko_status::OperationalStateStore>(
     storage: &mut S,
 ) -> Result<()> {
     let now = chrono::Utc::now();
-    let mut state = read_operational_state(storage)?;
-    state.last_cycle_success = Some(now);
-    state.last_persist_success = Some(now);
-    storage
-        .write_operational_state(&state)
-        .context("recording cycle completion")?;
+    storage.update_operational_state(&|state: &mut _| {
+        state.last_cycle_success = Some(now);
+        state.last_persist_success = Some(now);
+    })?;
     Ok(())
 }
 

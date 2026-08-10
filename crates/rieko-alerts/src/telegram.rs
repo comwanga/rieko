@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::sink::{Alert, AlertError, AlertSink};
+use crate::state::DeliveryOutcome;
 
 /// Default Telegram Bot API base URL. Overridable for tests / self-hosted
 /// proxies via [`TelegramSink::with_endpoint`].
@@ -172,10 +173,8 @@ impl TelegramSink {
 }
 
 impl AlertSink for TelegramSink {
-    fn send(&mut self, alert: &Alert) -> Result<(), AlertError> {
+    fn send(&mut self, alert: &Alert) -> Result<DeliveryOutcome, AlertError> {
         let text = self.build_text(alert);
-        // The token is embedded in the URL; keep it out of any error we raise
-        // and never let reqwest's raw error (which can echo the URL) surface.
         let url = format!("{}/bot{}/sendMessage", self.endpoint, self.token);
         let payload = serde_json::json!({
             "chat_id": self.chat_id,
@@ -183,6 +182,7 @@ impl AlertSink for TelegramSink {
             "parse_mode": "Markdown",
         });
         self.send_with_retry(&url, &payload)
+            .map(|()| DeliveryOutcome::Delivered)
     }
 }
 
