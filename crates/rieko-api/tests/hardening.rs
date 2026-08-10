@@ -221,6 +221,7 @@ async fn findings_lifecycle_filter_defaults_active_and_validates_input() {
         .unwrap();
     mem.resolve_findings_for_scope(&FindingCycleScope {
         detector: "old_detector".into(),
+        network: None,
         node: Some("local-node".into()),
         complete: true,
     })

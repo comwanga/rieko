@@ -25,7 +25,7 @@
   function detailsText(d: unknown) {
     if (typeof d === "object" && d !== null) {
       const finding = (d as Record<string, unknown>).finding_id;
-      return finding ? `finding ${finding.slice(0, 8)}…` : "";
+      return typeof finding === "string" ? `finding ${finding.slice(0, 8)}…` : "";
     }
     return "";
   }

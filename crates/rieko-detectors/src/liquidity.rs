@@ -1,7 +1,7 @@
 use chrono::Utc;
-use rieko_domain::{LiquidityImbalance, NodeId};
+use rieko_domain::{ChannelSnapshot, LiquidityImbalance, NodeId};
 use rieko_findings::{
-    channel_state_digest, finding_identity, ChannelSnapshotReference, Evidence, Finding,
+    channel_snapshot_state_digest, finding_identity, ChannelSnapshotReference, Evidence, Finding,
     FindingProvenance, ObservationReference, Severity,
 };
 use rieko_graph::GraphView;
@@ -114,10 +114,12 @@ impl Detector for LiquidityDetector {
             ];
 
             let now = Utc::now();
+            let snapshot = ChannelSnapshot::from_channel(channel, channel.last_seen, ctx.network);
             findings.push(Finding {
                 id: finding_identity(
                     self.id(),
                     self.version(),
+                    Some(ctx.network),
                     Some(self.local_node.as_ref()),
                     Some(channel.id.as_ref()),
                 ),
@@ -129,13 +131,15 @@ impl Detector for LiquidityDetector {
                 channel: Some(channel.id.to_string()),
                 evidence,
                 provenance: ctx.source.map(|source| FindingProvenance {
+                    network: Some(ctx.network),
                     source: source.clone(),
                     producers: provenance_producers(ctx.normalizer, self),
                     observation: ObservationReference::ChannelState {
                         channel_id: channel.id.to_string(),
                         snapshot: ChannelSnapshotReference {
+                            network: snapshot.network,
                             observed_at: channel.last_seen,
-                            state_digest: channel_state_digest(channel),
+                            state_digest: channel_snapshot_state_digest(&snapshot),
                         },
                     },
                 }),
@@ -168,11 +172,17 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use rieko_domain::{Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId};
+    use rieko_domain::{
+        BitcoinNetwork, Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
+    };
     use rieko_graph::{GraphStore, InMemoryGraph};
 
     use super::*;
     use crate::registry::DetectorContext;
+
+    fn no_context() -> DetectorContext<'static> {
+        DetectorContext::no_context(BitcoinNetwork::Regtest)
+    }
 
     fn channel(id: &str, local: u64, remote: u64) -> Channel {
         let capacity = local + remote;
@@ -227,14 +237,14 @@ mod tests {
     fn balanced_channel_is_silent() {
         let g = graph_with(vec![channel("c1", 50_000, 50_000)]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d.run(&g, &no_context()).is_empty());
     }
 
     #[test]
     fn outbound_drained_yields_warning() {
         let g = graph_with(vec![channel("c1", 8_000, 92_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g, &DetectorContext::no_context());
+        let findings = d.run(&g, &no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert_eq!(findings[0].channel.as_deref(), Some("c1"));
@@ -244,7 +254,7 @@ mod tests {
     fn critically_drained_yields_critical() {
         let g = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g, &DetectorContext::no_context());
+        let findings = d.run(&g, &no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(
@@ -259,7 +269,7 @@ mod tests {
         c.status = ChannelStatus::Closed;
         let g = graph_with(vec![c]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d.run(&g, &no_context()).is_empty());
     }
 
     #[test]
@@ -269,7 +279,7 @@ mod tests {
             channel("c2", 1_000, 99_000),
         ]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g, &DetectorContext::no_context());
+        let findings = d.run(&g, &no_context());
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].severity, Severity::Critical);
     }
@@ -286,7 +296,7 @@ mod tests {
         )]);
         let d = LiquidityDetector::new("local-node");
         assert!(
-            d.run(&g, &DetectorContext::no_context()).is_empty(),
+            d.run(&g, &no_context()).is_empty(),
             "zero-capacity channel must not be flagged drained"
         );
     }
@@ -300,7 +310,7 @@ mod tests {
         )]);
         let d = LiquidityDetector::new("local-node");
         assert!(
-            d.run(&g, &DetectorContext::no_context()).is_empty(),
+            d.run(&g, &no_context()).is_empty(),
             "a balance above capacity is invalid data, not InboundDrained"
         );
     }
@@ -314,7 +324,7 @@ mod tests {
         )]);
         let d = LiquidityDetector::new("local-node");
         assert!(
-            d.run(&g, &DetectorContext::no_context()).is_empty(),
+            d.run(&g, &no_context()).is_empty(),
             "missing balance data is Unknown, not drained and not healthy"
         );
     }
@@ -325,7 +335,7 @@ mod tests {
         c.status = ChannelStatus::Inactive;
         let g = graph_with(vec![c]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d.run(&g, &no_context()).is_empty());
     }
 
     #[test]
@@ -334,7 +344,7 @@ mod tests {
         c.status = ChannelStatus::ForceClosing;
         let g = graph_with(vec![c]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d.run(&g, &no_context()).is_empty());
     }
 
     #[test]
@@ -342,27 +352,18 @@ mod tests {
         // 0.02 (< 0.03) is Critical and below the severity gate -> stays Critical.
         let g = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Critical
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Critical);
 
         // 0.03 is below the detector's strict critical bar (0.05) on the
         // drained side -> Critical.
         let g = graph_with(vec![channel("c1", 3_000, 97_000)]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Critical
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Critical);
 
         // 0.06 sits between the critical bar and the drain floor -> Warning.
         let g = graph_with(vec![channel("c1", 6_000, 94_000)]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Warning
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Warning);
 
         // 0.05 == critical_ratio: the bar is strict (`<`), so an exact hit is
         // Warning, not Critical.
@@ -372,10 +373,7 @@ mod tests {
             LiquidityProfile::compute(100_000, 5_000, 95_000),
         )]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Warning
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Warning);
 
         // 0.0499 < critical_ratio: below the bar on the drained side -> Critical.
         let g = graph_with(vec![raw_channel(
@@ -384,10 +382,7 @@ mod tests {
             LiquidityProfile::compute(100_000, 4_990, 95_010),
         )]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Critical
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Critical);
 
         // Mirror on the inbound side: 0.98 (> 1 - 0.05) is Critical, 0.94 is not.
         let g = graph_with(vec![raw_channel(
@@ -396,20 +391,14 @@ mod tests {
             LiquidityProfile::compute(100_000, 98_000, 2_000),
         )]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Critical
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Critical);
         let g = graph_with(vec![raw_channel(
             "c1",
             100_000,
             LiquidityProfile::compute(100_000, 94_000, 6_000),
         )]);
         let d = LiquidityDetector::new("local-node");
-        assert_eq!(
-            d.run(&g, &DetectorContext::no_context())[0].severity,
-            Severity::Warning
-        );
+        assert_eq!(d.run(&g, &no_context())[0].severity, Severity::Warning);
 
         // Exactly 0.10 is Balanced (drain floor is strict): silent.
         let g = graph_with(vec![raw_channel(
@@ -418,7 +407,7 @@ mod tests {
             LiquidityProfile::compute(100_000, 10_000, 90_000),
         )]);
         let d = LiquidityDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d.run(&g, &no_context()).is_empty());
     }
 
     #[test]
@@ -427,7 +416,7 @@ mod tests {
         // signal rather than proof of a fault.
         let g = graph_with(vec![channel("c1", 6_000, 94_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g, &DetectorContext::no_context());
+        let findings = d.run(&g, &no_context());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         let explanation = findings[0].explanation.as_deref().unwrap_or("");
@@ -442,8 +431,8 @@ mod tests {
     fn evidence_is_stable_and_shows_how_it_was_calculated() {
         let g = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let d = LiquidityDetector::new("local-node");
-        let a = d.run(&g, &DetectorContext::no_context());
-        let b = d.run(&g, &DetectorContext::no_context());
+        let a = d.run(&g, &no_context());
+        let b = d.run(&g, &no_context());
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.evidence, y.evidence, "evidence must be deterministic");
@@ -470,8 +459,8 @@ mod tests {
         let warning = graph_with(vec![channel("c1", 8_000, 92_000)]);
         let critical = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let detector = LiquidityDetector::new("local-node");
-        let warning = detector.run(&warning, &DetectorContext::no_context());
-        let critical = detector.run(&critical, &DetectorContext::no_context());
+        let warning = detector.run(&warning, &no_context());
+        let critical = detector.run(&critical, &no_context());
         assert_eq!(warning[0].id, critical[0].id);
         assert_ne!(warning[0].severity, critical[0].severity);
         assert_ne!(warning[0].evidence, critical[0].evidence);
@@ -490,6 +479,7 @@ mod tests {
             role: rieko_findings::ProducerRole::Normalizer,
         };
         let context = DetectorContext {
+            network: BitcoinNetwork::Signet,
             history: None,
             source: Some(&source),
             normalizer: Some(&normalizer),
@@ -501,11 +491,21 @@ mod tests {
         assert!(cycle.scope.complete);
         let provenance = cycle.findings[0].provenance.as_ref().unwrap();
         assert_eq!(provenance.source, source);
+        assert_eq!(provenance.network, Some(BitcoinNetwork::Signet));
         assert_eq!(provenance.producers.len(), 2);
-        assert!(matches!(
-            provenance.observation,
-            rieko_findings::ObservationReference::ChannelState { .. }
-        ));
+        let rieko_findings::ObservationReference::ChannelState { snapshot, .. } =
+            &provenance.observation
+        else {
+            panic!("expected channel state provenance");
+        };
+        let channel = graph.channels()[0];
+        let expected =
+            ChannelSnapshot::from_channel(channel, channel.last_seen, BitcoinNetwork::Signet);
+        assert_eq!(snapshot.network, expected.network);
+        assert_eq!(
+            snapshot.state_digest,
+            channel_snapshot_state_digest(&expected)
+        );
     }
 
     #[test]
@@ -514,7 +514,7 @@ mod tests {
 
         let g = graph_with(vec![channel("c1", 2_000, 98_000)]);
         let d = LiquidityDetector::new("local-node");
-        let findings = d.run(&g, &DetectorContext::no_context());
+        let findings = d.run(&g, &no_context());
         assert!(!findings.is_empty());
 
         let engine = RecommendationEngine;

@@ -4,11 +4,12 @@
 //! lookup, lifecycle persistence, reuse, and transport-neutral public views.
 
 use chrono::{DateTime, Utc};
-use rieko_findings::{FindingLifecycle, Recommendation};
+use rieko_domain::BitcoinNetwork;
+use rieko_findings::{Finding, FindingLifecycle, ObservationReference, Recommendation};
 use rieko_simulation::model::{
-    compute_input_hash, LiquidityRedistributionModel, LiquidityRedistributionParameters,
-    ModelError, SimulationConfidence, SimulationInput, SimulationModel, SimulationResult,
-    SimulationStatus, DEFAULT_FRESHNESS,
+    compute_input_hash, FindingDirection, LiquidityRedistributionModel,
+    LiquidityRedistributionParameters, ModelError, SimulationConfidence, SimulationInput,
+    SimulationModel, SimulationResult, SimulationStatus, DEFAULT_FRESHNESS,
 };
 use rieko_storage::{SimulationEvent, SimulationRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
@@ -215,6 +216,11 @@ fn create_in_transaction(
             ),
         ));
     }
+    let finding_direction = if supported {
+        Some(parse_finding_direction(&finding)?)
+    } else {
+        None
+    };
     let node_id = required(finding.node, "finding has no node identity")
         .map_err(|error| context_or_unsupported(supported, error))?;
     let provenance = finding.provenance.ok_or_else(|| {
@@ -226,6 +232,8 @@ fn create_in_transaction(
             ),
         )
     })?;
+    let (network, observed_at) = referenced_observation(&provenance)
+        .map_err(|error| context_or_unsupported(supported, error))?;
     let finding_channel = required(finding.channel, "finding has no channel identity")
         .map_err(|error| context_or_unsupported(supported, error))?;
     let recommendation_target = required(
@@ -233,12 +241,21 @@ fn create_in_transaction(
         "recommendation has no channel target",
     )
     .map_err(|error| context_or_unsupported(supported, error))?;
-    let source_snapshot = latest_snapshot(storage, &node_id, &command.source_channel, "source")
-        .map_err(|error| context_or_unsupported(supported, error))?;
-    let destination_snapshot = latest_snapshot(
+    let source_snapshot = snapshot_at(
         storage,
+        network,
+        &node_id,
+        &command.source_channel,
+        observed_at,
+        "source",
+    )
+    .map_err(|error| context_or_unsupported(supported, error))?;
+    let destination_snapshot = snapshot_at(
+        storage,
+        network,
         &node_id,
         &command.destination_channel,
+        observed_at,
         "destination",
     )
     .map_err(|error| context_or_unsupported(supported, error))?;
@@ -247,7 +264,9 @@ fn create_in_transaction(
         recommendation_target,
         finding_id: recommendation.finding_id.clone(),
         finding_channel,
+        finding_direction,
         node_id,
+        network: Some(network),
         provenance,
         action_type: recommendation.action.action_type,
         model_id: model.model_id().into(),
@@ -285,7 +304,7 @@ fn create_in_transaction(
         if !(command.allow_stale && existing.status == "stale") {
             let view = simulation_view(&existing, Utc::now())?;
             return Err(SimulationAppError::with_simulation(
-                error_kind_for_status(view.status),
+                error_kind_for_view(&view),
                 format!(
                     "identical simulation request {} already ended with status {}",
                     existing.id,
@@ -353,6 +372,8 @@ fn evaluate_and_persist(
             Some(
                 if stale_refused {
                     "stale_input"
+                } else if input.is_future_at(requested_at) {
+                    "future_dated_input"
                 } else {
                     "invalid_input"
                 }
@@ -407,7 +428,7 @@ pub fn get_simulation(
     simulation_id: &str,
 ) -> Result<Option<SimulationView>, SimulationAppError> {
     storage
-        .simulation_v2_by_id(simulation_id)
+        .replayable_simulation_v2_by_id(simulation_id)
         .map_err(SimulationAppError::storage)?
         .map(|record| simulation_view(&record, Utc::now()))
         .transpose()
@@ -418,7 +439,7 @@ pub fn list_simulations(
     limit: u32,
 ) -> Result<Vec<SimulationView>, SimulationAppError> {
     storage
-        .recent_simulations_v2(limit)
+        .recent_replayable_simulations_v2(limit)
         .map_err(SimulationAppError::storage)?
         .iter()
         .map(|record| simulation_view(record, Utc::now()))
@@ -584,23 +605,86 @@ fn context_or_unsupported(
     }
 }
 
-fn latest_snapshot(
+fn snapshot_at(
     storage: &mut dyn Storage,
+    network: BitcoinNetwork,
     node_id: &str,
     channel_id: &str,
+    observed_at: DateTime<Utc>,
     role: &str,
 ) -> Result<rieko_domain::ChannelSnapshot, SimulationAppError> {
     storage
-        .recent_channel_snapshots_for_node(node_id, channel_id, 1)
+        .channel_snapshot_at(network, node_id, channel_id, observed_at)
         .map_err(SimulationAppError::storage)?
-        .into_iter()
-        .next()
         .ok_or_else(|| {
             SimulationAppError::new(
                 SimulationAppErrorKind::SnapshotNotFound,
-                format!("no snapshot for {role} channel {channel_id}"),
+                format!("no {network} snapshot for {role} channel {channel_id} at {observed_at}"),
             )
         })
+}
+
+fn referenced_observation(
+    provenance: &rieko_findings::FindingProvenance,
+) -> Result<(BitcoinNetwork, DateTime<Utc>), SimulationAppError> {
+    let network = provenance.network.ok_or_else(|| {
+        SimulationAppError::new(
+            SimulationAppErrorKind::MissingContext,
+            "finding provenance has no network identity",
+        )
+    })?;
+    let reference = match &provenance.observation {
+        ObservationReference::ChannelState { snapshot, .. } => snapshot,
+        ObservationReference::ChannelWindow { snapshots, .. } => snapshots
+            .iter()
+            .max_by_key(|snapshot| snapshot.observed_at)
+            .ok_or_else(|| {
+                SimulationAppError::new(
+                    SimulationAppErrorKind::MissingContext,
+                    "finding provenance has an empty observation window",
+                )
+            })?,
+    };
+    if reference.network != Some(network) {
+        return Err(SimulationAppError::new(
+            SimulationAppErrorKind::MissingContext,
+            "snapshot reference network does not match finding provenance",
+        ));
+    }
+    Ok((network, reference.observed_at))
+}
+
+fn parse_finding_direction(finding: &Finding) -> Result<FindingDirection, SimulationAppError> {
+    if finding.detector != "channel_liquidity" {
+        return Err(SimulationAppError::new(
+            SimulationAppErrorKind::UnsupportedRecommendation,
+            format!(
+                "finding detector {} is unsupported by this model",
+                finding.detector
+            ),
+        ));
+    }
+    let mut directions = finding
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.key == "direction");
+    let value = directions
+        .next()
+        .and_then(|evidence| evidence.value.as_str());
+    if value.is_none() || directions.next().is_some() {
+        return Err(SimulationAppError::new(
+            SimulationAppErrorKind::InvalidInput,
+            "finding must contain one string direction evidence value",
+        ));
+    }
+    match value {
+        Some("outbound") => Ok(FindingDirection::Outbound),
+        Some("inbound") => Ok(FindingDirection::Inbound),
+        _ => Err(SimulationAppError::new(
+            SimulationAppErrorKind::InvalidInput,
+            "finding direction must be outbound or inbound",
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -704,8 +788,11 @@ fn parse_status(status: &str) -> Result<SimulationStatus, SimulationAppError> {
     }
 }
 
-fn error_kind_for_status(status: SimulationStatus) -> SimulationAppErrorKind {
-    match status {
+fn error_kind_for_view(view: &SimulationView) -> SimulationAppErrorKind {
+    if view.error_code.as_deref() == Some("future_dated_input") {
+        return SimulationAppErrorKind::FutureDatedInput;
+    }
+    match view.status {
         SimulationStatus::Unsupported => SimulationAppErrorKind::UnsupportedRecommendation,
         SimulationStatus::InvalidInput => SimulationAppErrorKind::InvalidInput,
         SimulationStatus::Stale => SimulationAppErrorKind::StaleInput,
@@ -731,4 +818,134 @@ fn model_error(error: ModelError) -> SimulationAppError {
 
 fn json_error(error: serde_json::Error) -> SimulationAppError {
     SimulationAppError::new(SimulationAppErrorKind::Storage, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rieko_detectors::{Detector, DetectorContext, LiquidityDetector};
+    use rieko_domain::{
+        BitcoinNetwork, Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
+    };
+    use rieko_findings::{channel_snapshot_state_digest, ObservationSource};
+    use rieko_graph::{GraphStore, InMemoryGraph};
+    use rieko_recommendations::RecommendationEngine;
+    use rieko_storage::MemoryStorage;
+
+    fn channel(id: &str, local: u64, remote: u64, observed_at: DateTime<Utc>) -> Channel {
+        let mut liquidity = LiquidityProfile::compute(local + remote, local, remote);
+        liquidity.spendable_outbound_msat = local.saturating_sub(10_000);
+        liquidity.spendable_inbound_msat = remote.saturating_sub(10_000);
+        Channel {
+            id: id.into(),
+            node: NodeId::new("local-node"),
+            peer: NodeId::new(format!("peer-{id}")),
+            capacity_msat: local + remote,
+            fee_policy: FeePolicy::default(),
+            status: ChannelStatus::Active,
+            liquidity,
+            last_seen: observed_at,
+            opening_height: Some(1),
+            channel_point: format!("tx-{id}:0"),
+            local_reserve_msat: Some(10_000),
+            remote_reserve_msat: Some(10_000),
+            is_private: false,
+            is_initiator: true,
+            total_sent_msat: None,
+            total_received_msat: None,
+        }
+    }
+
+    #[test]
+    fn detector_recommendation_and_simulation_preserve_correct_outbound_direction() {
+        let observed_at = Utc::now();
+        let finding_channel = channel("c1", 50_000, 950_000, observed_at);
+        let source_channel = channel("c2", 500_000, 500_000, observed_at);
+        let mut graph = InMemoryGraph::new();
+        graph
+            .upsert_channels(vec![finding_channel.clone(), source_channel.clone()])
+            .unwrap();
+        let source = ObservationSource::Fixture {
+            redacted_hash: "fixture-hash".into(),
+        };
+        let detector = LiquidityDetector::new("local-node");
+        let cycle = detector
+            .evaluate(
+                &graph,
+                &DetectorContext {
+                    network: BitcoinNetwork::Regtest,
+                    history: None,
+                    source: Some(&source),
+                    normalizer: None,
+                    node: Some("local-node"),
+                },
+            )
+            .unwrap();
+        let finding = cycle.findings.into_iter().next().unwrap();
+        let recommendation = RecommendationEngine
+            .recommend(&finding)
+            .unwrap()
+            .into_iter()
+            .find(|recommendation| {
+                recommendation.action.action_type == rieko_findings::ActionType::RebalanceChannel
+            })
+            .unwrap();
+
+        let mut storage = MemoryStorage::new();
+        storage.save_finding(&finding).unwrap();
+        storage.save_recommendation(&recommendation).unwrap();
+        for channel in [&finding_channel, &source_channel] {
+            let mut snapshot = rieko_domain::ChannelSnapshot::from_channel(
+                channel,
+                observed_at,
+                BitcoinNetwork::Regtest,
+            );
+            snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+            storage.save_channel_snapshot(&snapshot).unwrap();
+        }
+        for channel in [
+            channel(
+                "c1",
+                10_000,
+                990_000,
+                observed_at + chrono::Duration::seconds(1),
+            ),
+            channel(
+                "c2",
+                900_000,
+                100_000,
+                observed_at + chrono::Duration::seconds(1),
+            ),
+        ] {
+            let mut snapshot = rieko_domain::ChannelSnapshot::from_channel(
+                &channel,
+                channel.last_seen,
+                BitcoinNetwork::Regtest,
+            );
+            snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+            storage.save_channel_snapshot(&snapshot).unwrap();
+        }
+
+        let outcome = create_simulation(
+            &mut storage,
+            CreateSimulationCommand {
+                recommendation_id: recommendation.action.id,
+                model_id: MODEL_ID.into(),
+                source_channel: "c2".into(),
+                destination_channel: "c1".into(),
+                amount_sats: 50,
+                allow_stale: false,
+            },
+        )
+        .unwrap();
+        let result = outcome.simulation.result.unwrap();
+        assert_eq!(result.baseline.local_balance_msat, 50_000);
+        assert_eq!(result.projected.local_balance_msat, 100_000);
+        assert!(result.deltas[1].clears_finding);
+        assert!(storage.latest_findings(10).unwrap()[0].lifecycle == FindingLifecycle::Active);
+        assert_eq!(
+            storage.latest_recommendations(10).unwrap()[0].action.stage,
+            rieko_findings::ActionStage::Recommended
+        );
+    }
 }

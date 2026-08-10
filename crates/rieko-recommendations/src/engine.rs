@@ -459,7 +459,7 @@ fn build_rebased_review(
                 "Confirm the imbalance is expected rather than a fault.".into(),
                 "Validate rebalancing cost and routing strategy before any action.".into(),
             ],
-            expected_effect: "If rebalancing is warranted, restoring the local balance could let the channel route payments in the drained direction again."
+            expected_effect: "If rebalancing is warranted, restoring capacity on the drained side could let the channel route payments in that direction again."
                 .into(),
             risks: vec![
                 "Rebalancing consumes on-chain fees and may not improve routing if demand is one-directional.".into(),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use rieko_domain::{Channel, ChannelId, ChannelSnapshot};
+use rieko_domain::{BitcoinNetwork, Channel, ChannelId, ChannelSnapshot};
 
 /// Read-only history consumed by detectors. Detectors never write history;
 /// the engine accumulates it each cycle.
@@ -37,9 +37,14 @@ impl InMemoryHistory {
         }
     }
 
-    pub fn push_channels(&mut self, channels: &[Channel], ts: chrono::DateTime<chrono::Utc>) {
+    pub fn push_channels(
+        &mut self,
+        channels: &[Channel],
+        ts: chrono::DateTime<chrono::Utc>,
+        network: BitcoinNetwork,
+    ) {
         for channel in channels {
-            self.push(ChannelSnapshot::from_channel(channel, ts));
+            self.push(ChannelSnapshot::from_channel(channel, ts, network));
         }
     }
 
@@ -75,6 +80,8 @@ mod tests {
         let local = (ratio * capacity as f64) as u64;
         ChannelSnapshot {
             node_id: Some("local-node".into()),
+            network: Some(BitcoinNetwork::Regtest),
+            state_digest: None,
             channel_id: id.to_string(),
             local_ratio: ratio,
             local_balance_msat: local,
@@ -131,7 +138,7 @@ mod tests {
             total_sent_msat: None,
             total_received_msat: None,
         }];
-        h.push_channels(&channels, chrono::Utc::now());
+        h.push_channels(&channels, chrono::Utc::now(), BitcoinNetwork::Regtest);
         assert_eq!(h.len(), 1);
     }
 }

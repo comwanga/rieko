@@ -183,6 +183,13 @@ pub struct LimitQuery {
     lifecycle: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SnapshotQuery {
+    limit: Option<u32>,
+    network: Option<rieko_domain::BitcoinNetwork>,
+    node_id: Option<String>,
+}
+
 fn limit(q: &LimitQuery) -> u32 {
     q.limit.unwrap_or(50).clamp(1, 500)
 }
@@ -563,11 +570,26 @@ pub async fn all_snapshots(
 pub async fn channel_snapshots(
     State(api): State<RiekoApi>,
     Path(channel_id): Path<String>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<SnapshotQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    if q.node_id.is_some() && q.network.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "node_id requires a network filter".into(),
+        ));
+    }
+    let row_limit = q.limit.unwrap_or(50).clamp(1, 500);
     let rows = block_storage(api.state.storage.clone(), move |s| {
-        s.recent_channel_snapshots(&channel_id, limit(&q))
-            .map_err(|e| e.to_string())
+        match q.network {
+            Some(network) => s.recent_channel_snapshots_for_network(
+                network,
+                q.node_id.as_deref(),
+                &channel_id,
+                row_limit,
+            ),
+            None => s.recent_channel_snapshots(&channel_id, row_limit),
+        }
+        .map_err(|e| e.to_string())
     })
     .await?;
     let out: Vec<Value> = rows

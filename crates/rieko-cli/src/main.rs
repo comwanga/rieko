@@ -105,4 +105,23 @@ mod tests {
         let expected: &[&str] = &["scan", "monitor", "status", "serve"];
         assert_eq!(got, expected, "got {got:?}");
     }
+
+    #[test]
+    fn scan_and_monitor_require_a_network() {
+        use super::Cli;
+        use clap::Parser;
+
+        for command in ["scan", "monitor"] {
+            assert!(Cli::try_parse_from(["rieko", command, "--fixture", "channels.json"]).is_err());
+            assert!(Cli::try_parse_from([
+                "rieko",
+                command,
+                "--network",
+                "signet",
+                "--fixture",
+                "channels.json",
+            ])
+            .is_ok());
+        }
+    }
 }

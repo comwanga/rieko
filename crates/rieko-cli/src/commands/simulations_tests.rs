@@ -1,9 +1,10 @@
 use super::*;
-use rieko_domain::{ChannelSnapshot, ChannelStatus};
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot, ChannelStatus};
 use rieko_findings::{
-    Action, ActionStage, ActionType, Actionability, ChannelSnapshotReference, Finding,
-    FindingLifecycle, FindingProvenance, ObservationReference, ObservationSource, Rationale,
-    Recommendation, Severity, FINDING_SCHEMA_VERSION,
+    channel_snapshot_state_digest, Action, ActionStage, ActionType, Actionability,
+    ChannelSnapshotReference, Evidence, Finding, FindingLifecycle, FindingProvenance,
+    ObservationReference, ObservationSource, Rationale, Recommendation, Severity,
+    FINDING_SCHEMA_VERSION,
 };
 use rieko_storage::Storage;
 
@@ -34,8 +35,10 @@ fn snapshot(
     remote: u64,
     ts: chrono::DateTime<chrono::Utc>,
 ) -> ChannelSnapshot {
-    ChannelSnapshot {
+    let mut snapshot = ChannelSnapshot {
         node_id: Some("local-node".into()),
+        network: Some(BitcoinNetwork::Regtest),
+        state_digest: None,
         channel_id: id.into(),
         local_ratio: local as f64 / (local + remote) as f64,
         local_balance_msat: local,
@@ -45,7 +48,9 @@ fn snapshot(
         ts,
         spendable_outbound_msat: local.saturating_sub(10_000),
         spendable_inbound_msat: remote.saturating_sub(10_000),
-    }
+    };
+    snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+    snapshot
 }
 
 fn seed_at(
@@ -73,8 +78,9 @@ fn seed_at_with_snapshots(
             schema_version: FINDING_SCHEMA_VERSION,
             node: Some("local-node".into()),
             channel: Some("c1".into()),
-            evidence: Vec::new(),
+            evidence: vec![Evidence::text("direction", "inbound")],
             provenance: Some(FindingProvenance {
+                network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
                 },
@@ -82,8 +88,14 @@ fn seed_at_with_snapshots(
                 observation: ObservationReference::ChannelState {
                     channel_id: "c1".into(),
                     snapshot: ChannelSnapshotReference {
+                        network: Some(BitcoinNetwork::Regtest),
                         observed_at,
-                        state_digest: "state-hash".into(),
+                        state_digest: channel_snapshot_state_digest(&snapshot(
+                            "c1",
+                            950_000,
+                            50_000,
+                            observed_at,
+                        )),
                     },
                 },
             }),
@@ -97,10 +109,10 @@ fn seed_at_with_snapshots(
     storage.save_recommendation(&recommendation).unwrap();
     if include_snapshots {
         storage
-            .save_channel_snapshot(&snapshot("c1", 200_000, 800_000, observed_at))
+            .save_channel_snapshot(&snapshot("c1", 950_000, 50_000, observed_at))
             .unwrap();
         storage
-            .save_channel_snapshot(&snapshot("c2", 700_000, 300_000, observed_at))
+            .save_channel_snapshot(&snapshot("c2", 200_000, 800_000, observed_at))
             .unwrap();
     }
     recommendation

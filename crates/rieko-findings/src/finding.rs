@@ -1,3 +1,4 @@
+use rieko_domain::BitcoinNetwork;
 use serde::{Deserialize, Serialize};
 
 /// Origin of the raw observation from which finding evidence was produced.
@@ -34,6 +35,8 @@ pub struct ProducerVersion {
 /// Immutable reference to one observed channel snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelSnapshotReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<BitcoinNetwork>,
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub state_digest: String,
 }
@@ -58,6 +61,8 @@ pub enum ObservationReference {
 /// observation reference describes one immutable observed state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<BitcoinNetwork>,
     pub source: ObservationSource,
     pub producers: Vec<ProducerVersion>,
     pub observation: ObservationReference,
@@ -68,6 +73,8 @@ pub struct FindingProvenance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingCycleScope {
     pub detector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<BitcoinNetwork>,
     pub node: Option<String>,
     pub complete: bool,
 }
@@ -219,6 +226,7 @@ mod tests {
 
     fn provenance() -> FindingProvenance {
         FindingProvenance {
+            network: Some(BitcoinNetwork::Signet),
             source: ObservationSource::Lnd {
                 redacted_endpoint: "https://lnd.example:8080".into(),
                 configured_node: "node-a".into(),
@@ -231,6 +239,7 @@ mod tests {
             observation: ObservationReference::ChannelWindow {
                 channel_id: "channel-a".into(),
                 snapshots: vec![ChannelSnapshotReference {
+                    network: Some(BitcoinNetwork::Signet),
                     observed_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                     state_digest: "abc123".into(),
                 }],
@@ -258,6 +267,23 @@ mod tests {
             serde_json::from_value::<Finding>(json).unwrap().provenance,
             None
         );
+    }
+
+    #[test]
+    fn absent_network_deserializes_for_legacy_provenance() {
+        let mut json = serde_json::to_value(provenance()).unwrap();
+        json.as_object_mut().unwrap().remove("network");
+        json["observation"]["snapshots"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("network");
+
+        let provenance: FindingProvenance = serde_json::from_value(json).unwrap();
+        assert_eq!(provenance.network, None);
+        let ObservationReference::ChannelWindow { snapshots, .. } = provenance.observation else {
+            panic!("expected channel window");
+        };
+        assert_eq!(snapshots[0].network, None);
     }
 
     #[test]

@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
 use rieko_detectors::{Detector, DetectorContext, DriftDetector, LiquidityDetector};
-use rieko_findings::Finding;
+use rieko_domain::BitcoinNetwork;
+use rieko_findings::{channel_snapshot_state_digest, Finding};
 use rieko_graph::{GraphView, InMemoryGraph, InMemoryHistory};
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_status::OperationalStateStore;
@@ -33,6 +34,10 @@ impl Default for RetryPolicy {
 
 #[derive(Args, Debug)]
 pub struct MonitorArgs {
+    /// Bitcoin network observed by this source.
+    #[arg(long, value_name = "NETWORK")]
+    network: BitcoinNetwork,
+
     /// Path to a JSON fixture matching the LND `/v1/channels` response.
     #[arg(long, value_name = "FILE")]
     fixture: Option<PathBuf>,
@@ -99,6 +104,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         .with_context(|| format!("locking db {}", db_path.display()))?;
 
     let source = GraphSource {
+        network: args.network,
         fixture: args.fixture.clone(),
         lnd_rest: args.lnd_rest.clone(),
         macaroon: args.macaroon.clone(),
@@ -208,7 +214,15 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         let channels = graph.channels();
         let snapshots: Vec<_> = channels
             .iter()
-            .map(|channel| rieko_domain::ChannelSnapshot::from_channel(channel, channel.last_seen))
+            .map(|channel| {
+                let mut snapshot = rieko_domain::ChannelSnapshot::from_channel(
+                    channel,
+                    channel.last_seen,
+                    source.network,
+                );
+                snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+                snapshot
+            })
             .collect();
         for snapshot in &snapshots {
             history.push(snapshot.clone());
@@ -216,6 +230,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
         let observation_source = source.observation_source()?;
         let ctx = DetectorContext {
+            network: source.network,
             history: Some(&history),
             source: Some(&observation_source),
             normalizer: Some(&normalizer),
@@ -411,8 +426,12 @@ mod tests {
 
     fn live_source() -> GraphSource {
         GraphSource {
+            network: BitcoinNetwork::Regtest,
+            fixture: None,
             lnd_rest: Some("https://localhost:8080".into()),
-            ..Default::default()
+            macaroon: None,
+            tls_cert: None,
+            node: "local-node".into(),
         }
     }
 
@@ -489,8 +508,12 @@ mod tests {
     fn fixture_failure_is_not_retried() {
         let mut storage = MemoryStorage::new();
         let source = GraphSource {
+            network: BitcoinNetwork::Regtest,
             fixture: Some("missing.json".into()),
-            ..Default::default()
+            lnd_rest: None,
+            macaroon: None,
+            tls_cert: None,
+            node: "local-node".into(),
         };
         let mut attempts = 0;
         let mut sleeps = 0;

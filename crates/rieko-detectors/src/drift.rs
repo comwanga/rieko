@@ -119,6 +119,7 @@ impl Detector for DriftDetector {
                 id: finding_identity(
                     self.id(),
                     self.version(),
+                    Some(ctx.network),
                     Some(self.local_node.as_ref()),
                     Some(channel.id.as_ref()),
                 ),
@@ -130,6 +131,7 @@ impl Detector for DriftDetector {
                 channel: Some(channel.id.to_string()),
                 evidence,
                 provenance: ctx.source.map(|source| FindingProvenance {
+                    network: Some(ctx.network),
                     source: source.clone(),
                     producers: provenance_producers(ctx.normalizer, self),
                     observation: ObservationReference::ChannelWindow {
@@ -138,6 +140,7 @@ impl Detector for DriftDetector {
                             .iter()
                             .rev()
                             .map(|snapshot| ChannelSnapshotReference {
+                                network: snapshot.network,
                                 observed_at: snapshot.ts,
                                 state_digest: channel_snapshot_state_digest(snapshot),
                             })
@@ -176,7 +179,9 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use rieko_domain::{Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId};
+    use rieko_domain::{
+        BitcoinNetwork, Channel, ChannelStatus, FeePolicy, LiquidityProfile, NodeId,
+    };
     use rieko_graph::{GraphStore, InMemoryGraph, InMemoryHistory};
 
     use super::*;
@@ -208,13 +213,18 @@ mod tests {
         let mut h = InMemoryHistory::new(100);
         for r in ratios {
             let c = channel(id, *r);
-            h.push(rieko_domain::ChannelSnapshot::from_channel(&c, Utc::now()));
+            h.push(rieko_domain::ChannelSnapshot::from_channel(
+                &c,
+                Utc::now(),
+                BitcoinNetwork::Regtest,
+            ));
         }
         h
     }
 
     fn ctx<'a>(h: &'a InMemoryHistory) -> DetectorContext<'a> {
         DetectorContext {
+            network: BitcoinNetwork::Regtest,
             history: Some(h),
             source: None,
             normalizer: None,
@@ -227,7 +237,9 @@ mod tests {
         let mut g = InMemoryGraph::new();
         g.upsert_channel(channel("c1", 0.10)).unwrap();
         let d = DriftDetector::new("local-node");
-        assert!(d.run(&g, &DetectorContext::no_context()).is_empty());
+        assert!(d
+            .run(&g, &DetectorContext::no_context(BitcoinNetwork::Regtest))
+            .is_empty());
     }
 
     #[test]
@@ -236,6 +248,7 @@ mod tests {
         graph.upsert_channel(channel("c1", 0.10)).unwrap();
         let detector = DriftDetector::new("local-node");
         let context = DetectorContext {
+            network: BitcoinNetwork::Regtest,
             history: None,
             source: None,
             normalizer: None,

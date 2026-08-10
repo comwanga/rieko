@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -61,6 +61,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 10,
         sql: V10_SIMULATION_INTEGRITY,
+    },
+    Migration {
+        version: 11,
+        sql: V11_SNAPSHOT_IDENTITY,
     },
 ];
 
@@ -336,6 +340,48 @@ BEGIN
 END;
 "#;
 
+/// v11: network identity and a deterministic digest of the observed channel
+/// state. Legacy rows remain NULL because neither value can be reconstructed
+/// truthfully from the columns previously persisted.
+const V11_SNAPSHOT_IDENTITY: &str = r#"
+UPDATE findings SET lifecycle = 'resolved'
+WHERE lifecycle = 'active'
+  AND (provenance IS NULL OR json_extract(provenance, '$.network') IS NULL);
+DROP INDEX IF EXISTS idx_snapshots_channel_ts;
+DROP INDEX IF EXISTS idx_snapshots_node_channel_ts;
+ALTER TABLE channel_snapshots RENAME TO channel_snapshots_v10;
+CREATE TABLE channel_snapshots (
+    network_id TEXT,
+    node_id TEXT,
+    channel_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    local_ratio REAL NOT NULL,
+    local_balance_msat INTEGER,
+    remote_balance_msat INTEGER,
+    capacity_msat INTEGER,
+    status_int INTEGER NOT NULL,
+    spendable_outbound_msat INTEGER NOT NULL DEFAULT 0,
+    spendable_inbound_msat INTEGER NOT NULL DEFAULT 0,
+    state_digest TEXT,
+    PRIMARY KEY (network_id, node_id, channel_id, ts)
+);
+INSERT INTO channel_snapshots
+    (network_id, node_id, channel_id, ts, local_ratio, local_balance_msat,
+     remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat,
+     spendable_inbound_msat, state_digest)
+SELECT NULL, node_id, channel_id, ts, local_ratio, local_balance_msat,
+       remote_balance_msat, capacity_msat, status_int, spendable_outbound_msat,
+       spendable_inbound_msat, NULL
+FROM channel_snapshots_v10;
+DROP TABLE channel_snapshots_v10;
+CREATE INDEX idx_snapshots_channel_ts
+    ON channel_snapshots (channel_id, ts DESC);
+CREATE INDEX idx_snapshots_node_channel_ts
+    ON channel_snapshots (node_id, channel_id, ts DESC);
+CREATE INDEX idx_snapshots_network_channel_ts
+    ON channel_snapshots (network_id, node_id, channel_id, ts DESC);
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -520,7 +566,8 @@ mod tests {
     fn v10_preserves_legacy_simulation_and_adds_integrity_metadata() {
         let mut conn = bare_conn();
         conn.execute_batch(
-            "CREATE TABLE simulations (
+            "CREATE TABLE findings (id TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, provenance TEXT);
+             CREATE TABLE simulations (
                 id TEXT PRIMARY KEY, action_id TEXT NOT NULL, finding_id TEXT NOT NULL,
                 action_type TEXT NOT NULL, projection TEXT NOT NULL, created_at TEXT NOT NULL,
                 status TEXT NOT NULL, model_id TEXT NOT NULL, model_version TEXT NOT NULL,
@@ -561,6 +608,39 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 2, "historical duplicate hashes must be preserved");
         assert_eq!(schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v11_preserves_unknown_legacy_snapshot_identity_as_null() {
+        let mut conn = bare_conn();
+        conn.execute_batch(
+            "CREATE TABLE findings (id TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, provenance TEXT);
+             CREATE TABLE channel_snapshots (
+                node_id TEXT, channel_id TEXT NOT NULL, ts TEXT NOT NULL,
+                local_ratio REAL NOT NULL, local_balance_msat INTEGER,
+                remote_balance_msat INTEGER, capacity_msat INTEGER,
+                status_int INTEGER NOT NULL,
+                spendable_outbound_msat INTEGER NOT NULL DEFAULT 0,
+                spendable_inbound_msat INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node_id, channel_id, ts)
+             );
+             INSERT INTO channel_snapshots VALUES
+                ('node', 'channel', '2020-01-01T00:00:00Z', 0.5,
+                 500, 500, 1000, 1, 490, 490);
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let identity: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT network_id, state_digest FROM channel_snapshots",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, (None, None));
     }
 
     #[test]

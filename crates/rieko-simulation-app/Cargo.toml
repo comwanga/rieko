@@ -20,4 +20,7 @@ thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+rieko-detectors.workspace = true
+rieko-graph.workspace = true
+rieko-recommendations.workspace = true
 tempfile = "3"

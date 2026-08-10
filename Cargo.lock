@@ -1414,8 +1414,11 @@ name = "rieko-simulation-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rieko-detectors",
  "rieko-domain",
  "rieko-findings",
+ "rieko-graph",
+ "rieko-recommendations",
  "rieko-simulation",
  "rieko-storage",
  "serde",

@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, DedupingSink, TelegramSink};
+use rieko_domain::BitcoinNetwork;
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_storage::SqliteStorage;
 use tracing::info;
@@ -13,6 +14,10 @@ use super::common::{persist_and_recommend, GraphSource};
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
+    /// Bitcoin network observed by this source.
+    #[arg(long, value_name = "NETWORK")]
+    network: BitcoinNetwork,
+
     /// Path to a JSON fixture matching the LND `/v1/channels` response.
     /// Mutually exclusive with `--lnd-rest`.
     #[arg(long, value_name = "FILE")]
@@ -53,6 +58,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
         .with_context(|| format!("opening db {}", db_path.display()))?;
 
     let source = GraphSource {
+        network: args.network,
         fixture: args.fixture.clone(),
         lnd_rest: args.lnd_rest.clone(),
         macaroon: args.macaroon.clone(),
@@ -80,6 +86,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let observation_source = source.observation_source()?;
     let normalizer = source.normalizer();
     let detector_context = rieko_detectors::DetectorContext {
+        network: source.network,
         history: None,
         source: Some(&observation_source),
         normalizer: Some(&normalizer),

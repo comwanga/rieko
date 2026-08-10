@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use rieko_api::RiekoApi;
-use rieko_domain::{ChannelSnapshot, ChannelStatus};
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot, ChannelStatus};
 use rieko_findings::{
     Action, ActionStage, ActionType, Evidence, Finding, FindingLifecycle, Rationale,
     Recommendation, Severity, FINDING_SCHEMA_VERSION,
@@ -17,6 +17,8 @@ async fn snapshots_path_param_route_reachable() {
     let mut mem = MemoryStorage::new();
     let snap = ChannelSnapshot {
         node_id: Some("local-node".into()),
+        network: None,
+        state_digest: None,
         channel_id: "abc123x0".to_string(),
         local_ratio: 0.42,
         local_balance_msat: 420_000,
@@ -66,6 +68,66 @@ async fn snapshots_path_param_route_reachable() {
     assert_eq!(arr.len(), 1, "expected one snapshot back");
     assert_eq!(arr[0]["channel_id"], "abc123x0");
     assert_eq!(arr[0]["local_ratio"], 0.42);
+}
+
+#[tokio::test]
+async fn channel_snapshots_can_be_filtered_by_network_and_node() {
+    let mut mem = MemoryStorage::new();
+    let base = ChannelSnapshot {
+        node_id: Some("node-a".into()),
+        network: Some(BitcoinNetwork::Mainnet),
+        state_digest: Some("mainnet-state".into()),
+        channel_id: "shared-channel".into(),
+        local_ratio: 0.2,
+        local_balance_msat: 200_000,
+        remote_balance_msat: 800_000,
+        capacity_msat: 1_000_000,
+        status: ChannelStatus::Active,
+        ts: Utc::now(),
+        spendable_outbound_msat: 190_000,
+        spendable_inbound_msat: 790_000,
+    };
+    mem.save_channel_snapshot(&base).unwrap();
+    mem.save_channel_snapshot(&ChannelSnapshot {
+        network: Some(BitcoinNetwork::Regtest),
+        state_digest: Some("regtest-state".into()),
+        ..base.clone()
+    })
+    .unwrap();
+    mem.save_channel_snapshot(&ChannelSnapshot {
+        node_id: Some("node-b".into()),
+        state_digest: Some("node-b-state".into()),
+        ..base
+    })
+    .unwrap();
+
+    let app = RiekoApi::new(Box::new(mem)).unwrap().router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/snapshots/channel/shared-channel?network=mainnet&node_id=node-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let snapshots: Vec<ChannelSnapshot> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].state_digest.as_deref(), Some("mainnet-state"));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/snapshots/channel/shared-channel?node_id=node-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[cfg(feature = "simulate")]
@@ -147,6 +209,33 @@ async fn simulations_route_returns_persisted_sims() {
         .await
         .unwrap();
     assert_eq!(detail.status(), StatusCode::OK);
+
+    let typed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v2/simulations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed.status(), StatusCode::OK);
+    let body = to_bytes(typed.into_body(), 4096).await.unwrap();
+    let typed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(typed.as_array().unwrap().is_empty());
+
+    let typed_detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v2/simulations/sim1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed_detail.status(), StatusCode::NOT_FOUND);
 
     let legacy = app
         .oneshot(
@@ -268,6 +357,8 @@ async fn status_reports_operational_counts() {
 
     mem.save_channel_snapshot(&ChannelSnapshot {
         node_id: Some("local-node".into()),
+        network: None,
+        state_digest: None,
         channel_id: "abc123x0".into(),
         local_ratio: 0.5,
         local_balance_msat: 500_000,
