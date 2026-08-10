@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{
@@ -40,6 +40,26 @@ pub struct AppState {
     /// Static bearer token required on non-loopback exposure. `None` means
     /// unauthenticated (only acceptable for loopback use).
     pub auth_token: Option<String>,
+    /// Sliding-window rate limiter for simulation creation requests.
+    pub simulation_rate: tokio::sync::Mutex<Vec<Instant>>,
+}
+
+pub const SIMULATION_RATE_LIMIT: usize = 5;
+
+impl AppState {
+    pub async fn check_simulation_rate(&self) -> Result<(), (StatusCode, String)> {
+        let now = Instant::now();
+        let mut window = self.simulation_rate.lock().await;
+        window.retain(|t| now - *t < Duration::from_secs(1));
+        if window.len() >= SIMULATION_RATE_LIMIT {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many simulation requests; wait and try again".into(),
+            ));
+        }
+        window.push(now);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -56,6 +76,7 @@ impl RiekoApi {
             state: Arc::new(AppState {
                 storage: Arc::new(Mutex::new(storage)),
                 auth_token: None,
+                simulation_rate: tokio::sync::Mutex::new(Vec::new()),
             }),
             static_dir: None,
         })
@@ -78,6 +99,7 @@ impl RiekoApi {
         self.state = Arc::new(AppState {
             storage: self.state.storage.clone(),
             auth_token: Some(token),
+            simulation_rate: tokio::sync::Mutex::new(Vec::new()),
         });
         Ok(self)
     }

@@ -9,7 +9,7 @@ use rieko_findings::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::storage::{StorageCounts, StorageError};
+use crate::storage::{SimulationCounts, StorageCounts, StorageError};
 use crate::Storage;
 
 /// SQLite-backed storage, WAL mode (D6). Synchronous — used by the CLI scan
@@ -1114,14 +1114,46 @@ impl Storage for SqliteStorage {
                     .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             Ok(n as usize)
         };
+        let sim_counts = simulation_status_counts(&self.conn)?;
         Ok(StorageCounts {
             findings: count("findings")?,
             recommendations: count("recommendations")?,
             simulations: count("simulations")?,
             audit: count("audit")?,
             channel_snapshots: count("channel_snapshots")?,
+            simulation_counts: sim_counts,
         })
     }
+}
+
+fn simulation_status_counts(conn: &Connection) -> Result<SimulationCounts, StorageError> {
+    let mut stmt = conn
+        .prepare("SELECT status, COUNT(*) FROM simulations WHERE status != '' GROUP BY status")
+        .map_err(|e| StorageError::Backend(format!("preparing simulation counts: {e}")))?;
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut stale = 0usize;
+    let mut other = 0usize;
+    for row in stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| StorageError::Backend(format!("querying simulation counts: {e}")))?
+    {
+        let (status, count) =
+            row.map_err(|e| StorageError::Backend(format!("reading simulation count row: {e}")))?;
+        let count = count as usize;
+        match status.as_str() {
+            "completed" => completed = count,
+            "failed" | "invalid_input" | "unsupported" => failed += count,
+            "stale" => stale = count,
+            _ => other += count,
+        }
+    }
+    Ok(SimulationCounts {
+        completed,
+        failed,
+        stale,
+        other,
+    })
 }
 
 impl SqliteStorage {

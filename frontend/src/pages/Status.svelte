@@ -38,7 +38,7 @@
     <div class="card" role="region" aria-label="Record counts">
       <div class="kv"><span>Findings</span><span>{counts.findings}</span></div>
       <div class="kv"><span>Recommendations</span><span>{counts.recommendations}</span></div>
-      <div class="kv"><span>Simulations</span><span>{counts.simulations}</span></div>
+      <div class="kv"><span>Simulations</span><span>{counts.simulations} (completed {counts.simulation_completed}, failed {counts.simulation_failed}, stale {counts.simulation_stale})</span></div>
     </div>
     <div class="card" role="region" aria-label="Component health">
       <div class="kv"><span>Snapshot rows</span><span>{counts.channel_snapshots}</span></div>

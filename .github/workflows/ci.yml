@@ -36,6 +36,12 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Verify no executor in default build
+        run: |
+          cargo check -p rieko-cli --no-default-features --features simulate
+          echo "rieko-execution crate must not appear in default dependency tree"
+          ! cargo tree -p rieko-cli --no-default-features --features simulate 2>/dev/null | grep -q 'rieko-execution'
+
   frontend:
     name: Frontend — build
     runs-on: ubuntu-latest
