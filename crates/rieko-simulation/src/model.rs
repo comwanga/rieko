@@ -565,10 +565,46 @@ impl SimulationModel for LiquidityRedistributionModel {
                     "Only recorded local channel state is modelled",
                 ),
             ],
-            warnings: Vec::new(),
+            warnings: build_warnings(source, destination, amount),
             confidence: SimulationConfidence::Medium,
         })
     }
+}
+
+fn build_warnings(
+    source: &ChannelSnapshot,
+    destination: &ChannelSnapshot,
+    amount_msat: u64,
+) -> Vec<SimulationWarning> {
+    let mut warnings = Vec::new();
+    let source_local_after = source.local_balance_msat.saturating_sub(amount_msat);
+    let half_source = source.capacity_msat.saturating_div(2);
+    let half_dest = destination.capacity_msat.saturating_div(2);
+    if amount_msat > half_source || amount_msat > half_dest {
+        warnings.push(SimulationWarning::new(
+            "amount_exceeds_half_capacity",
+            "The rebalance amount exceeds half of the capacity of at least one channel.",
+        ));
+    }
+    let reserve = source.capacity_msat / 100;
+    if source_local_after < reserve {
+        warnings.push(SimulationWarning::new(
+            "source_balance_near_reserve",
+            "After rebalance, source local balance is close to the channel reserve limit.",
+        ));
+    }
+    let dest_after = destination.local_balance_msat + amount_msat;
+    if dest_after
+        > destination
+            .capacity_msat
+            .saturating_sub(destination.capacity_msat / 100)
+    {
+        warnings.push(SimulationWarning::new(
+            "destination_balance_near_capacity",
+            "After rebalance, destination local balance is close to channel capacity.",
+        ));
+    }
+    warnings
 }
 
 fn liquidity_imbalance(snapshot: &ChannelSnapshot) -> LiquidityImbalance {
@@ -729,13 +765,33 @@ mod tests {
 
     #[test]
     fn model_version_changes_input_identity() {
-        let input = input();
-        let mut changed = input.clone();
-        changed.model_version = "4".into();
+        let one = input();
+        let mut two = input();
+        two.model_version = "2".into();
         assert_ne!(
-            compute_input_hash(&input).unwrap(),
-            compute_input_hash(&changed).unwrap()
+            compute_input_hash(&one).unwrap(),
+            compute_input_hash(&two).unwrap()
         );
+    }
+
+    #[test]
+    fn model_version_must_match_for_validation() {
+        let model = LiquidityRedistributionModel::new();
+        let mut v2_input = input();
+        v2_input.model_version = "2".into();
+        assert!(
+            model.validate(&v2_input).is_err(),
+            "mismatched model version must be rejected"
+        );
+    }
+
+    #[test]
+    fn result_preserves_input_model_version() {
+        let model = LiquidityRedistributionModel::new();
+        let inp = input();
+        let result = model.simulate(&inp).unwrap();
+        assert_eq!(result.model_version, inp.model_version);
+        assert_eq!(result.input_hash, compute_input_hash(&inp).unwrap());
     }
 
     #[test]
