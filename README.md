@@ -263,7 +263,8 @@ creates zero duplicates.
 | `rieko-alerts` | Engine | Alert dedup, cooldown, Telegram sink |
 | `rieko-llm` | Engine | LLM explanation client |
 | `rieko-status` | Engine | Health assessment and status model |
-| `rieko-simulation` | Future | What-if projection of actions (v2) |
+| `rieko-simulation` | Kernel | Pure deterministic what-if models (v2) |
+| `rieko-simulation-app` | Application | Simulation validation, persistence, and public views |
 | `rieko-execution` | Future | LND-backed executor with approval gate (v3) |
 | `rieko-api` | Interface | axum HTTP API, serves embedded UI |
 | `rieko-cli` | Interface | CLI entrypoint |
@@ -288,9 +289,9 @@ sqlite3 ~/.rieko/rieko.db ".backup '~/.rieko/backup.db'"
 
 ## Operational model
 
-Rieko runs one **writer** at a time (the `monitor`) and any number of
-readers (the API). This matches SQLite WAL: many concurrent readers with a
-single writer.
+Rieko runs one authoritative **monitor writer** at a time. The API can also
+persist local simulation projections, but it cannot execute actions or mutate a
+node. SQLite WAL permits concurrent readers and serializes these short writes.
 
 - The database is opened in WAL mode with `synchronous=NORMAL`, foreign
   keys enforced, and a finite busy timeout.

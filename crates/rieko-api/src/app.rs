@@ -1,27 +1,29 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
     X_FRAME_OPTIONS,
 };
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use rieko_storage::Storage;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Maximum request body accepted by the API. The v1 surface is read-only, so
-/// requests are tiny; a low ceiling rejects stray large uploads early.
-const MAX_BODY_BYTES: usize = 1 << 20;
+/// Maximum request body accepted by the API. Simulation requests are small,
+/// so a low ceiling rejects stray large uploads early.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20;
 /// Upper bound for any single request, protecting the loopback server from a
 /// stalled client holding a connection forever (RIEKO-AUDIT-014).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum RiekoApiError {
@@ -31,8 +33,8 @@ pub enum RiekoApiError {
     InvalidAuthToken,
 }
 
-/// Shared state: durable storage behind a mutex. The engine is write-once at
-/// v1 (CLI scan pipeline); the API is read-only (D3: read-only by default).
+/// Shared state: durable storage behind a mutex. Simulation writes only create
+/// local projections; no API route can execute or mutate a node.
 pub struct AppState {
     pub storage: Arc<Mutex<Box<dyn Storage + Send>>>,
     /// Static bearer token required on non-loopback exposure. `None` means
@@ -148,6 +150,23 @@ impl RiekoApi {
             .route(
                 "/simulations/:simulation_id",
                 axum::routing::get(crate::routes::simulation_v2_by_id),
+            )
+            .route(
+                "/api/v2/simulations",
+                axum::routing::get(crate::routes::simulation_views)
+                    .post(crate::routes::create_simulation_v2),
+            )
+            .route(
+                "/api/v2/simulations/:simulation_id",
+                axum::routing::get(crate::routes::simulation_view_by_id),
+            )
+            .route(
+                "/api/v2/simulations/:simulation_id/report",
+                axum::routing::get(crate::routes::simulation_view_by_id),
+            )
+            .route(
+                "/api/v2/simulations/compare",
+                axum::routing::post(crate::routes::compare_simulations_v2),
             );
         router
             // Bearer auth guards the JSON surface; static assets are inert.
@@ -158,26 +177,24 @@ impl RiekoApi {
             // Security headers apply to every response, API and static alike.
             .layer(axum::middleware::from_fn(security_headers))
             .layer(axum::middleware::from_fn(enforce_body_limit))
+            // Enforce the ceiling while streaming, including chunked requests
+            // without a trustworthy Content-Length header.
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .layer(axum::middleware::from_fn(request_timeout))
             .with_state(state)
     }
 }
 
-/// Blocking SQLite work must never run on the Tokio executor, or the runtime
-/// stalls behind the `std::sync::Mutex`. Run the read on the blocking pool and
-/// return the bounded result (RIEKO-AUDIT-014).
-pub(crate) async fn block_read<T: Send + 'static>(
+/// Blocking storage work must never run on the Tokio executor. Bound lock
+/// admission, then run the operation on the blocking pool (RIEKO-AUDIT-014).
+pub(crate) async fn block_storage<T: Send + 'static>(
     storage: Arc<Mutex<Box<dyn Storage + Send>>>,
     f: impl FnOnce(&mut (dyn Storage + Send)) -> Result<T, String> + Send + 'static,
 ) -> Result<T, (StatusCode, String)> {
-    match tokio::task::spawn_blocking(move || {
-        let mut guard = storage
-            .lock()
-            .map_err(|_| "storage lock poisoned".to_string())?;
-        f(&mut **guard)
-    })
-    .await
-    {
+    let mut guard = tokio::time::timeout(REQUEST_TIMEOUT, storage.lock_owned())
+        .await
+        .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "storage is busy".into()))?;
+    match tokio::task::spawn_blocking(move || f(&mut **guard)).await {
         Ok(Ok(t)) => Ok(t),
         Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         Err(e) => Err((
@@ -213,9 +230,15 @@ async fn require_auth(
     Ok(next.run(req).await)
 }
 
-/// Bounded wall-clock time for every request; a stalled client or backend can
-/// never tie up the server forever (RIEKO-AUDIT-014).
+/// Bound read-only requests. Local simulation creation instead bounds storage
+/// admission and waits for an admitted write to finish atomically.
 async fn request_timeout(req: Request, next: Next) -> Result<Response, (StatusCode, String)> {
+    // Storage-lock admission is bounded in `block_storage`. Once a local write is
+    // admitted, wait for it to finish: dropping `spawn_blocking` cannot cancel
+    // it and must not produce a timeout response followed by a late commit.
+    if req.method() == axum::http::Method::POST && req.uri().path() == "/api/v2/simulations" {
+        return Ok(next.run(req).await);
+    }
     tokio::time::timeout(REQUEST_TIMEOUT, next.run(req))
         .await
         .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "request timed out".into()))
@@ -225,7 +248,7 @@ async fn request_timeout(req: Request, next: Next) -> Result<Response, (StatusCo
 /// a handler. Checked eagerly on `Content-Length` because the read-only v1
 /// routes never extract a body, so a streaming limit would never fire
 /// (RIEKO-AUDIT-014).
-async fn enforce_body_limit(req: Request, next: Next) -> Result<Response, (StatusCode, String)> {
+async fn enforce_body_limit(req: Request, next: Next) -> Response {
     let too_large = req
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -233,12 +256,18 @@ async fn enforce_body_limit(req: Request, next: Next) -> Result<Response, (Statu
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|n| n > MAX_BODY_BYTES);
     if too_large {
-        return Err((
+        return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large".into(),
-        ));
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "request body too large"
+                }
+            })),
+        )
+            .into_response();
     }
-    Ok(next.run(req).await)
+    next.run(req).await
 }
 
 async fn security_headers(req: Request, next: Next) -> Response {

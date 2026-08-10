@@ -1242,6 +1242,7 @@ dependencies = [
  "http-body-util",
  "rieko-domain",
  "rieko-findings",
+ "rieko-simulation-app",
  "rieko-status",
  "rieko-storage",
  "serde",
@@ -1273,6 +1274,7 @@ dependencies = [
  "rieko-llm",
  "rieko-recommendations",
  "rieko-simulation",
+ "rieko-simulation-app",
  "rieko-status",
  "rieko-storage",
  "serde",
@@ -1403,6 +1405,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "rieko-simulation-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rieko-domain",
+ "rieko-findings",
+ "rieko-simulation",
+ "rieko-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "uuid",
 ]
