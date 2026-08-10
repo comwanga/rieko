@@ -8,19 +8,20 @@
     refetchInterval: 15000,
   });
 
-  // Latest snapshot per channel, plus a small history toggle.
+  // Latest snapshot per network/node/channel identity, plus a small history toggle.
   let selected: string | null = null;
 
   $: latest = (() => {
     const byChannel = new Map<string, ChannelSnapshot[]>();
     for (const s of $q.data ?? []) {
-      const list = byChannel.get(s.channel_id) ?? [];
+      const key = `${s.network ?? "legacy"}\u0000${s.node_id ?? "unknown"}\u0000${s.channel_id}`;
+      const list = byChannel.get(key) ?? [];
       list.push(s);
-      byChannel.set(s.channel_id, list);
+      byChannel.set(key, list);
     }
     return Array.from(byChannel.entries())
-      .map(([id, list]) => ({ id, snaps: list.sort((a, b) => b.ts.localeCompare(a.ts)) }))
-      .sort((a, b) => a.id.localeCompare(b.id));
+      .map(([key, list]) => ({ key, snaps: list.sort((a, b) => b.ts.localeCompare(a.ts)) }))
+      .sort((a, b) => a.key.localeCompare(b.key));
   })();
 
   function pct(v: number | undefined) {
@@ -36,25 +37,27 @@
 {:else}
   <table>
     <thead>
-      <tr><th>Channel</th><th>Status</th><th>Local</th><th>Capacity</th><th></th></tr>
+       <tr><th>Network</th><th>Node</th><th>Channel</th><th>Status</th><th>Local</th><th>Capacity</th><th></th></tr>
     </thead>
     <tbody>
-      {#each latest as { id, snaps }}
+      {#each latest as { key, snaps }}
         {@const s = snaps[0]}
         <tr>
-          <td>{id}</td>
+          <td>{s.network ?? "legacy"}</td>
+          <td class="muted">{s.node_id ?? "unknown"}</td>
+          <td>{s.channel_id}</td>
           <td>{s.status}</td>
           <td>{pct(s.local_ratio)}</td>
           <td class="muted">{(s.capacity_msat / 1e6).toFixed(0)}M msat</td>
           <td>
-            <button on:click={() => (selected = selected === id ? null : id)}>
-              {selected === id ? "hide" : "history"}
+            <button on:click={() => (selected = selected === key ? null : key)}>
+              {selected === key ? "hide" : "history"}
             </button>
           </td>
         </tr>
-        {#if selected === id}
+        {#if selected === key}
           <tr>
-            <td colspan="5">
+            <td colspan="7">
               <div class="grid">
                 {#each snaps as h}
                   <div class="card">

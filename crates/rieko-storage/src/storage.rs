@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rieko_alerts::{AlertError, AlertState, AlertStateStore};
-use rieko_domain::ChannelSnapshot;
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot};
 use rieko_findings::{
     ActionStage, AuditEntry, Finding, FindingCycleScope, FindingLifecycle, FindingLifecycleFilter,
     Recommendation, Simulation, FINDING_SCHEMA_VERSION,
@@ -58,7 +58,13 @@ pub enum StorageError {
 
 impl From<rusqlite::Error> for StorageError {
     fn from(e: rusqlite::Error) -> Self {
-        StorageError::Backend(e.to_string())
+        match e {
+            rusqlite::Error::FromSqlConversionFailure(_, _, _)
+            | rusqlite::Error::IntegralValueOutOfRange(_, _) => {
+                StorageError::Corrupt(e.to_string())
+            }
+            _ => StorageError::Backend(e.to_string()),
+        }
     }
 }
 
@@ -136,6 +142,20 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<ChannelSnapshot>, StorageError>;
+    fn recent_channel_snapshots_for_network(
+        &mut self,
+        network: BitcoinNetwork,
+        node_id: Option<&str>,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError>;
+    fn channel_snapshot_at(
+        &mut self,
+        network: BitcoinNetwork,
+        node_id: &str,
+        channel_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ChannelSnapshot>, StorageError>;
     /// Newest-first snapshots across all channels (for the UI channel list).
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError>;
 
@@ -149,11 +169,21 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     /// serialized [`crate::SimulationRecord`].
     fn save_simulation_v2(&mut self, rec: &SimulationRecord) -> Result<(), StorageError>;
     fn recent_simulations_v2(&mut self, limit: u32) -> Result<Vec<SimulationRecord>, StorageError>;
+    /// Newest-first simulations whose canonical input was persisted. Filtering
+    /// happens before limiting so legacy rows cannot crowd out replayable rows.
+    fn recent_replayable_simulations_v2(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<SimulationRecord>, StorageError>;
     fn simulations_v2_for_action(
         &mut self,
         action_id: &str,
     ) -> Result<Vec<SimulationRecord>, StorageError>;
     fn simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError>;
+    fn replayable_simulation_v2_by_id(
         &mut self,
         simulation_id: &str,
     ) -> Result<Option<SimulationRecord>, StorageError>;
@@ -307,6 +337,8 @@ impl Storage for MemoryStorage {
             .filter(|existing| {
                 existing.detector == finding.detector
                     && existing.detector_version == finding.detector_version
+                    && existing.provenance.as_ref().and_then(|p| p.network)
+                        == finding.provenance.as_ref().and_then(|p| p.network)
                     && existing.node == finding.node
                     && existing.channel == finding.channel
             })
@@ -342,6 +374,7 @@ impl Storage for MemoryStorage {
         if scope.complete {
             for finding in &mut self.findings {
                 if finding.detector == scope.detector
+                    && finding.provenance.as_ref().and_then(|p| p.network) == scope.network
                     && finding.node == scope.node
                     && finding.lifecycle == FindingLifecycle::Active
                 {
@@ -519,6 +552,47 @@ impl Storage for MemoryStorage {
             .collect())
     }
 
+    fn recent_channel_snapshots_for_network(
+        &mut self,
+        network: BitcoinNetwork,
+        node_id: Option<&str>,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        Ok(self
+            .channel_snapshots
+            .iter()
+            .rev()
+            .filter(|snapshot| snapshot.network == Some(network))
+            .filter(|snapshot| match node_id {
+                Some(node) => snapshot.node_id.as_deref() == Some(node),
+                None => true,
+            })
+            .filter(|snapshot| snapshot.channel_id == channel_id)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn channel_snapshot_at(
+        &mut self,
+        network: BitcoinNetwork,
+        node_id: &str,
+        channel_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ChannelSnapshot>, StorageError> {
+        Ok(self
+            .channel_snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.network == Some(network)
+                    && snapshot.node_id.as_deref() == Some(node_id)
+                    && snapshot.channel_id == channel_id
+                    && snapshot.ts == observed_at
+            })
+            .cloned())
+    }
+
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
         Ok(self
             .channel_snapshots
@@ -619,9 +693,12 @@ impl Storage for MemoryStorage {
             };
         }
         if !rec.input_hash.is_empty()
+            && !rec.canonical_input.is_null()
             && !rec.projection.is_null()
             && self.simulation_records.iter().any(|existing| {
-                existing.input_hash == rec.input_hash && !existing.projection.is_null()
+                existing.input_hash == rec.input_hash
+                    && !existing.canonical_input.is_null()
+                    && !existing.projection.is_null()
             })
         {
             return Err(StorageError::Backend(format!(
@@ -638,6 +715,20 @@ impl Storage for MemoryStorage {
             .simulation_records
             .iter()
             .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn recent_replayable_simulations_v2(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
+            .iter()
+            .rev()
+            .filter(|record| !record.canonical_input.is_null())
             .take(limit as usize)
             .cloned()
             .collect())
@@ -667,6 +758,17 @@ impl Storage for MemoryStorage {
             .cloned())
     }
 
+    fn replayable_simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<SimulationRecord>, StorageError> {
+        Ok(self
+            .simulation_records
+            .iter()
+            .find(|record| record.id == simulation_id && !record.canonical_input.is_null())
+            .cloned())
+    }
+
     fn simulation_v2_by_input_hash(
         &mut self,
         input_hash: &str,
@@ -674,8 +776,12 @@ impl Storage for MemoryStorage {
         Ok(self
             .simulation_records
             .iter()
-            .filter(|record| !input_hash.is_empty() && record.input_hash == input_hash)
-            .max_by_key(|record| (!record.projection.is_null(), record.created_at.as_str()))
+            .filter(|record| {
+                !input_hash.is_empty()
+                    && record.input_hash == input_hash
+                    && !record.canonical_input.is_null()
+            })
+            .max_by_key(|record| record.created_at.as_str())
             .cloned())
     }
 

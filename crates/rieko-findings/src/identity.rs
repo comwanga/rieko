@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use rieko_domain::{Channel, ChannelSnapshot, ChannelStatus, LiquidityImbalance};
+use rieko_domain::{BitcoinNetwork, Channel, ChannelSnapshot, ChannelStatus, LiquidityImbalance};
 
 use crate::{ActionType, Evidence};
 
@@ -71,6 +71,7 @@ fn imbalance_tag(imbalance: LiquidityImbalance) -> u8 {
 pub fn finding_identity(
     detector: &str,
     detector_version: &str,
+    network: Option<BitcoinNetwork>,
     node: Option<&str>,
     channel: Option<&str>,
 ) -> String {
@@ -78,6 +79,7 @@ pub fn finding_identity(
         field(m, b"rieko-finding-v2");
         field(m, detector);
         field(m, detector_version);
+        optional_field(m, network.map(|network| network.to_string()));
         optional_field(m, node);
         optional_field(m, channel);
     });
@@ -123,8 +125,9 @@ pub fn channel_state_digest(channel: &Channel) -> String {
 /// SHA-256 digest of explicit snapshot state, excluding its observation time.
 pub fn channel_snapshot_state_digest(snapshot: &ChannelSnapshot) -> String {
     digest(|m| {
-        field(m, b"rieko-channel-snapshot-state-v2");
+        field(m, b"rieko-channel-snapshot-state-v3");
         optional_field(m, snapshot.node_id.as_deref());
+        optional_field(m, snapshot.network.map(|network| network.to_string()));
         field(m, &snapshot.channel_id);
         field(m, snapshot.local_ratio.to_bits().to_be_bytes());
         field(m, snapshot.local_balance_msat.to_be_bytes());
@@ -205,8 +208,20 @@ mod tests {
 
     #[test]
     fn identity_stable_across_construction() {
-        let a = finding_identity("channel_liquidity", "1", Some("node1"), Some("chan-abc"));
-        let b = finding_identity("channel_liquidity", "1", Some("node1"), Some("chan-abc"));
+        let a = finding_identity(
+            "channel_liquidity",
+            "1",
+            None,
+            Some("node1"),
+            Some("chan-abc"),
+        );
+        let b = finding_identity(
+            "channel_liquidity",
+            "1",
+            None,
+            Some("node1"),
+            Some("chan-abc"),
+        );
         assert_eq!(a, b);
         assert!(a.starts_with("finding-"));
     }
@@ -215,25 +230,44 @@ mod tests {
     fn identity_distinguishes_detector_version() {
         // Same detector + input, but a new detector version, must be
         // distinguishable (WP2.3: changed detector version is distinguishable).
-        let v1 = finding_identity("channel_liquidity", "1", Some("node1"), Some("c1"));
-        let v2 = finding_identity("channel_liquidity", "2", Some("node1"), Some("c1"));
+        let v1 = finding_identity("channel_liquidity", "1", None, Some("node1"), Some("c1"));
+        let v2 = finding_identity("channel_liquidity", "2", None, Some("node1"), Some("c1"));
         assert_ne!(v1, v2);
     }
 
     #[test]
     fn identity_distinguishes_entity_changes() {
-        let a = finding_identity("channel_liquidity", "1", Some("node1"), Some("c1"));
-        let b = finding_identity("channel_liquidity", "1", Some("node1"), Some("c2"));
-        let c = finding_identity("channel_liquidity", "1", Some("node2"), Some("c1"));
+        let a = finding_identity("channel_liquidity", "1", None, Some("node1"), Some("c1"));
+        let b = finding_identity("channel_liquidity", "1", None, Some("node1"), Some("c2"));
+        let c = finding_identity("channel_liquidity", "1", None, Some("node2"), Some("c1"));
         assert_ne!(a, b);
         assert_ne!(a, c);
     }
 
     #[test]
+    fn identity_distinguishes_networks() {
+        let mainnet = finding_identity(
+            "channel_liquidity",
+            "1",
+            Some(BitcoinNetwork::Mainnet),
+            Some("node1"),
+            Some("c1"),
+        );
+        let regtest = finding_identity(
+            "channel_liquidity",
+            "1",
+            Some(BitcoinNetwork::Regtest),
+            Some("node1"),
+            Some("c1"),
+        );
+        assert_ne!(mainnet, regtest);
+    }
+
+    #[test]
     fn identity_distinguishes_absent_and_empty_entity_parts() {
         assert_ne!(
-            finding_identity("detector", "1", None, Some("c1")),
-            finding_identity("detector", "1", Some(""), Some("c1"))
+            finding_identity("detector", "1", None, None, Some("c1")),
+            finding_identity("detector", "1", None, Some(""), Some("c1"))
         );
     }
 
@@ -266,7 +300,11 @@ mod tests {
     #[test]
     fn snapshot_digest_excludes_observation_timestamp_but_includes_state() {
         let channel = channel(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
-        let original = ChannelSnapshot::from_channel(&channel, channel.last_seen);
+        let original = ChannelSnapshot::from_channel(
+            &channel,
+            channel.last_seen,
+            rieko_domain::BitcoinNetwork::Signet,
+        );
         let later = ChannelSnapshot {
             ts: Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
             ..original.clone()
@@ -283,6 +321,22 @@ mod tests {
         assert_ne!(
             channel_snapshot_state_digest(&original),
             channel_snapshot_state_digest(&changed)
+        );
+        let different_network = ChannelSnapshot {
+            network: Some(rieko_domain::BitcoinNetwork::Regtest),
+            ..original.clone()
+        };
+        assert_ne!(
+            channel_snapshot_state_digest(&original),
+            channel_snapshot_state_digest(&different_network)
+        );
+        let digest_field_changed = ChannelSnapshot {
+            state_digest: Some("stored-digest".into()),
+            ..original.clone()
+        };
+        assert_eq!(
+            channel_snapshot_state_digest(&original),
+            channel_snapshot_state_digest(&digest_field_changed)
         );
     }
 

@@ -10,7 +10,7 @@ actions. AI is one capability inside the engine.
 
 ```sh
 # Build and scan a fixture (no live node needed)
-cargo run -- scan --fixture fixtures/channels.json
+cargo run -- scan --network regtest --fixture fixtures/channels.json
 
 # Serve the API + embedded UI
 cargo run -- serve
@@ -39,6 +39,7 @@ cd rieko
 ### 2. Build
 
 ```sh
+cd frontend && npm ci && npm run build && cd ..
 cargo build --release
 ```
 
@@ -64,7 +65,7 @@ unsafe for a read-only watcher.
 ### 4. First scan — fixture (no node)
 
 ```sh
-cargo run -- scan --fixture fixtures/channels.json
+cargo run -- scan --network regtest --fixture fixtures/channels.json
 ```
 
 This runs the pipeline against a test fixture. Check the results:
@@ -77,6 +78,7 @@ cargo run -- status
 
 ```sh
 cargo run -- scan \
+  --network mainnet \
   --lnd-rest https://localhost:8080 \
   --tls-cert ~/.lnd/tls.cert \
   --macaroon read-only.macaroon \
@@ -95,10 +97,11 @@ feeding both the liquidity detector and the drift trend detector):
 
 ```sh
 # Against a fixture (development)
-cargo run -- monitor --fixture fixtures/channels.json --interval 300
+cargo run -- monitor --network regtest --fixture fixtures/channels.json --interval 300
 
 # Against a live node
 cargo run -- monitor \
+  --network mainnet \
   --lnd-rest https://localhost:8080 \
   --tls-cert ~/.lnd/tls.cert \
   --macaroon read-only.macaroon \
@@ -147,10 +150,17 @@ The release binary embeds the UI at `/`. API endpoints:
 | `GET /audit?limit=N` | Audit trail |
 | `GET /snapshots?limit=N` | Channel snapshots |
 | `GET /snapshots/channel/:id` | Snapshots for a channel |
+| `POST /api/v2/simulations` | Create and persist a local deterministic projection |
+| `GET /api/v2/simulations?limit=N` | Recent replayable projections |
+| `GET /api/v2/simulations/:id` | Projection detail |
+| `GET /api/v2/simulations/:id/report` | Projection detail in the current report-compatible shape |
+| `POST /api/v2/simulations/compare` | Compare compatible local projections |
 
-All routes are read-only (`GET`). Security headers (CSP, X-Content-Type-Options,
-frame/referrer/cross-origin protection) are applied to every response. Request
-size is capped at 1 MB; queries are bounded (1–500 limit, default 50).
+Simulation POST routes write only local projection records; they never contact
+or mutate a node. All other routes are read-only. Security headers (CSP,
+X-Content-Type-Options, frame/referrer/cross-origin protection) are applied to
+every response. Request size is capped at 1 MB; queries are bounded (1–500
+limit, default 50).
 
 ### 9. Optional: LLM explanations
 
@@ -197,13 +207,14 @@ cargo run -- simulations list
 cargo run -- simulations show <sim-id>
 ```
 
-Simulation is read-only and deterministic. It requires source and destination
+Simulation is node-read-only and deterministic. It requires source and destination
 snapshots from the same observation, embeds those exact inputs for replay, and
 rejects data older than 15 minutes unless the operator explicitly uses
 `--force`; forced stale results remain marked stale. See
 [docs/adrs/0005-v2-deterministic-simulation.md](docs/adrs/0005-v2-deterministic-simulation.md).
-Databases upgraded to schema v10 need one new monitor cycle before simulation,
-because legacy snapshots do not contain a trustworthy local-node identity.
+Databases upgraded to schema v11 need one new monitor cycle with an explicit
+`--network` before simulation, because legacy snapshots do not contain a
+trustworthy network, local-node identity, or state digest.
 
 ### 12. Execution (v3, interlocked)
 

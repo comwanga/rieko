@@ -8,7 +8,6 @@ use rieko_findings::{
     FindingProvenance, Recommendation, Simulation,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::Value;
 
 use crate::storage::{StorageCounts, StorageError};
 use crate::Storage;
@@ -166,6 +165,74 @@ impl SqliteStorage {
             lifecycle,
         })
     }
+
+    fn row_to_recommendation(row: &rusqlite::Row) -> rusqlite::Result<Recommendation> {
+        use rieko_findings::Action;
+
+        let action_type_raw: String = row.get(2)?;
+        let action_type = parse_action_type(&action_type_raw)
+            .map_err(|message| invalid_storage_column(2, message))?;
+        let stage_raw: String = row.get(3)?;
+        let stage =
+            parse_action_stage(&stage_raw).map_err(|message| invalid_storage_column(3, message))?;
+        let params_raw: String = row.get(5)?;
+        let params = serde_json::from_str(&params_raw).map_err(|error| {
+            invalid_storage_column(5, format!("invalid recommendation params: {error}"))
+        })?;
+        let rationale_raw: String = row.get(7)?;
+        let rationale = serde_json::from_str(&rationale_raw).map_err(|error| {
+            invalid_storage_column(7, format!("invalid recommendation rationale: {error}"))
+        })?;
+        let created_at = parse_persisted_timestamp(8, "recommendation created_at", row.get(8)?)?;
+        let updated_at = parse_persisted_timestamp(9, "recommendation updated_at", row.get(9)?)?;
+        Ok(Recommendation {
+            finding_id: row.get(0)?,
+            action: Action {
+                id: row.get(1)?,
+                action_type,
+                stage,
+                target: row.get(4)?,
+                params,
+                summary: row.get(6)?,
+                created_at,
+                updated_at,
+            },
+            rationale,
+        })
+    }
+
+    fn row_to_snapshot(row: &rusqlite::Row) -> rusqlite::Result<ChannelSnapshot> {
+        let status_int: u32 = row.get(6)?;
+        let ts = parse_persisted_timestamp(1, "snapshot timestamp", row.get(1)?)?;
+        let network = row
+            .get::<_, Option<String>>(10)?
+            .map(|network_id| {
+                serde_json::from_value(serde_json::Value::String(network_id.clone())).map_err(
+                    |error| {
+                        invalid_storage_column(
+                            10,
+                            format!("invalid snapshot network_id {network_id:?}: {error}"),
+                        )
+                    },
+                )
+            })
+            .transpose()?;
+        Ok(ChannelSnapshot {
+            node_id: row.get(9)?,
+            network,
+            channel_id: row.get(0)?,
+            local_ratio: row.get(2)?,
+            local_balance_msat: row.get(3)?,
+            remote_balance_msat: row.get(4)?,
+            capacity_msat: row.get(5)?,
+            status: status_from_i64(status_int)
+                .map_err(|message| invalid_storage_column(6, message))?,
+            ts,
+            spendable_outbound_msat: row.get(7)?,
+            spendable_inbound_msat: row.get(8)?,
+            state_digest: row.get(11)?,
+        })
+    }
 }
 
 impl Storage for SqliteStorage {
@@ -237,15 +304,17 @@ impl Storage for SqliteStorage {
             .map_err(|e| StorageError::Corrupt(format!("finding provenance: {e}")))?;
         self.conn.execute(
             "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
-                    evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
-                    lifecycle, schema_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                     MIN(?11, COALESCE((
-                        SELECT MIN(first_seen_at) FROM findings
-                        WHERE detector = ?2 AND detector_version = ?3
-                          AND node_id IS ?5 AND channel_id IS ?6
-                     ), ?11)), ?12, 'active', ?13)
-             ON CONFLICT(id) DO UPDATE SET
+                     evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
+                     lifecycle, schema_version)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                      MIN(?11, COALESCE((
+                         SELECT MIN(first_seen_at) FROM findings
+                         WHERE detector = ?2 AND detector_version = ?3
+                           AND node_id IS ?5 AND channel_id IS ?6
+                           AND json_extract(provenance, '$.network') IS
+                               json_extract(?8, '$.network')
+                      ), ?11)), ?12, 'active', ?13)
+              ON CONFLICT(id) DO UPDATE SET
                 first_seen_at = MIN(findings.first_seen_at, excluded.first_seen_at),
                 severity = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
                     THEN excluded.severity ELSE findings.severity END,
@@ -288,8 +357,14 @@ impl Storage for SqliteStorage {
         if scope.complete {
             self.conn.execute(
                 "UPDATE findings SET lifecycle = 'resolved'
-                 WHERE detector = ?1 AND node_id IS ?2 AND lifecycle = 'active'",
-                params![scope.detector, scope.node],
+                 WHERE detector = ?1 AND node_id IS ?2
+                   AND json_extract(provenance, '$.network') IS ?3
+                   AND lifecycle = 'active'",
+                params![
+                    scope.detector,
+                    scope.node,
+                    scope.network.map(|network| network.to_string())
+                ],
             )?;
         }
         Ok(())
@@ -430,40 +505,7 @@ impl Storage for SqliteStorage {
             "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations ORDER BY created_at DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map([limit], |row| {
-            use rieko_findings::{Action, ActionStage, ActionType};
-            let stage = match row.get::<_, String>(3)?.as_str() {
-                "Simulated" => ActionStage::Simulated,
-                "Approved" => ActionStage::Approved,
-                "Executed" => ActionStage::Executed,
-                "Rejected" => ActionStage::Rejected,
-                "Failed" => ActionStage::Failed,
-                _ => ActionStage::Recommended,
-            };
-            let action_type = match row.get::<_, String>(2)?.as_str() {
-                "update_fee_policy" => ActionType::UpdateFeePolicy,
-                "restart_service" => ActionType::RestartService,
-                "custom" => ActionType::Custom,
-                _ => ActionType::RebalanceChannel,
-            };
-            let params: Value =
-                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
-            let rationale = parse_rationale(&row.get::<_, String>(7)?);
-            Ok(Recommendation {
-                finding_id: row.get(0)?,
-                action: Action {
-                    id: row.get(1)?,
-                    action_type,
-                    stage,
-                    target: row.get::<_, Option<String>>(4)?,
-                    params,
-                    summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(8)?),
-                    updated_at: parse_ts(&row.get::<_, String>(9)?),
-                },
-                rationale,
-            })
-        })?;
+        let rows = stmt.query_map([limit], Self::row_to_recommendation)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -479,40 +521,7 @@ impl Storage for SqliteStorage {
             "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
              FROM recommendations WHERE action_id = ?1",
         )?;
-        let mut rows = stmt.query_map([action_id], |row| {
-            use rieko_findings::{Action, ActionStage, ActionType};
-            let stage = match row.get::<_, String>(3)?.as_str() {
-                "Simulated" => ActionStage::Simulated,
-                "Approved" => ActionStage::Approved,
-                "Executed" => ActionStage::Executed,
-                "Rejected" => ActionStage::Rejected,
-                "Failed" => ActionStage::Failed,
-                _ => ActionStage::Recommended,
-            };
-            let action_type = match row.get::<_, String>(2)?.as_str() {
-                "update_fee_policy" => ActionType::UpdateFeePolicy,
-                "restart_service" => ActionType::RestartService,
-                "custom" => ActionType::Custom,
-                _ => ActionType::RebalanceChannel,
-            };
-            let params: Value =
-                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
-            let rationale = parse_rationale(&row.get::<_, String>(7)?);
-            Ok(Recommendation {
-                finding_id: row.get(0)?,
-                action: Action {
-                    id: row.get(1)?,
-                    action_type,
-                    stage,
-                    target: row.get::<_, Option<String>>(4)?,
-                    params,
-                    summary: row.get(6)?,
-                    created_at: parse_ts(&row.get::<_, String>(8)?),
-                    updated_at: parse_ts(&row.get::<_, String>(9)?),
-                },
-                rationale,
-            })
-        })?;
+        let mut rows = stmt.query_map([action_id], Self::row_to_recommendation)?;
         rows.next().transpose().map_err(Into::into)
     }
 
@@ -555,35 +564,23 @@ impl Storage for SqliteStorage {
              FROM audit ORDER BY ts DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], |row| {
-            use rieko_findings::{ActionStage, ActionType};
-            let stage = match row.get::<_, String>(4)?.as_str() {
-                "Simulated" => ActionStage::Simulated,
-                "Approved" => ActionStage::Approved,
-                "Executed" => ActionStage::Executed,
-                "Rejected" => ActionStage::Rejected,
-                "Failed" => ActionStage::Failed,
-                _ => ActionStage::Recommended,
-            };
-            let previous_stage = match row.get::<_, Option<String>>(3)? {
-                Some(ref s) => match s.as_str() {
-                    "Recommended" => Some(ActionStage::Recommended),
-                    "Simulated" => Some(ActionStage::Simulated),
-                    "Approved" => Some(ActionStage::Approved),
-                    "Executed" => Some(ActionStage::Executed),
-                    "Rejected" => Some(ActionStage::Rejected),
-                    "Failed" => Some(ActionStage::Failed),
-                    _ => None,
-                },
-                None => None,
-            };
-            let action_type = match row.get::<_, String>(2)?.as_str() {
-                "update_fee_policy" => ActionType::UpdateFeePolicy,
-                "restart_service" => ActionType::RestartService,
-                "custom" => ActionType::Custom,
-                _ => ActionType::RebalanceChannel,
-            };
-            let details: Value =
-                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(Value::Null);
+            let action_type_raw: String = row.get(2)?;
+            let action_type = parse_action_type(&action_type_raw)
+                .map_err(|message| invalid_storage_column(2, message))?;
+            let previous_stage = row
+                .get::<_, Option<String>>(3)?
+                .map(|stage| {
+                    parse_action_stage(&stage).map_err(|message| invalid_storage_column(3, message))
+                })
+                .transpose()?;
+            let stage_raw: String = row.get(4)?;
+            let stage = parse_action_stage(&stage_raw)
+                .map_err(|message| invalid_storage_column(4, message))?;
+            let details_raw: String = row.get(6)?;
+            let details = serde_json::from_str(&details_raw).map_err(|error| {
+                invalid_storage_column(6, format!("invalid audit details: {error}"))
+            })?;
+            let timestamp = parse_persisted_timestamp(7, "audit timestamp", row.get(7)?)?;
             Ok(AuditEntry {
                 id: row.get(0)?,
                 action_id: row.get(1)?,
@@ -592,7 +589,7 @@ impl Storage for SqliteStorage {
                 stage,
                 actor: row.get(5)?,
                 details,
-                timestamp: parse_ts(&row.get::<_, String>(7)?),
+                timestamp,
             })
         })?;
         let mut out = Vec::new();
@@ -603,11 +600,27 @@ impl Storage for SqliteStorage {
     }
 
     fn save_channel_snapshot(&mut self, snapshot: &ChannelSnapshot) -> Result<(), StorageError> {
+        let network_id = snapshot
+            .network
+            .as_ref()
+            .map(|network| {
+                serde_json::to_value(network)
+                    .map_err(|error| StorageError::Corrupt(format!("snapshot network: {error}")))
+                    .and_then(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            StorageError::Corrupt(
+                                "snapshot network did not encode as a string".into(),
+                            )
+                        })
+                    })
+            })
+            .transpose()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO channel_snapshots
              (channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat, capacity_msat,
-              status_int, spendable_outbound_msat, spendable_inbound_msat, node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+               status_int, spendable_outbound_msat, spendable_inbound_msat, node_id,
+               network_id, state_digest)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 snapshot.channel_id,
                 snapshot.ts.to_rfc3339(),
@@ -619,6 +632,8 @@ impl Storage for SqliteStorage {
                 snapshot.spendable_outbound_msat,
                 snapshot.spendable_inbound_msat,
                 snapshot.node_id,
+                network_id,
+                snapshot.state_digest,
             ],
         )?;
         Ok(())
@@ -632,33 +647,10 @@ impl Storage for SqliteStorage {
         let mut stmt = self.conn.prepare(
             "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
                     capacity_msat, status_int, spendable_outbound_msat,
-                    spendable_inbound_msat, node_id
+                    spendable_inbound_msat, node_id, network_id, state_digest
              FROM channel_snapshots WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![channel_id, limit], |row| {
-            let status_int: u32 = row.get(6)?;
-            let ts_raw: String = row.get(1)?;
-            let ts = DateTime::parse_from_rfc3339(&ts_raw)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(|error| {
-                    invalid_simulation_column(
-                        1,
-                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
-                    )
-                })?;
-            Ok(ChannelSnapshot {
-                node_id: row.get(9)?,
-                channel_id: row.get(0)?,
-                local_ratio: row.get(2)?,
-                local_balance_msat: row.get(3)?,
-                remote_balance_msat: row.get(4)?,
-                capacity_msat: row.get(5)?,
-                status: status_from_i64(status_int),
-                ts,
-                spendable_outbound_msat: row.get(7)?,
-                spendable_inbound_msat: row.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![channel_id, limit], Self::row_to_snapshot)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -675,69 +667,74 @@ impl Storage for SqliteStorage {
         let mut statement = self.conn.prepare(
             "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
                     capacity_msat, status_int, spendable_outbound_msat,
-                    spendable_inbound_msat, node_id
+                    spendable_inbound_msat, node_id, network_id, state_digest
              FROM channel_snapshots
              WHERE node_id = ?1 AND channel_id = ?2
              ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![node_id, channel_id, limit], |row| {
-            let status_int: u32 = row.get(6)?;
-            let ts_raw: String = row.get(1)?;
-            let ts = DateTime::parse_from_rfc3339(&ts_raw)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(|error| {
-                    invalid_simulation_column(
-                        1,
-                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
-                    )
-                })?;
-            Ok(ChannelSnapshot {
-                node_id: row.get(9)?,
-                channel_id: row.get(0)?,
-                local_ratio: row.get(2)?,
-                local_balance_msat: row.get(3)?,
-                remote_balance_msat: row.get(4)?,
-                capacity_msat: row.get(5)?,
-                status: status_from_i64(status_int),
-                ts,
-                spendable_outbound_msat: row.get(7)?,
-                spendable_inbound_msat: row.get(8)?,
-            })
-        })?;
+        let rows =
+            statement.query_map(params![node_id, channel_id, limit], Self::row_to_snapshot)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn recent_channel_snapshots_for_network(
+        &mut self,
+        network: rieko_domain::BitcoinNetwork,
+        node_id: Option<&str>,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelSnapshot>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+                    capacity_msat, status_int, spendable_outbound_msat,
+                    spendable_inbound_msat, node_id, network_id, state_digest
+             FROM channel_snapshots
+             WHERE network_id = ?1
+               AND (?2 IS NULL OR node_id = ?2)
+               AND channel_id = ?3
+             ORDER BY ts DESC LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![network.to_string(), node_id, channel_id, limit],
+            Self::row_to_snapshot,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn channel_snapshot_at(
+        &mut self,
+        network: rieko_domain::BitcoinNetwork,
+        node_id: &str,
+        channel_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ChannelSnapshot>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
+                        capacity_msat, status_int, spendable_outbound_msat,
+                        spendable_inbound_msat, node_id, network_id, state_digest
+                 FROM channel_snapshots
+                 WHERE network_id = ?1 AND node_id = ?2 AND channel_id = ?3 AND ts = ?4",
+                params![
+                    network.to_string(),
+                    node_id,
+                    channel_id,
+                    observed_at.to_rfc3339()
+                ],
+                Self::row_to_snapshot,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn recent_snapshots_all(&mut self, limit: u32) -> Result<Vec<ChannelSnapshot>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT channel_id, ts, local_ratio, local_balance_msat, remote_balance_msat,
                     capacity_msat, status_int, spendable_outbound_msat,
-                    spendable_inbound_msat, node_id
+                    spendable_inbound_msat, node_id, network_id, state_digest
              FROM channel_snapshots ORDER BY ts DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map([limit], |row| {
-            let status_int: u32 = row.get(6)?;
-            let ts_raw: String = row.get(1)?;
-            let ts = DateTime::parse_from_rfc3339(&ts_raw)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(|error| {
-                    invalid_simulation_column(
-                        1,
-                        format!("invalid snapshot timestamp {ts_raw:?}: {error}"),
-                    )
-                })?;
-            Ok(ChannelSnapshot {
-                node_id: row.get(9)?,
-                channel_id: row.get(0)?,
-                local_ratio: row.get(2)?,
-                local_balance_msat: row.get(3)?,
-                remote_balance_msat: row.get(4)?,
-                capacity_msat: row.get(5)?,
-                status: status_from_i64(status_int),
-                ts,
-                spendable_outbound_msat: row.get(7)?,
-                spendable_inbound_msat: row.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map([limit], Self::row_to_snapshot)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -805,7 +802,7 @@ impl Storage for SqliteStorage {
                                 SELECT rowid FROM (
                                     SELECT rowid,
                                            ROW_NUMBER() OVER (
-                                               PARTITION BY node_id, channel_id ORDER BY ts DESC
+                                                PARTITION BY network_id, node_id, channel_id ORDER BY ts DESC
                                            ) AS rn
                                     FROM channel_snapshots
                                 ) WHERE rn > ?1
@@ -907,8 +904,14 @@ impl Storage for SqliteStorage {
         validate_simulation_record(rec)?;
         let proj = serde_json::to_string(&rec.projection)
             .map_err(|e| StorageError::Corrupt(format!("simulation projection: {e}")))?;
-        let canonical_input = serde_json::to_string(&rec.canonical_input)
-            .map_err(|e| StorageError::Corrupt(format!("canonical simulation input: {e}")))?;
+        let canonical_input =
+            if rec.canonical_input.is_null() {
+                None
+            } else {
+                Some(serde_json::to_string(&rec.canonical_input).map_err(|e| {
+                    StorageError::Corrupt(format!("canonical simulation input: {e}"))
+                })?)
+            };
         let assumptions = serde_json::to_string(&rec.assumptions)
             .map_err(|e| StorageError::Corrupt(format!("assumptions: {e}")))?;
         let warnings = serde_json::to_string(&rec.warnings)
@@ -962,6 +965,22 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    fn recent_replayable_simulations_v2(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<crate::SimulationRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                    input_hash, confidence, assumptions, warnings, explanation, projection, created_at,
+                    canonical_input, source_observed_at, requested_at, completed_at, error_code
+             FROM simulations
+             WHERE canonical_input IS NOT NULL AND canonical_input <> 'null'
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], Self::row_to_simulation_v2)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn simulations_v2_for_action(
         &mut self,
         action_id: &str,
@@ -998,6 +1017,25 @@ impl Storage for SqliteStorage {
             .map_err(Into::into)
     }
 
+    fn replayable_simulation_v2_by_id(
+        &mut self,
+        simulation_id: &str,
+    ) -> Result<Option<crate::SimulationRecord>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, action_id, finding_id, action_type, status, model_id, model_version,
+                        input_hash, confidence, assumptions, warnings, explanation, projection,
+                        created_at, canonical_input, source_observed_at, requested_at,
+                        completed_at, error_code
+                 FROM simulations
+                 WHERE id = ?1 AND canonical_input IS NOT NULL AND canonical_input <> 'null'",
+                [simulation_id],
+                Self::row_to_simulation_v2,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn simulation_v2_by_input_hash(
         &mut self,
         input_hash: &str,
@@ -1011,8 +1049,10 @@ impl Storage for SqliteStorage {
                         input_hash, confidence, assumptions, warnings, explanation, projection,
                         created_at, canonical_input, source_observed_at, requested_at,
                         completed_at, error_code
-                 FROM simulations WHERE input_hash = ?1
-                 ORDER BY CASE WHEN projection <> 'null' THEN 0 ELSE 1 END, created_at DESC
+                 FROM simulations
+                 WHERE input_hash = ?1
+                   AND canonical_input IS NOT NULL AND canonical_input <> 'null'
+                 ORDER BY created_at DESC
                  LIMIT 1",
                 [input_hash],
                 Self::row_to_simulation_v2,
@@ -1341,29 +1381,69 @@ fn validate_rfc3339(label: &str, timestamp: &str) -> Result<(), StorageError> {
         .map_err(|error| StorageError::Corrupt(format!("invalid {label} {timestamp:?}: {error}")))
 }
 
+fn parse_action_stage(value: &str) -> Result<ActionStage, String> {
+    match value {
+        "Recommended" => Ok(ActionStage::Recommended),
+        "Simulated" => Ok(ActionStage::Simulated),
+        "Approved" => Ok(ActionStage::Approved),
+        "Executed" => Ok(ActionStage::Executed),
+        "Rejected" => Ok(ActionStage::Rejected),
+        "Failed" => Ok(ActionStage::Failed),
+        _ => Err(format!("invalid action stage {value:?}")),
+    }
+}
+
+fn parse_action_type(value: &str) -> Result<rieko_findings::ActionType, String> {
+    use rieko_findings::ActionType;
+    match value {
+        "rebalance_channel" => Ok(ActionType::RebalanceChannel),
+        "update_fee_policy" => Ok(ActionType::UpdateFeePolicy),
+        "restart_service" => Ok(ActionType::RestartService),
+        "custom" => Ok(ActionType::Custom),
+        _ => Err(format!("invalid action type {value:?}")),
+    }
+}
+
+fn parse_persisted_timestamp(
+    index: usize,
+    label: &str,
+    value: String,
+) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            invalid_storage_column(index, format!("invalid {label} {value:?}: {error}"))
+        })
+}
+
+fn invalid_storage_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, message.into())
+}
+
 fn invalid_simulation_column(index: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, message.into())
 }
 
-fn status_from_i64(v: u32) -> rieko_domain::ChannelStatus {
+fn status_from_i64(v: u32) -> Result<rieko_domain::ChannelStatus, String> {
     use rieko_domain::ChannelStatus;
     match v {
-        0 => ChannelStatus::Opening,
-        1 => ChannelStatus::Active,
-        2 => ChannelStatus::Inactive,
-        3 => ChannelStatus::Closing,
-        4 => ChannelStatus::Closed,
-        5 => ChannelStatus::PendingOpen,
-        6 => ChannelStatus::WaitingClose,
-        7 => ChannelStatus::ForceClosing,
-        _ => ChannelStatus::Unknown,
+        0 => Ok(ChannelStatus::Opening),
+        1 => Ok(ChannelStatus::Active),
+        2 => Ok(ChannelStatus::Inactive),
+        3 => Ok(ChannelStatus::Closing),
+        4 => Ok(ChannelStatus::Closed),
+        5 => Ok(ChannelStatus::PendingOpen),
+        6 => Ok(ChannelStatus::WaitingClose),
+        7 => Ok(ChannelStatus::ForceClosing),
+        8 => Ok(ChannelStatus::Unknown),
+        _ => Err(format!("invalid channel status {v}")),
     }
 }
 
-fn parse_ts(s: &str) -> DateTime<Utc> {
+fn parse_ts(label: &str, s: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|error| format!("invalid {label} {s:?}: {error}"))
 }
 
 /// Apply the documented, intentional per-connection operational settings. These
@@ -1470,9 +1550,15 @@ impl AlertStateStore for SqliteStorage {
         };
         let (sent, sev, status) = row.map_err(|e| AlertError::Store(e.to_string()))?;
         Ok(Some(rieko_alerts::AlertState {
-            last_sent_at: sent.map(|s| parse_ts(&s)),
-            last_severity: sev.and_then(severity_from_int),
-            last_status: parse_status(&status),
+            last_sent_at: sent
+                .map(|s| parse_ts("alert last_sent_at", &s))
+                .transpose()
+                .map_err(AlertError::Store)?,
+            last_severity: sev
+                .map(severity_from_int)
+                .transpose()
+                .map_err(AlertError::Store)?,
+            last_status: parse_delivery_status(&status).map_err(AlertError::Store)?,
         }))
     }
 
@@ -1550,18 +1636,42 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             cleanup_success,
         ) = row.map_err(|e| OperationalStateError::Store(e.to_string()))?;
         Ok(Some(rieko_status::OperationalState {
-            source: parse_source(&source, connected),
-            last_ingestion_attempt: ingest_attempt.map(|s| parse_ts(&s)),
-            last_ingestion_success: ingest_success.map(|s| parse_ts(&s)),
-            last_cycle_attempt: cycle_attempt.map(|s| parse_ts(&s)),
-            last_cycle_success: cycle_success.map(|s| parse_ts(&s)),
-            last_persist_success: persist_success.map(|s| parse_ts(&s)),
-            source_data_at: data_at.map(|s| parse_ts(&s)),
-            llm: parse_component(&llm),
-            alert_sink: parse_component(&alert),
-            cleanup: parse_component(&cleanup),
-            last_cleanup_attempt: cleanup_attempt.map(|s| parse_ts(&s)),
-            last_cleanup_success: cleanup_success.map(|s| parse_ts(&s)),
+            source: parse_source(&source, connected).map_err(OperationalStateError::Store)?,
+            last_ingestion_attempt: ingest_attempt
+                .map(|s| parse_ts("last_ingestion_attempt", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            last_ingestion_success: ingest_success
+                .map(|s| parse_ts("last_ingestion_success", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            last_cycle_attempt: cycle_attempt
+                .map(|s| parse_ts("last_cycle_attempt", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            last_cycle_success: cycle_success
+                .map(|s| parse_ts("last_cycle_success", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            last_persist_success: persist_success
+                .map(|s| parse_ts("last_persist_success", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            source_data_at: data_at
+                .map(|s| parse_ts("source_data_at", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            llm: parse_component(&llm).map_err(OperationalStateError::Store)?,
+            alert_sink: parse_component(&alert).map_err(OperationalStateError::Store)?,
+            cleanup: parse_component(&cleanup).map_err(OperationalStateError::Store)?,
+            last_cleanup_attempt: cleanup_attempt
+                .map(|s| parse_ts("last_cleanup_attempt", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
+            last_cleanup_success: cleanup_success
+                .map(|s| parse_ts("last_cleanup_success", &s))
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
         }))
     }
 
@@ -1616,23 +1726,28 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
     }
 }
 
-fn parse_source(s: &str, connected: Option<i64>) -> rieko_status::SourceState {
+fn parse_source(s: &str, connected: Option<i64>) -> Result<rieko_status::SourceState, String> {
     use rieko_status::SourceState;
     match s {
-        "lnd_rest" => SourceState::LndRest {
-            connected: connected == Some(1),
+        "lnd_rest" => match connected {
+            Some(0) => Ok(SourceState::LndRest { connected: false }),
+            Some(1) => Ok(SourceState::LndRest { connected: true }),
+            _ => Err("lnd_rest source must have a boolean connection state".into()),
         },
-        _ => SourceState::Fixture,
+        "fixture" if connected.is_none() => Ok(SourceState::Fixture),
+        "fixture" => Err("fixture source cannot have a connection state".into()),
+        _ => Err(format!("invalid operational source {s:?}")),
     }
 }
 
-fn parse_component(s: &str) -> rieko_status::ComponentState {
+fn parse_component(s: &str) -> Result<rieko_status::ComponentState, String> {
     use rieko_status::ComponentState;
     match s {
-        "configured" => ComponentState::Configured,
-        "healthy" => ComponentState::Healthy,
-        "failing" => ComponentState::Failing,
-        _ => ComponentState::NotConfigured,
+        "not_configured" => Ok(ComponentState::NotConfigured),
+        "configured" => Ok(ComponentState::Configured),
+        "healthy" => Ok(ComponentState::Healthy),
+        "failing" => Ok(ComponentState::Failing),
+        _ => Err(format!("invalid component state {s:?}")),
     }
 }
 
@@ -1640,25 +1755,22 @@ fn component_str(s: rieko_status::ComponentState) -> &'static str {
     s.as_str()
 }
 
-fn parse_rationale(s: &str) -> rieko_findings::Rationale {
-    serde_json::from_str(s).unwrap_or_default()
-}
-
-fn severity_from_int(v: i64) -> Option<rieko_findings::Severity> {
+fn severity_from_int(v: i64) -> Result<rieko_findings::Severity, String> {
     match v {
-        0 => Some(rieko_findings::Severity::Info),
-        1 => Some(rieko_findings::Severity::Warning),
-        2 => Some(rieko_findings::Severity::Critical),
-        _ => None,
+        0 => Ok(rieko_findings::Severity::Info),
+        1 => Ok(rieko_findings::Severity::Warning),
+        2 => Ok(rieko_findings::Severity::Critical),
+        _ => Err(format!("invalid alert severity {v}")),
     }
 }
 
-fn parse_status(s: &str) -> rieko_alerts::DeliveryStatus {
+fn parse_delivery_status(s: &str) -> Result<rieko_alerts::DeliveryStatus, String> {
     match s {
-        "success" => rieko_alerts::DeliveryStatus::Success,
-        "failed" => rieko_alerts::DeliveryStatus::Failed,
-        "skipped" => rieko_alerts::DeliveryStatus::Skipped,
-        _ => rieko_alerts::DeliveryStatus::None,
+        "none" => Ok(rieko_alerts::DeliveryStatus::None),
+        "success" => Ok(rieko_alerts::DeliveryStatus::Success),
+        "failed" => Ok(rieko_alerts::DeliveryStatus::Failed),
+        "skipped" => Ok(rieko_alerts::DeliveryStatus::Skipped),
+        _ => Err(format!("invalid alert delivery status {s:?}")),
     }
 }
 
@@ -1680,11 +1792,12 @@ fn invalid_finding_column(index: usize, message: String) -> rusqlite::Error {
 mod tests {
     use super::*;
     use crate::MemoryStorage;
-    use rieko_domain::ChannelStatus;
+    use rieko_domain::{BitcoinNetwork, ChannelStatus};
     use rieko_findings::{
         Action, ActionStage, ActionType, Evidence, FindingProvenance, ObservationReference,
         ObservationSource, ProducerRole, ProducerVersion, Rationale, Severity,
     };
+    use serde_json::Value;
 
     fn test_rec(finding_id: &str, action: Action) -> Recommendation {
         Recommendation {
@@ -1706,6 +1819,7 @@ mod tests {
             channel: Some("c1".into()),
             evidence: vec![Evidence::number("local_ratio", 0.02)],
             provenance: Some(FindingProvenance {
+                network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
                 },
@@ -1717,6 +1831,7 @@ mod tests {
                 observation: ObservationReference::ChannelState {
                     channel_id: "c1".into(),
                     snapshot: rieko_findings::ChannelSnapshotReference {
+                        network: Some(BitcoinNetwork::Regtest),
                         observed_at: now,
                         state_digest: "state-hash".into(),
                     },
@@ -2070,6 +2185,147 @@ mod tests {
     }
 
     #[test]
+    fn replayable_queries_filter_legacy_rows_before_limit_in_both_backends() {
+        for mut storage in lifecycle_backends() {
+            let replayable = simulation_record("replayable");
+            storage.save_simulation_v2(&replayable).unwrap();
+
+            let mut legacy = replayable.clone();
+            legacy.id = "legacy".into();
+            legacy.canonical_input = Value::Null;
+            legacy.source_observed_at = None;
+            legacy.created_at = "2023-11-14T22:15:20Z".into();
+            legacy.requested_at = legacy.created_at.clone();
+            legacy.completed_at = Some(legacy.created_at.clone());
+            storage.save_simulation_v2(&legacy).unwrap();
+
+            assert_eq!(storage.recent_simulations_v2(1).unwrap()[0].id, "legacy");
+            assert_eq!(
+                storage.recent_replayable_simulations_v2(1).unwrap(),
+                vec![replayable.clone()]
+            );
+            assert!(storage
+                .replayable_simulation_v2_by_id("legacy")
+                .unwrap()
+                .is_none());
+            assert_eq!(storage.simulation_v2_by_id("legacy").unwrap(), Some(legacy));
+            assert_eq!(
+                storage
+                    .simulation_v2_by_input_hash(&replayable.input_hash)
+                    .unwrap(),
+                Some(replayable)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_recommendation_fields_return_corrupt() {
+        for (column, value) in [
+            ("stage", "'unknown'"),
+            ("action_type", "'unknown'"),
+            ("params", "'not-json'"),
+            ("rationale", "'not-json'"),
+            ("created_at", "'not-a-time'"),
+            ("updated_at", "'not-a-time'"),
+        ] {
+            let mut storage = SqliteStorage::in_memory().unwrap();
+            let rec = test_rec(
+                "f1",
+                Action::new(
+                    ActionType::RebalanceChannel,
+                    ActionStage::Recommended,
+                    Some("c1".into()),
+                    serde_json::json!({}),
+                    "rebalance",
+                ),
+            );
+            storage.save_recommendation(&rec).unwrap();
+            storage
+                .conn
+                .execute(
+                    &format!("UPDATE recommendations SET {column} = {value} WHERE action_id = ?1"),
+                    [&rec.action.id],
+                )
+                .unwrap();
+
+            assert!(matches!(
+                storage.latest_recommendations(1),
+                Err(StorageError::Corrupt(_))
+            ));
+            assert!(matches!(
+                storage.recommendation_for_action(&rec.action.id),
+                Err(StorageError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_audit_fields_return_corrupt() {
+        for column in ["stage", "previous_stage", "action_type", "details", "ts"] {
+            // The table is append-only, so inject corruption as part of the
+            // original row rather than attempting a forbidden UPDATE.
+            let mut corrupt = SqliteStorage::in_memory().unwrap();
+            corrupt
+                .conn
+                .execute(
+                    "INSERT INTO audit
+                     (id, action_id, action_type, previous_stage, stage, actor, details, ts)
+                     VALUES ('audit', 'action', ?1, ?2, ?3, 'operator', ?4, ?5)",
+                    params![
+                        if column == "action_type" {
+                            "unknown"
+                        } else {
+                            "rebalance_channel"
+                        },
+                        if column == "previous_stage" {
+                            "unknown"
+                        } else {
+                            "Recommended"
+                        },
+                        if column == "stage" {
+                            "unknown"
+                        } else {
+                            "Approved"
+                        },
+                        if column == "details" {
+                            "not-json"
+                        } else {
+                            "{}"
+                        },
+                        if column == "ts" {
+                            "not-a-time"
+                        } else {
+                            "2023-11-14T22:15:20Z"
+                        },
+                    ],
+                )
+                .unwrap();
+            assert!(matches!(
+                corrupt.recent_audit(1),
+                Err(StorageError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_snapshot_identity_and_status_return_corrupt() {
+        for update in [
+            "UPDATE channel_snapshots SET network_id = 'unknown-network'",
+            "UPDATE channel_snapshots SET status_int = 99",
+        ] {
+            let mut storage = SqliteStorage::in_memory().unwrap();
+            storage
+                .save_channel_snapshot(&snapshot_at("c1", ChannelStatus::Active, Utc::now()))
+                .unwrap();
+            storage.conn.execute(update, []).unwrap();
+            assert!(matches!(
+                storage.recent_channel_snapshots("c1", 1),
+                Err(StorageError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
     fn simulation_input_survives_snapshot_retention() {
         let mut storage = SqliteStorage::in_memory().unwrap();
         let record = simulation_record("sim-v2");
@@ -2130,6 +2386,8 @@ mod tests {
     fn snapshot_at(id: &str, status: ChannelStatus, ts: DateTime<Utc>) -> ChannelSnapshot {
         ChannelSnapshot {
             node_id: Some("local-node".into()),
+            network: Some(BitcoinNetwork::Regtest),
+            state_digest: Some(format!("digest-{id}")),
             channel_id: id.to_string(),
             local_ratio: 0.5,
             local_balance_msat: 500_000,
@@ -2381,15 +2639,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_operational_timestamp_fails_loudly() {
+        use rieko_status::OperationalStateStore as _;
+
+        let storage = SqliteStorage::in_memory().unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO operational_state
+                    (id, source, source_connected, last_ingestion_attempt, llm, alert_sink, cleanup)
+                 VALUES ('current', 'fixture', NULL, 'not-a-timestamp',
+                         'not_configured', 'not_configured', 'not_configured')",
+                [],
+            )
+            .unwrap();
+
+        assert!(storage.read_operational_state().is_err());
+    }
+
+    #[test]
     fn component_state_decodes_configured() {
         assert_eq!(
-            parse_component("configured"),
+            parse_component("configured").unwrap(),
             rieko_status::ComponentState::Configured
         );
-        assert_eq!(
-            parse_component("unknown"),
-            rieko_status::ComponentState::NotConfigured
-        );
+        assert!(parse_component("unknown").is_err());
     }
 
     #[test]
@@ -2400,6 +2674,8 @@ mod tests {
         let ts = Utc::now();
         let snap = ChannelSnapshot {
             node_id: Some("local-node".into()),
+            network: Some(BitcoinNetwork::Signet),
+            state_digest: Some("state-digest".into()),
             channel_id: "c1".into(),
             local_ratio: 0.42,
             local_balance_msat: 420_000,
@@ -2424,6 +2700,8 @@ mod tests {
         // newest first
         assert_eq!(got[0].local_ratio, 0.30);
         assert_eq!(got[0].status, ChannelStatus::Active);
+        assert_eq!(got[0].network, Some(BitcoinNetwork::Signet));
+        assert_eq!(got[0].state_digest.as_deref(), Some("state-digest"));
         assert_eq!(got[1].local_ratio, 0.42);
         assert_eq!(s.recent_channel_snapshots("other", 10).unwrap().len(), 0);
     }
@@ -2434,6 +2712,8 @@ mod tests {
         for mut storage in lifecycle_backends() {
             let first = ChannelSnapshot {
                 node_id: Some("node-a".into()),
+                network: Some(BitcoinNetwork::Regtest),
+                state_digest: Some("node-a-state".into()),
                 channel_id: "c1".into(),
                 local_ratio: 0.2,
                 local_balance_msat: 200_000,
@@ -2474,6 +2754,70 @@ mod tests {
     }
 
     #[test]
+    fn same_snapshot_identity_is_isolated_by_network() {
+        let timestamp = Utc::now();
+        for mut storage in lifecycle_backends() {
+            let regtest = ChannelSnapshot {
+                node_id: Some("node-a".into()),
+                network: Some(BitcoinNetwork::Regtest),
+                state_digest: Some("regtest-state".into()),
+                channel_id: "c1".into(),
+                local_ratio: 0.2,
+                local_balance_msat: 200_000,
+                remote_balance_msat: 800_000,
+                capacity_msat: 1_000_000,
+                status: ChannelStatus::Active,
+                ts: timestamp,
+                spendable_outbound_msat: 190_000,
+                spendable_inbound_msat: 790_000,
+            };
+            let mainnet = ChannelSnapshot {
+                network: Some(BitcoinNetwork::Mainnet),
+                state_digest: Some("mainnet-state".into()),
+                local_ratio: 0.8,
+                local_balance_msat: 800_000,
+                remote_balance_msat: 200_000,
+                ..regtest.clone()
+            };
+            storage.save_channel_snapshot(&regtest).unwrap();
+            storage.save_channel_snapshot(&mainnet).unwrap();
+
+            let regtest_history = storage
+                .recent_channel_snapshots_for_network(
+                    BitcoinNetwork::Regtest,
+                    Some("node-a"),
+                    "c1",
+                    10,
+                )
+                .unwrap();
+            assert_eq!(regtest_history.len(), 1);
+            assert_eq!(
+                regtest_history[0].state_digest.as_deref(),
+                Some("regtest-state")
+            );
+
+            assert_eq!(
+                storage
+                    .channel_snapshot_at(BitcoinNetwork::Regtest, "node-a", "c1", timestamp)
+                    .unwrap()
+                    .unwrap()
+                    .state_digest
+                    .as_deref(),
+                Some("regtest-state")
+            );
+            assert_eq!(
+                storage
+                    .channel_snapshot_at(BitcoinNetwork::Mainnet, "node-a", "c1", timestamp)
+                    .unwrap()
+                    .unwrap()
+                    .state_digest
+                    .as_deref(),
+                Some("mainnet-state")
+            );
+        }
+    }
+
+    #[test]
     fn alert_state_roundtrips_through_sqlite() {
         use rieko_alerts::{AlertState, AlertStateStore, DeliveryStatus};
         use rieko_findings::Severity;
@@ -2497,6 +2841,21 @@ mod tests {
         assert_eq!(got.last_severity, Some(Severity::Critical));
         assert_eq!(got.last_status, DeliveryStatus::Success);
         assert!(got.last_sent_at.is_some());
+    }
+
+    #[test]
+    fn malformed_alert_timestamp_fails_loudly() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO alert_state (dedup_key, last_sent_at, last_severity, last_status)
+                 VALUES ('bad-time', 'not-a-timestamp', NULL, 'none')",
+                [],
+            )
+            .unwrap();
+
+        assert!(AlertStateStore::read(&storage, "bad-time").is_err());
     }
 
     #[test]
@@ -2835,6 +3194,7 @@ mod tests {
         s.save_finding(&f).unwrap();
         s.resolve_findings_for_scope(&FindingCycleScope {
             detector: f.detector.clone(),
+            network: f.provenance.as_ref().and_then(|p| p.network),
             node: f.node.clone(),
             complete: true,
         })
@@ -2871,6 +3231,7 @@ mod tests {
             storage
                 .resolve_findings_for_scope(&FindingCycleScope {
                     detector: original.detector.clone(),
+                    network: original.provenance.as_ref().and_then(|p| p.network),
                     node: original.node.clone(),
                     complete: true,
                 })
@@ -2881,6 +3242,7 @@ mod tests {
             recurrence.severity = Severity::Warning;
             recurrence.evidence = vec![Evidence::number("local_ratio", 0.15)];
             recurrence.provenance = Some(FindingProvenance {
+                network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "new-fixture-hash".into(),
                 },
@@ -2941,6 +3303,7 @@ mod tests {
 
             let mut scope = FindingCycleScope {
                 detector: target.detector.clone(),
+                network: target.provenance.as_ref().and_then(|p| p.network),
                 node: target.node.clone(),
                 complete: false,
             };
@@ -2966,6 +3329,40 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_is_network_isolated() {
+        for mut storage in lifecycle_backends() {
+            let regtest = sample_finding();
+            let mut mainnet = regtest.clone();
+            mainnet.id = "mainnet-finding".into();
+            let provenance = mainnet.provenance.as_mut().unwrap();
+            provenance.network = Some(BitcoinNetwork::Mainnet);
+            if let ObservationReference::ChannelState { snapshot, .. } = &mut provenance.observation
+            {
+                snapshot.network = Some(BitcoinNetwork::Mainnet);
+            }
+            storage.save_finding(&regtest).unwrap();
+            storage.save_finding(&mainnet).unwrap();
+
+            storage
+                .resolve_findings_for_scope(&FindingCycleScope {
+                    detector: regtest.detector.clone(),
+                    network: Some(BitcoinNetwork::Regtest),
+                    node: regtest.node.clone(),
+                    complete: true,
+                })
+                .unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &regtest.id).lifecycle,
+                FindingLifecycle::Resolved
+            );
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &mainnet.id).lifecycle,
+                FindingLifecycle::Active
+            );
+        }
+    }
+
+    #[test]
     fn complete_cycle_supersedes_prior_detector_version() {
         for mut storage in lifecycle_backends() {
             let old = sample_finding();
@@ -2973,6 +3370,7 @@ mod tests {
             storage
                 .resolve_findings_for_scope(&FindingCycleScope {
                     detector: old.detector.clone(),
+                    network: old.provenance.as_ref().and_then(|p| p.network),
                     node: old.node.clone(),
                     complete: true,
                 })
@@ -3004,6 +3402,7 @@ mod tests {
             storage
                 .resolve_findings_for_scope(&FindingCycleScope {
                     detector: finding.detector.clone(),
+                    network: finding.provenance.as_ref().and_then(|p| p.network),
                     node: finding.node.clone(),
                     complete: true,
                 })
@@ -3017,7 +3416,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_row_bridges_first_seen_without_fabricating_provenance() {
+    fn legacy_row_does_not_bridge_first_seen_across_unknown_network() {
         let mut storage = SqliteStorage::in_memory().unwrap();
         let legacy_first = "2020-01-01T00:00:00+00:00";
         storage
@@ -3039,7 +3438,8 @@ mod tests {
         let bridged = finding_by_id(&mut storage, "stable-v2-id");
         assert_eq!(legacy.provenance, None);
         assert_eq!(legacy.schema_version, 1);
-        assert_eq!(bridged.first_seen_at, legacy.first_seen_at);
+        assert_eq!(bridged.first_seen_at, current.first_seen_at);
+        assert_ne!(bridged.first_seen_at, legacy.first_seen_at);
         assert_eq!(bridged.provenance, current.provenance);
     }
 
@@ -3160,7 +3560,11 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "old1");
         assert_eq!(got[0].detector_version, "1", "default detector version");
-        assert_eq!(got[0].lifecycle, FindingLifecycle::Active);
+        assert_eq!(
+            got[0].lifecycle,
+            FindingLifecycle::Resolved,
+            "networkless legacy findings remain historical until re-observed"
+        );
         assert_eq!(got[0].first_seen_at, got[0].last_seen_at);
     }
 

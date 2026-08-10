@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rieko_domain::{ChannelSnapshot, NodeId};
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot, NodeId};
 use rieko_findings::{
     AuditEntry, Finding, FindingCycleScope, ObservationSource, ProducerRole, ProducerVersion,
     Recommendation,
@@ -17,8 +17,9 @@ const MAX_LLM_EXPLANATIONS_PER_CYCLE: usize = 3;
 
 /// Where channel state comes from: a JSON fixture or a live LND REST node.
 /// Both scan and monitor share this so the ingestion path stays identical.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GraphSource {
+    pub network: BitcoinNetwork,
     pub fixture: Option<PathBuf>,
     pub lnd_rest: Option<String>,
     pub macaroon: Option<PathBuf>,
@@ -454,7 +455,10 @@ mod tests {
 
     fn detect(graph: &InMemoryGraph) -> Vec<rieko_findings::Finding> {
         let detector = LiquidityDetector::new("local-node");
-        detector.run(graph, &rieko_detectors::DetectorContext::no_context())
+        detector.run(
+            graph,
+            &rieko_detectors::DetectorContext::no_context(BitcoinNetwork::Regtest),
+        )
     }
 
     fn fixture_path() -> std::path::PathBuf {
@@ -467,15 +471,19 @@ mod tests {
         // recommend → persist) must work end to end against the committed
         // fixture and match the documented liquidity semantics (RIEKO-AUDIT-011).
         let source = GraphSource {
+            network: BitcoinNetwork::Regtest,
             fixture: Some(fixture_path()),
+            lnd_rest: None,
+            macaroon: None,
+            tls_cert: None,
             node: "local-node".into(),
-            ..Default::default()
         };
         let graph = source.build().expect("fixture should load");
 
         let observation_source = source.observation_source().unwrap();
         let normalizer = source.normalizer();
         let context = rieko_detectors::DetectorContext {
+            network: source.network,
             history: None,
             source: Some(&observation_source),
             normalizer: Some(&normalizer),
@@ -564,6 +572,7 @@ mod tests {
         let mut fixture = tempfile::NamedTempFile::new().unwrap();
         fixture.write_all(b"first observation").unwrap();
         let source = GraphSource {
+            network: BitcoinNetwork::Regtest,
             fixture: Some(fixture.path().to_path_buf()),
             lnd_rest: None,
             tls_cert: None,
@@ -584,9 +593,12 @@ mod tests {
     #[test]
     fn missing_macaroon_file_fails_cleanly() {
         let source = GraphSource {
+            network: BitcoinNetwork::Regtest,
+            fixture: None,
             lnd_rest: Some("http://127.0.0.1:1".into()),
             macaroon: Some(std::path::PathBuf::from("/definitely/not/a/macaroon")),
-            ..Default::default()
+            tls_cert: None,
+            node: "local-node".into(),
         };
         let msg = source.build().unwrap_err().to_string();
         assert!(
@@ -755,7 +767,7 @@ mod tests {
         let snapshots: Vec<_> = graph
             .channels()
             .iter()
-            .map(|channel| ChannelSnapshot::from_channel(channel, now))
+            .map(|channel| ChannelSnapshot::from_channel(channel, now, BitcoinNetwork::Regtest))
             .collect();
         let mut findings = detect(&graph);
         let mut storage = MemoryStorage::new();
@@ -782,6 +794,7 @@ mod tests {
         let engine = RecommendationEngine;
         let scope = FindingCycleScope {
             detector: "channel_liquidity".into(),
+            network: None,
             node: Some("local-node".into()),
             complete: true,
         };
@@ -845,9 +858,14 @@ mod tests {
         findings[0]
             .evidence
             .retain(|evidence| evidence.key != "direction");
-        let snapshot = ChannelSnapshot::from_channel(graph.channels()[0], chrono::Utc::now());
+        let snapshot = ChannelSnapshot::from_channel(
+            graph.channels()[0],
+            chrono::Utc::now(),
+            BitcoinNetwork::Regtest,
+        );
         let scope = FindingCycleScope {
             detector: "channel_liquidity".into(),
+            network: None,
             node: Some("local-node".into()),
             complete: true,
         };
@@ -880,8 +898,12 @@ mod tests {
     #[test]
     fn failed_ingestion_preserves_last_good_observation() {
         let source = GraphSource {
+            network: BitcoinNetwork::Regtest,
+            fixture: None,
             lnd_rest: Some("https://localhost:8080".into()),
-            ..Default::default()
+            macaroon: None,
+            tls_cert: None,
+            node: "local-node".into(),
         };
         let graph = drained_graph(20_000, 980_000);
         let observed_at = newest_source_data_at(&graph);

@@ -4,8 +4,10 @@
 //! model. Run identity and timestamps remain outside the deterministic output.
 
 use chrono::{DateTime, Duration, Utc};
-use rieko_domain::{ChannelSnapshot, ChannelStatus};
-use rieko_findings::{ActionType, FindingProvenance, Recommendation};
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot, ChannelStatus, LiquidityImbalance};
+use rieko_findings::{
+    channel_snapshot_state_digest, ActionType, FindingProvenance, Recommendation,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -123,6 +125,13 @@ pub struct LiquidityRedistributionParameters {
     pub amount_msat: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingDirection {
+    Outbound,
+    Inbound,
+}
+
 /// Canonical, replayable model input. Every calculation-affecting source value
 /// is embedded so snapshot retention cannot change or destroy a historical run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,7 +140,11 @@ pub struct SimulationInput {
     pub recommendation_target: String,
     pub finding_id: String,
     pub finding_channel: String,
+    #[serde(default)]
+    pub finding_direction: Option<FindingDirection>,
     pub node_id: String,
+    #[serde(default)]
+    pub network: Option<BitcoinNetwork>,
     pub provenance: FindingProvenance,
     pub action_type: ActionType,
     pub model_id: String,
@@ -143,7 +156,7 @@ pub struct SimulationInput {
 
 impl SimulationInput {
     pub fn observed_at(&self) -> DateTime<Utc> {
-        self.source_snapshot.ts
+        self.finding_snapshot().ts
     }
 
     pub fn is_stale_at(&self, now: DateTime<Utc>, freshness: Duration) -> bool {
@@ -152,6 +165,14 @@ impl SimulationInput {
 
     pub fn is_future_at(&self, now: DateTime<Utc>) -> bool {
         self.observed_at() > now
+    }
+
+    fn finding_snapshot(&self) -> &ChannelSnapshot {
+        if self.destination_snapshot.channel_id == self.finding_channel {
+            &self.destination_snapshot
+        } else {
+            &self.source_snapshot
+        }
     }
 }
 
@@ -230,7 +251,7 @@ impl SimulationModel for LiquidityRedistributionModel {
     }
 
     fn model_version(&self) -> &str {
-        "2"
+        "3"
     }
 
     fn supports(&self, recommendation: &Recommendation) -> bool {
@@ -245,6 +266,14 @@ impl SimulationModel for LiquidityRedistributionModel {
         }
         if input.node_id.trim().is_empty() {
             return Err(ModelError::InvalidInput("node identity is required".into()));
+        }
+        let network = input
+            .network
+            .ok_or_else(|| ModelError::InvalidInput("network identity is required".into()))?;
+        if input.provenance.network != Some(network) {
+            return Err(ModelError::InvalidInput(
+                "finding provenance network does not match simulation network".into(),
+            ));
         }
         if let rieko_findings::ObservationSource::Lnd {
             configured_node, ..
@@ -266,38 +295,67 @@ impl SimulationModel for LiquidityRedistributionModel {
             )));
         }
         let parameters = &input.parameters;
-        let (provenance_channel, provenance_observed_at) = match &input.provenance.observation {
+        let (provenance_channel, provenance_snapshot) = match &input.provenance.observation {
             rieko_findings::ObservationReference::ChannelState {
                 channel_id,
                 snapshot,
-            } => (channel_id, snapshot.observed_at),
+            } => (channel_id, snapshot),
             rieko_findings::ObservationReference::ChannelWindow {
                 channel_id,
                 snapshots,
-            } => (
-                channel_id,
-                snapshots
+            } => {
+                let snapshot = snapshots
                     .iter()
-                    .map(|snapshot| snapshot.observed_at)
-                    .max()
+                    .max_by_key(|snapshot| snapshot.observed_at)
                     .ok_or_else(|| {
                         ModelError::InvalidInput(
                             "finding provenance has an empty observation window".into(),
                         )
-                    })?,
-            ),
+                    })?;
+                (channel_id, snapshot)
+            }
         };
-        if input.recommendation_target != parameters.source_channel
-            || input.finding_channel != parameters.source_channel
-            || provenance_channel != &parameters.source_channel
+        if input.recommendation_target != input.finding_channel
+            || provenance_channel != &input.finding_channel
         {
             return Err(ModelError::InvalidInput(
-                "source channel is not the recommendation's finding channel".into(),
+                "recommendation and provenance must identify the finding channel".into(),
             ));
         }
-        if provenance_observed_at != input.source_snapshot.ts {
+        if provenance_snapshot.network != Some(network) {
             return Err(ModelError::InvalidInput(
-                "source snapshot is not the finding's observed state".into(),
+                "snapshot reference network does not match simulation network".into(),
+            ));
+        }
+        let direction = input.finding_direction.ok_or_else(|| {
+            ModelError::InvalidInput("finding liquidity direction is required".into())
+        })?;
+        let expected_finding_channel = match direction {
+            FindingDirection::Outbound => &parameters.destination_channel,
+            FindingDirection::Inbound => &parameters.source_channel,
+        };
+        if &input.finding_channel != expected_finding_channel {
+            return Err(ModelError::InvalidInput(
+                match direction {
+                    FindingDirection::Outbound => {
+                        "outbound-drained finding channel must be the destination"
+                    }
+                    FindingDirection::Inbound => {
+                        "inbound-drained finding channel must be the source"
+                    }
+                }
+                .into(),
+            ));
+        }
+        let finding_snapshot = input.finding_snapshot();
+        if provenance_snapshot.observed_at != finding_snapshot.ts {
+            return Err(ModelError::InvalidInput(
+                "finding snapshot is not the finding's observed state".into(),
+            ));
+        }
+        if provenance_snapshot.state_digest != channel_snapshot_state_digest(finding_snapshot) {
+            return Err(ModelError::InvalidInput(
+                "finding snapshot digest does not match provenance".into(),
             ));
         }
         if parameters.source_channel == parameters.destination_channel {
@@ -322,6 +380,24 @@ impl SimulationModel for LiquidityRedistributionModel {
                 "snapshot node identity does not match finding provenance".into(),
             ));
         }
+        for (label, snapshot) in [
+            ("source", &input.source_snapshot),
+            ("destination", &input.destination_snapshot),
+        ] {
+            if snapshot.network != Some(network) {
+                return Err(ModelError::InvalidInput(format!(
+                    "{label} snapshot network does not match simulation network"
+                )));
+            }
+            let stored_digest = snapshot.state_digest.as_deref().ok_or_else(|| {
+                ModelError::InvalidInput(format!("{label} snapshot has no state digest"))
+            })?;
+            if stored_digest != channel_snapshot_state_digest(snapshot) {
+                return Err(ModelError::InvalidInput(format!(
+                    "{label} snapshot state digest is invalid"
+                )));
+            }
+        }
         if input.source_snapshot.ts != input.destination_snapshot.ts {
             return Err(ModelError::InvalidInput(
                 "source and destination snapshots must come from the same observation".into(),
@@ -330,6 +406,36 @@ impl SimulationModel for LiquidityRedistributionModel {
 
         validate_snapshot("source", &input.source_snapshot)?;
         validate_snapshot("destination", &input.destination_snapshot)?;
+        let finding_imbalance = liquidity_imbalance(finding_snapshot);
+        let direction_matches = matches!(
+            (
+                direction,
+                finding_imbalance,
+                finding_snapshot.local_ratio < 0.5
+            ),
+            (
+                FindingDirection::Outbound,
+                LiquidityImbalance::OutboundDrained,
+                _
+            ) | (
+                FindingDirection::Outbound,
+                LiquidityImbalance::SeverelyDrained,
+                true
+            ) | (
+                FindingDirection::Inbound,
+                LiquidityImbalance::InboundDrained,
+                _
+            ) | (
+                FindingDirection::Inbound,
+                LiquidityImbalance::SeverelyDrained,
+                false
+            )
+        );
+        if !direction_matches {
+            return Err(ModelError::InvalidInput(
+                "finding direction does not match the recorded channel state".into(),
+            ));
+        }
         let amount = parameters.amount_msat;
         if amount > input.source_snapshot.spendable_outbound_msat {
             return Err(ModelError::InvalidInput(format!(
@@ -387,22 +493,46 @@ impl SimulationModel for LiquidityRedistributionModel {
             source_local_after,
             source_remote_after,
         );
+        let destination_profile = rieko_domain::LiquidityProfile::compute(
+            destination.capacity_msat,
+            destination_local_after,
+            destination_remote_after,
+        );
         let input_hash = compute_input_hash(input)?;
+        let (baseline, projected) = if input.finding_channel == source.channel_id {
+            (
+                state(
+                    source.local_balance_msat,
+                    source.remote_balance_msat,
+                    source.capacity_msat,
+                ),
+                state(
+                    source_local_after,
+                    source_remote_after,
+                    source.capacity_msat,
+                ),
+            )
+        } else {
+            (
+                state(
+                    destination.local_balance_msat,
+                    destination.remote_balance_msat,
+                    destination.capacity_msat,
+                ),
+                state(
+                    destination_local_after,
+                    destination_remote_after,
+                    destination.capacity_msat,
+                ),
+            )
+        };
 
         Ok(SimulationResult {
             model_id: self.model_id().into(),
             model_version: self.model_version().into(),
             input_hash,
-            baseline: state(
-                source.local_balance_msat,
-                source.remote_balance_msat,
-                source.capacity_msat,
-            ),
-            projected: state(
-                source_local_after,
-                source_remote_after,
-                source.capacity_msat,
-            ),
+            baseline,
+            projected,
             deltas: vec![
                 ProjectedDelta {
                     channel_id: source.channel_id.clone(),
@@ -411,8 +541,8 @@ impl SimulationModel for LiquidityRedistributionModel {
                     remote_before_msat: source.remote_balance_msat,
                     remote_after_msat: source_remote_after,
                     delta_msat: amount,
-                    clears_finding: source_profile.imbalance
-                        == rieko_domain::LiquidityImbalance::Balanced,
+                    clears_finding: input.finding_channel == source.channel_id
+                        && source_profile.imbalance == LiquidityImbalance::Balanced,
                 },
                 ProjectedDelta {
                     channel_id: destination.channel_id.clone(),
@@ -421,7 +551,8 @@ impl SimulationModel for LiquidityRedistributionModel {
                     remote_before_msat: destination.remote_balance_msat,
                     remote_after_msat: destination_remote_after,
                     delta_msat: amount,
-                    clears_finding: false,
+                    clears_finding: input.finding_channel == destination.channel_id
+                        && destination_profile.imbalance == LiquidityImbalance::Balanced,
                 },
             ],
             assumptions: vec![
@@ -438,6 +569,15 @@ impl SimulationModel for LiquidityRedistributionModel {
             confidence: SimulationConfidence::Medium,
         })
     }
+}
+
+fn liquidity_imbalance(snapshot: &ChannelSnapshot) -> LiquidityImbalance {
+    rieko_domain::LiquidityProfile::compute(
+        snapshot.capacity_msat,
+        snapshot.local_balance_msat,
+        snapshot.remote_balance_msat,
+    )
+    .imbalance
 }
 
 fn validate_snapshot(label: &str, snapshot: &ChannelSnapshot) -> Result<(), ModelError> {
@@ -474,6 +614,13 @@ fn validate_snapshot(label: &str, snapshot: &ChannelSnapshot) -> Result<(), Mode
             snapshot.channel_id
         )));
     }
+    let expected_ratio = snapshot.local_balance_msat as f64 / snapshot.capacity_msat as f64;
+    if (snapshot.local_ratio - expected_ratio).abs() > f64::EPSILON * 4.0 {
+        return Err(ModelError::InvalidInput(format!(
+            "{label} channel {} has an inconsistent local ratio",
+            snapshot.channel_id
+        )));
+    }
     Ok(())
 }
 
@@ -491,8 +638,10 @@ mod tests {
     use super::*;
 
     fn snapshot(id: &str, local: u64, remote: u64, ts: DateTime<Utc>) -> ChannelSnapshot {
-        ChannelSnapshot {
+        let mut snapshot = ChannelSnapshot {
             node_id: Some("node-1".into()),
+            network: Some(BitcoinNetwork::Regtest),
+            state_digest: None,
             channel_id: id.into(),
             local_ratio: local as f64 / (local + remote) as f64,
             local_balance_msat: local,
@@ -502,7 +651,9 @@ mod tests {
             ts,
             spendable_outbound_msat: local.saturating_sub(10_000),
             spendable_inbound_msat: remote.saturating_sub(10_000),
-        }
+        };
+        snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+        snapshot
     }
 
     fn input() -> SimulationInput {
@@ -512,8 +663,11 @@ mod tests {
             recommendation_target: "c1".into(),
             finding_id: "f1".into(),
             finding_channel: "c1".into(),
+            finding_direction: Some(FindingDirection::Inbound),
             node_id: "node-1".into(),
+            network: Some(BitcoinNetwork::Regtest),
             provenance: rieko_findings::FindingProvenance {
+                network: Some(BitcoinNetwork::Regtest),
                 source: rieko_findings::ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
                 },
@@ -521,22 +675,42 @@ mod tests {
                 observation: rieko_findings::ObservationReference::ChannelState {
                     channel_id: "c1".into(),
                     snapshot: rieko_findings::ChannelSnapshotReference {
+                        network: Some(BitcoinNetwork::Regtest),
                         observed_at: ts,
-                        state_digest: "state-hash".into(),
+                        state_digest: channel_snapshot_state_digest(&snapshot(
+                            "c1", 950_000, 50_000, ts,
+                        )),
                     },
                 },
             },
             action_type: ActionType::RebalanceChannel,
             model_id: "liquidity-redistribution".into(),
-            model_version: "2".into(),
+            model_version: "3".into(),
             parameters: LiquidityRedistributionParameters {
                 source_channel: "c1".into(),
                 destination_channel: "c2".into(),
-                amount_msat: 50_000,
+                amount_msat: 100_000,
             },
-            source_snapshot: snapshot("c1", 200_000, 800_000, ts),
-            destination_snapshot: snapshot("c2", 700_000, 300_000, ts),
+            source_snapshot: snapshot("c1", 950_000, 50_000, ts),
+            destination_snapshot: snapshot("c2", 200_000, 800_000, ts),
         }
+    }
+
+    fn outbound_input() -> SimulationInput {
+        let mut input = input();
+        let ts = input.observed_at();
+        input.finding_direction = Some(FindingDirection::Outbound);
+        input.parameters.source_channel = "c2".into();
+        input.parameters.destination_channel = "c1".into();
+        input.parameters.amount_msat = 50_000;
+        input.source_snapshot = snapshot("c2", 800_000, 200_000, ts);
+        input.destination_snapshot = snapshot("c1", 50_000, 950_000, ts);
+        if let rieko_findings::ObservationReference::ChannelState { snapshot, .. } =
+            &mut input.provenance.observation
+        {
+            snapshot.state_digest = channel_snapshot_state_digest(&input.destination_snapshot);
+        }
+        input
     }
 
     #[test]
@@ -557,7 +731,7 @@ mod tests {
     fn model_version_changes_input_identity() {
         let input = input();
         let mut changed = input.clone();
-        changed.model_version = "3".into();
+        changed.model_version = "4".into();
         assert_ne!(
             compute_input_hash(&input).unwrap(),
             compute_input_hash(&changed).unwrap()
@@ -569,10 +743,56 @@ mod tests {
         let result = LiquidityRedistributionModel::new()
             .simulate(&input())
             .unwrap();
-        assert_eq!(result.deltas[0].local_after_msat, 150_000);
-        assert_eq!(result.deltas[0].remote_after_msat, 850_000);
-        assert_eq!(result.deltas[1].local_after_msat, 750_000);
-        assert_eq!(result.deltas[1].remote_after_msat, 250_000);
+        assert_eq!(result.deltas[0].local_after_msat, 850_000);
+        assert_eq!(result.deltas[0].remote_after_msat, 150_000);
+        assert_eq!(result.deltas[1].local_after_msat, 300_000);
+        assert_eq!(result.deltas[1].remote_after_msat, 700_000);
+        assert!(result.deltas[0].clears_finding);
+        assert!(!result.deltas[1].clears_finding);
+    }
+
+    #[test]
+    fn outbound_drained_finding_channel_is_the_destination() {
+        let model = LiquidityRedistributionModel::new();
+        let input = outbound_input();
+        let result = model.simulate(&input).unwrap();
+        assert_eq!(result.baseline.local_balance_msat, 50_000);
+        assert_eq!(result.projected.local_balance_msat, 100_000);
+        assert!(!result.deltas[0].clears_finding);
+        assert!(result.deltas[1].clears_finding);
+
+        let mut reversed = input;
+        std::mem::swap(
+            &mut reversed.parameters.source_channel,
+            &mut reversed.parameters.destination_channel,
+        );
+        std::mem::swap(
+            &mut reversed.source_snapshot,
+            &mut reversed.destination_snapshot,
+        );
+        assert!(model.validate(&reversed).is_err());
+    }
+
+    #[test]
+    fn network_and_snapshot_digest_must_match_provenance() {
+        let model = LiquidityRedistributionModel::new();
+        let mut wrong_network = input();
+        wrong_network.destination_snapshot.network = Some(BitcoinNetwork::Mainnet);
+        wrong_network.destination_snapshot.state_digest = Some(channel_snapshot_state_digest(
+            &wrong_network.destination_snapshot,
+        ));
+        assert!(model.validate(&wrong_network).is_err());
+
+        let mut replaced_state = input();
+        replaced_state.source_snapshot.local_balance_msat -= 1;
+        replaced_state.source_snapshot.remote_balance_msat += 1;
+        replaced_state.source_snapshot.local_ratio =
+            replaced_state.source_snapshot.local_balance_msat as f64
+                / replaced_state.source_snapshot.capacity_msat as f64;
+        replaced_state.source_snapshot.state_digest = Some(channel_snapshot_state_digest(
+            &replaced_state.source_snapshot,
+        ));
+        assert!(model.validate(&replaced_state).is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use rieko_domain::BitcoinNetwork;
 use rieko_findings::{
     finding_identity, Finding, FindingCycleScope, FindingLifecycle, ObservationSource,
     ProducerRole, ProducerVersion,
@@ -10,6 +11,7 @@ use thiserror::Error;
 /// Read-only context handed to a detector. Carries optional history so
 /// trend-based detectors can reason over time while staying pure.
 pub struct DetectorContext<'a> {
+    pub network: BitcoinNetwork,
     pub history: Option<&'a dyn HistoryView>,
     pub source: Option<&'a ObservationSource>,
     pub normalizer: Option<&'a ProducerVersion>,
@@ -17,8 +19,9 @@ pub struct DetectorContext<'a> {
 }
 
 impl<'a> DetectorContext<'a> {
-    pub fn no_context() -> Self {
+    pub fn no_context(network: BitcoinNetwork) -> Self {
         Self {
+            network,
             history: None,
             source: None,
             normalizer: None,
@@ -69,6 +72,7 @@ pub trait Detector {
             let expected_id = finding_identity(
                 self.id(),
                 self.version(),
+                Some(ctx.network),
                 finding.node.as_deref(),
                 finding.channel.as_deref(),
             );
@@ -93,6 +97,7 @@ pub trait Detector {
         Ok(DetectorCycle {
             scope: FindingCycleScope {
                 detector: self.id().to_string(),
+                network: Some(ctx.network),
                 node: Some(node.to_string()),
                 complete: self.is_complete(view, ctx),
             },

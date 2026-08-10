@@ -4,11 +4,11 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use chrono::Utc;
 use rieko_api::RiekoApi;
-use rieko_domain::{ChannelSnapshot, ChannelStatus};
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot, ChannelStatus};
 use rieko_findings::{
-    Action, ActionType, Actionability, ChannelSnapshotReference, Finding, FindingLifecycle,
-    FindingProvenance, ObservationReference, ObservationSource, Rationale, Recommendation,
-    Severity, FINDING_SCHEMA_VERSION,
+    channel_snapshot_state_digest, Action, ActionType, Actionability, ChannelSnapshotReference,
+    Evidence, Finding, FindingLifecycle, FindingProvenance, ObservationReference,
+    ObservationSource, Rationale, Recommendation, Severity, FINDING_SCHEMA_VERSION,
 };
 use rieko_storage::{MemoryStorage, Storage};
 use tower::ServiceExt;
@@ -19,8 +19,10 @@ fn snapshot(
     remote: u64,
     observed_at: chrono::DateTime<Utc>,
 ) -> ChannelSnapshot {
-    ChannelSnapshot {
+    let mut snapshot = ChannelSnapshot {
         node_id: Some("local-node".into()),
+        network: Some(BitcoinNetwork::Regtest),
+        state_digest: None,
         channel_id: channel_id.into(),
         local_ratio: local as f64 / (local + remote) as f64,
         local_balance_msat: local,
@@ -30,7 +32,9 @@ fn snapshot(
         ts: observed_at,
         spendable_outbound_msat: local.saturating_sub(10_000),
         spendable_inbound_msat: remote.saturating_sub(10_000),
-    }
+    };
+    snapshot.state_digest = Some(channel_snapshot_state_digest(&snapshot));
+    snapshot
 }
 
 fn seeded_app(auth: Option<&str>) -> (axum::Router, String) {
@@ -38,7 +42,20 @@ fn seeded_app(auth: Option<&str>) -> (axum::Router, String) {
 }
 
 fn seeded_app_at(auth: Option<&str>, observed_at: chrono::DateTime<Utc>) -> (axum::Router, String) {
+    seeded_app_for(auth, observed_at, "inbound")
+}
+
+fn seeded_app_for(
+    auth: Option<&str>,
+    observed_at: chrono::DateTime<Utc>,
+    direction: &str,
+) -> (axum::Router, String) {
     let mut storage = MemoryStorage::new();
+    let (finding_local, finding_remote) = if direction == "outbound" {
+        (50_000, 950_000)
+    } else {
+        (950_000, 50_000)
+    };
     let recommendation = Recommendation {
         finding_id: "finding-1".into(),
         action: Action::for_recommendation(
@@ -66,8 +83,9 @@ fn seeded_app_at(auth: Option<&str>, observed_at: chrono::DateTime<Utc>) -> (axu
             schema_version: FINDING_SCHEMA_VERSION,
             node: Some("local-node".into()),
             channel: Some("c1".into()),
-            evidence: Vec::new(),
+            evidence: vec![Evidence::text("direction", direction)],
             provenance: Some(FindingProvenance {
+                network: Some(BitcoinNetwork::Regtest),
                 source: ObservationSource::Fixture {
                     redacted_hash: "fixture-hash".into(),
                 },
@@ -75,8 +93,14 @@ fn seeded_app_at(auth: Option<&str>, observed_at: chrono::DateTime<Utc>) -> (axu
                 observation: ObservationReference::ChannelState {
                     channel_id: "c1".into(),
                     snapshot: ChannelSnapshotReference {
+                        network: Some(BitcoinNetwork::Regtest),
                         observed_at,
-                        state_digest: "state-hash".into(),
+                        state_digest: channel_snapshot_state_digest(&snapshot(
+                            "c1",
+                            finding_local,
+                            finding_remote,
+                            observed_at,
+                        )),
                     },
                 },
             }),
@@ -89,10 +113,10 @@ fn seeded_app_at(auth: Option<&str>, observed_at: chrono::DateTime<Utc>) -> (axu
         .unwrap();
     storage.save_recommendation(&recommendation).unwrap();
     storage
-        .save_channel_snapshot(&snapshot("c1", 200_000, 800_000, observed_at))
+        .save_channel_snapshot(&snapshot("c1", finding_local, finding_remote, observed_at))
         .unwrap();
     storage
-        .save_channel_snapshot(&snapshot("c2", 700_000, 300_000, observed_at))
+        .save_channel_snapshot(&snapshot("c2", 200_000, 800_000, observed_at))
         .unwrap();
     let mut api = RiekoApi::new(Box::new(storage)).unwrap();
     if let Some(token) = auth {
@@ -107,6 +131,16 @@ fn request_body(recommendation_id: &str) -> serde_json::Value {
         "model_id": "liquidity-redistribution",
         "source_channel": "c1",
         "destination_channel": "c2",
+        "amount_sats": 50
+    })
+}
+
+fn outbound_request_body(recommendation_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "recommendation_id": recommendation_id,
+        "model_id": "liquidity-redistribution",
+        "source_channel": "c2",
+        "destination_channel": "c1",
         "amount_sats": 50
     })
 }
@@ -249,6 +283,29 @@ async fn creates_reuses_and_reports_a_stable_projection() {
 }
 
 #[tokio::test]
+async fn outbound_drained_recommendation_uses_finding_channel_as_destination() {
+    let (app, recommendation_id) = seeded_app_for(None, Utc::now(), "outbound");
+    let response = post(&app, outbound_request_body(&recommendation_id), None).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let simulation = &created["simulation"];
+    assert_eq!(
+        simulation["result"]["baseline"]["local_balance_msat"],
+        50_000
+    );
+    assert_eq!(
+        simulation["result"]["projected"]["local_balance_msat"],
+        100_000
+    );
+    assert_eq!(simulation["result"]["deltas"][1]["channel_id"], "c1");
+    assert_eq!(simulation["result"]["deltas"][1]["clears_finding"], true);
+
+    let reversed = post(&app, request_body(&recommendation_id), None).await;
+    assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn validation_errors_have_stable_codes() {
     let (app, recommendation_id) = seeded_app(None);
     for (body, status, code) in [
@@ -322,6 +379,22 @@ async fn stale_source_requires_explicit_opt_in_and_remains_marked_stale() {
     let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(error["error"]["code"], "invalid_input");
     assert_eq!(error["error"]["simulation"]["status"], "invalid_input");
+}
+
+#[tokio::test]
+async fn future_dated_error_code_is_stable_on_replay() {
+    let (app, recommendation_id) = seeded_app_at(None, Utc::now() + chrono::Duration::hours(1));
+    for _ in 0..2 {
+        let response = post(&app, request_body(&recommendation_id), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "future_dated_input");
+        assert_eq!(
+            error["error"]["simulation"]["error_code"],
+            "future_dated_input"
+        );
+    }
 }
 
 #[tokio::test]
