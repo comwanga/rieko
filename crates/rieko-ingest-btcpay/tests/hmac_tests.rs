@@ -27,12 +27,41 @@ fn verifies_valid_signature_with_sha256_prefix() {
 }
 
 #[test]
-fn verifies_valid_signature_without_prefix() {
+fn rejects_signature_without_sha256_prefix() {
     let secret = b"another-secret-key-999";
     let payload = br#"{"deliveryId":"del-2","webhookId":"wh-2","type":"InvoiceExpired","timestamp":1629892100,"storeId":"store-abc","invoiceId":"inv-123"}"#;
 
     let hex_sig = compute_hmac_hex(secret, payload);
-    assert!(verify_btcpay_sig(secret, payload, &hex_sig));
+    // Raw hex without prefix MUST be rejected
+    assert!(!verify_btcpay_sig(secret, payload, &hex_sig));
+}
+
+#[test]
+fn rejects_unsupported_hash_prefixes() {
+    let secret = b"secret-123";
+    let payload = br#"{"type":"InvoiceSettled"}"#;
+    let hex_sig = compute_hmac_hex(secret, payload);
+
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        &format!("sha512={hex_sig}")
+    ));
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        &format!("sha1={hex_sig}")
+    ));
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        &format!("sha256:{hex_sig}")
+    ));
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        &format!("md5={hex_sig}")
+    ));
 }
 
 #[test]
@@ -80,7 +109,17 @@ fn rejects_empty_or_malformed_inputs() {
         payload,
         "sha256=not_hex_at_all!!"
     ));
-    assert!(!verify_btcpay_sig(secret, payload, "sha256=12345")); // too short
+    assert!(!verify_btcpay_sig(secret, payload, "sha256=12345")); // too short (5 chars)
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        "sha256=00000000000000000000000000000000000000000000000000000000000000" // 62 chars (too short)
+    ));
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        "sha256=000000000000000000000000000000000000000000000000000000000000000000" // 66 chars (too long)
+    ));
 }
 
 #[test]

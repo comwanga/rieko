@@ -19,7 +19,15 @@ pub const BTCPAY_SIG_HEADER: &str = "BTCPay-Sig";
 /// Verifies a BTCPay Greenfield webhook signature header (`BTCPay-Sig`) against the raw payload bytes.
 ///
 /// BTCPay Server Greenfield calculates HMAC-SHA256(secret, payload) and transmits it as:
-/// `sha256=<hex_encoded_hmac>` or `<hex_encoded_hmac>`.
+/// `BTCPay-Sig: sha256=<64 hexadecimal characters>`.
+///
+/// Strictly rejects:
+/// - Missing signature headers or empty secrets.
+/// - Raw hex signatures without the `sha256=` prefix.
+/// - Unsupported hash prefixes or algorithms.
+/// - Non-hexadecimal characters.
+/// - Signatures whose hex length is not exactly 64 characters (32 bytes).
+/// - Signatures that do not match the calculated HMAC.
 ///
 /// Uses constant-time comparison (`subtle::ConstantTimeEq`) to eliminate timing side-channel attacks.
 pub fn verify_btcpay_sig(secret: &[u8], payload_bytes: &[u8], sig_header: &str) -> bool {
@@ -28,13 +36,16 @@ pub fn verify_btcpay_sig(secret: &[u8], payload_bytes: &[u8], sig_header: &str) 
     }
 
     let header_clean = sig_header.trim();
-    let header_val = header_clean
-        .strip_prefix("sha256=")
-        .or_else(|| header_clean.strip_prefix("sha256:"))
-        .unwrap_or(header_clean)
-        .trim();
+    let Some(hex_str) = header_clean.strip_prefix("sha256=") else {
+        return false;
+    };
 
-    let Ok(provided_bytes) = hex::decode(header_val) else {
+    let hex_clean = hex_str.trim();
+    if hex_clean.len() != 64 {
+        return false;
+    }
+
+    let Ok(provided_bytes) = hex::decode(hex_clean) else {
         return false;
     };
 
@@ -136,14 +147,9 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
                 timestamp,
             }))
         }
-        other_type => {
-            let raw_json: serde_json::Value = serde_json::from_slice(payload_bytes)?;
-            Ok(NodeEvent::Custom {
-                kind: other_type.to_string(),
-                payload: raw_json,
-                timestamp,
-            })
-        }
+        other_type => Err(BtcPayError::MalformedPayload(format!(
+            "unsupported or non-telemetry webhook event type: {other_type}"
+        ))),
     }
 }
 

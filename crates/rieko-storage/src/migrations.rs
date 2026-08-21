@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -69,6 +69,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         sql: V12_CONSECUTIVE_ABSENT,
+    },
+    Migration {
+        version: 13,
+        sql: V13_WEBHOOK_DELIVERIES,
     },
 ];
 
@@ -388,6 +392,17 @@ CREATE INDEX idx_snapshots_network_channel_ts
 
 const V12_CONSECUTIVE_ABSENT: &str = r#"
 ALTER TABLE findings ADD COLUMN consecutive_absent INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const V13_WEBHOOK_DELIVERIES: &str = r#"
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id  TEXT PRIMARY KEY,
+    webhook_id   TEXT,
+    event_type   TEXT,
+    processed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_processed_at
+    ON webhook_deliveries (processed_at DESC);
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).

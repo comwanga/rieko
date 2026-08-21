@@ -207,6 +207,18 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::PruneSummary, StorageError>;
 
+    /// Check whether a webhook delivery has already been successfully processed.
+    fn is_webhook_delivery_processed(&mut self, delivery_id: &str) -> Result<bool, StorageError>;
+
+    /// Record a webhook delivery as successfully processed.
+    fn record_webhook_delivery(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError>;
+
     /// Constant-size table counts for `/status` and the `status` command.
     /// Backends must compute these without scanning entire tables into memory
     /// (RIEKO-AUDIT-008: no million-row status queries).
@@ -247,6 +259,14 @@ pub struct SimulationCounts {
     pub other: usize,
 }
 
+/// In-memory record for a processed webhook delivery.
+#[derive(Debug, Clone)]
+pub struct WebhookDeliveryRecord {
+    pub webhook_id: Option<String>,
+    pub event_type: Option<String>,
+    pub processed_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// In-memory implementation for tests and fixtures.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
@@ -261,6 +281,7 @@ pub struct MemoryStorage {
     operational_state: Option<rieko_status::OperationalState>,
     transaction_snapshot: Option<MemoryStorageState>,
     finding_absent: HashMap<String, u32>,
+    webhook_deliveries: HashMap<String, WebhookDeliveryRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +295,7 @@ struct MemoryStorageState {
     simulation_events: Vec<SimulationEvent>,
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
+    webhook_deliveries: HashMap<String, WebhookDeliveryRecord>,
 }
 
 impl MemoryStorage {
@@ -315,6 +337,7 @@ impl Storage for MemoryStorage {
             simulation_events: self.simulation_events.clone(),
             alert_state: self.alert_state.clone(),
             operational_state: self.operational_state.clone(),
+            webhook_deliveries: self.webhook_deliveries.clone(),
         });
         Ok(())
     }
@@ -342,6 +365,7 @@ impl Storage for MemoryStorage {
         self.simulation_events = snapshot.simulation_events;
         self.alert_state = snapshot.alert_state;
         self.operational_state = snapshot.operational_state;
+        self.webhook_deliveries = snapshot.webhook_deliveries;
         Ok(())
     }
 
@@ -846,6 +870,28 @@ impl Storage for MemoryStorage {
             .filter(|event| event.simulation_id == simulation_id)
             .cloned()
             .collect())
+    }
+
+    fn is_webhook_delivery_processed(&mut self, delivery_id: &str) -> Result<bool, StorageError> {
+        Ok(self.webhook_deliveries.contains_key(delivery_id))
+    }
+
+    fn record_webhook_delivery(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        self.webhook_deliveries.insert(
+            delivery_id.to_string(),
+            WebhookDeliveryRecord {
+                webhook_id: webhook_id.map(ToString::to_string),
+                event_type: event_type.map(ToString::to_string),
+                processed_at,
+            },
+        );
+        Ok(())
     }
 }
 

@@ -254,6 +254,39 @@ impl Storage for SqliteStorage {
         }
     }
 
+    fn is_webhook_delivery_processed(&mut self, delivery_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM webhook_deliveries WHERE delivery_id = ?1",
+                params![delivery_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Backend(format!("querying webhook delivery: {e}")))?;
+        Ok(count > 0)
+    }
+
+    fn record_webhook_delivery(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO webhook_deliveries (delivery_id, webhook_id, event_type, processed_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    delivery_id,
+                    webhook_id,
+                    event_type,
+                    processed_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Backend(format!("recording webhook delivery: {e}")))?;
+        Ok(())
+    }
+
     fn begin_transaction(&mut self) -> Result<(), StorageError> {
         if self.in_transaction {
             return Err(StorageError::Backend("nested transaction attempted".into()));
