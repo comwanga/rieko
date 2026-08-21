@@ -648,16 +648,24 @@ pub async fn channel_snapshots(
 
 /// Webhook ingestion endpoint for BTCPay Server Greenfield notifications.
 ///
-/// Verifies `BTCPay-Sig` HMAC-SHA256 signature using constant-time comparison,
-/// normalizes incoming payloads into domain `NodeEvent` instances, and forwards
-/// them onto the ingestion adapter channel.
+/// Processing pipeline:
+/// 1. Body-size enforcement (1MB max via Axum middleware).
+/// 2. HMAC-SHA256 signature verification (`BTCPay-Sig: sha256=<64 hex chars>`).
+/// 3. Payload deserialization and delivery identity extraction (`deliveryId` / `originalDeliveryId`).
+/// 4. Deduplication check against persistent storage (acknowledged as `already_processed` without re-queueing).
+/// 5. Normalization into strongly-typed `NodeEvent`.
+/// 6. Bounded event enqueueing with timeout protection against prolonged saturation (returns 503 if full).
+/// 7. Mark delivery as accepted in durable storage only after successful enqueue.
 pub async fn btcpay_webhook(
     State(api): State<RiekoApi>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    use rieko_ingest_btcpay::{normalize_webhook_payload, verify_btcpay_sig, BTCPAY_SIG_HEADER};
+    use rieko_ingest_btcpay::{
+        normalize_webhook_payload, verify_btcpay_sig, BtcPayWebhookEvent, BTCPAY_SIG_HEADER,
+    };
 
+    // 1. Signature Verification (HMAC-SHA256 constant-time)
     if let Some(secret) = api.state.btcpay_webhook_secret.as_deref() {
         let sig = headers
             .get(BTCPAY_SIG_HEADER)
@@ -678,7 +686,8 @@ pub async fn btcpay_webhook(
         }
     }
 
-    let event = normalize_webhook_payload(&body).map_err(|e| {
+    // 2. Extract delivery envelope and identity
+    let envelope: BtcPayWebhookEvent = serde_json::from_slice(&body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -690,14 +699,101 @@ pub async fn btcpay_webhook(
         )
     })?;
 
+    let fallback_delivery_id =
+        (!envelope.delivery_id.is_empty()).then_some(envelope.delivery_id.as_str());
+    let canonical_delivery_id = envelope
+        .original_delivery_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(fallback_delivery_id);
+
+    // 3. Deduplication check against persistent storage
+    if let Some(del_id) = canonical_delivery_id {
+        let is_already_processed = {
+            let mut storage = api.state.storage.lock().await;
+            storage
+                .is_webhook_delivery_processed(del_id)
+                .unwrap_or(false)
+        };
+
+        if is_already_processed {
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "already_processed",
+                    "delivery_id": del_id
+                })),
+            ));
+        }
+    }
+
+    // 4. Normalization into strongly-typed domain event
+    let event = normalize_webhook_payload(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "normalization_failed",
+                    "message": e.to_string()
+                }
+            })),
+        )
+    })?;
+
+    // 5. Backpressure-safe event enqueueing
     if let Some(sender) = &api.state.event_sender {
-        let _ = sender.send(event).await;
+        // Enqueue with bounded timeout (2 seconds) to avoid indefinite blocking
+        match tokio::time::timeout(std::time::Duration::from_secs(2), sender.send(event)).await {
+            Ok(Ok(())) => {
+                // Enqueue succeeded — now record delivery in storage
+                if let Some(del_id) = canonical_delivery_id {
+                    let mut storage = api.state.storage.lock().await;
+                    let _ = storage.record_webhook_delivery(
+                        del_id,
+                        Some(envelope.webhook_id.as_str()),
+                        Some(&envelope.event_type),
+                        chrono::Utc::now(),
+                    );
+                }
+            }
+            Ok(Err(_)) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "ingestion_unavailable",
+                            "message": "Ingestion event stream is closed"
+                        }
+                    })),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "queue_saturated",
+                            "message": "Ingestion event queue is saturated; retry later"
+                        }
+                    })),
+                ));
+            }
+        }
+    } else if let Some(del_id) = canonical_delivery_id {
+        let mut storage = api.state.storage.lock().await;
+        let _ = storage.record_webhook_delivery(
+            del_id,
+            Some(envelope.webhook_id.as_str()),
+            Some(&envelope.event_type),
+            chrono::Utc::now(),
+        );
     }
 
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
-            "status": "accepted"
+            "status": "accepted",
+            "delivery_id": canonical_delivery_id.unwrap_or_default()
         })),
     ))
 }

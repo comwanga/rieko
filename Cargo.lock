@@ -1268,6 +1268,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",
@@ -1313,12 +1314,18 @@ name = "rieko-detectors"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
+ "hmac",
  "rieko-domain",
  "rieko-findings",
  "rieko-graph",
+ "rieko-ingest-btcpay",
+ "rieko-ingest-lnd",
  "rieko-recommendations",
  "serde_json",
+ "sha2",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
