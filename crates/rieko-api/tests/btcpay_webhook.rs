@@ -93,7 +93,10 @@ async fn webhook_rejects_invalid_signature() {
         .method("POST")
         .uri("/api/v1/integrations/btcpay/webhook")
         .header("content-type", "application/json")
-        .header("BTCPay-Sig", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+        .header(
+            "BTCPay-Sig",
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+        )
         .body(Body::from(payload.to_vec()))
         .unwrap();
 

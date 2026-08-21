@@ -701,4 +701,3 @@ pub async fn btcpay_webhook(
         })),
     ))
 }
-

@@ -1,4 +1,3 @@
-use tokio_stream::StreamExt;
 use hmac::{Hmac, Mac};
 use rieko_domain::{BitcoinNetwork, NodeEvent, NodeIngestionAdapter};
 use rieko_ingest_btcpay::{
@@ -6,6 +5,7 @@ use rieko_ingest_btcpay::{
     BtcPayGreenfieldClient,
 };
 use sha2::Sha256;
+use tokio_stream::StreamExt;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -44,7 +44,11 @@ fn rejects_tampered_payload() {
     let header_val = format!("sha256={hex_sig}");
 
     let mut tampered_payload = payload.to_vec();
-    tampered_payload[10] = if tampered_payload[10] == b'a' { b'b' } else { b'a' };
+    tampered_payload[10] = if tampered_payload[10] == b'a' {
+        b'b'
+    } else {
+        b'a'
+    };
 
     assert!(!verify_btcpay_sig(secret, &tampered_payload, &header_val));
 }
@@ -56,7 +60,11 @@ fn rejects_wrong_secret() {
     let payload = br#"{"type":"InvoiceSettled"}"#;
 
     let hex_sig = compute_hmac_hex(secret_correct, payload);
-    assert!(!verify_btcpay_sig(secret_wrong, payload, &format!("sha256={hex_sig}")));
+    assert!(!verify_btcpay_sig(
+        secret_wrong,
+        payload,
+        &format!("sha256={hex_sig}")
+    ));
 }
 
 #[test]
@@ -67,7 +75,11 @@ fn rejects_empty_or_malformed_inputs() {
     assert!(!verify_btcpay_sig(b"", payload, "sha256=abcdef"));
     assert!(!verify_btcpay_sig(secret, payload, ""));
     assert!(!verify_btcpay_sig(secret, payload, "   "));
-    assert!(!verify_btcpay_sig(secret, payload, "sha256=not_hex_at_all!!"));
+    assert!(!verify_btcpay_sig(
+        secret,
+        payload,
+        "sha256=not_hex_at_all!!"
+    ));
     assert!(!verify_btcpay_sig(secret, payload, "sha256=12345")); // too short
 }
 
@@ -104,7 +116,10 @@ fn normalizes_invoice_settled_payload() {
             assert_eq!(e.amount_msat, 100_000);
             assert_eq!(e.fee_msat, 100);
             assert_eq!(e.payment_hash.as_deref(), Some("hash123"));
-            assert_eq!(e.metadata.get("orderId").map(|s| s.as_str()), Some("order-42"));
+            assert_eq!(
+                e.metadata.get("orderId").map(|s| s.as_str()),
+                Some("order-42")
+            );
         }
         other => panic!("expected InvoiceSettled, got {:?}", other),
     }
@@ -173,7 +188,10 @@ async fn adapter_event_stream_propagates_webhook_events() {
     };
 
     let adapter = BtcPayAdapter::new(client, config);
-    let mut stream = adapter.event_stream().await.expect("stream subscription succeeds");
+    let mut stream = adapter
+        .event_stream()
+        .await
+        .expect("stream subscription succeeds");
 
     let payload = br#"{
         "deliveryId": "del-stream-1",

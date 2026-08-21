@@ -3,9 +3,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use rieko_domain::{BitcoinNetwork, ChannelStatus, NodeIngestionAdapter};
-use rieko_ingest_btcpay::{
-    BtcPayAdapter, BtcPayAdapterConfig, BtcPayGreenfieldClient,
-};
+use rieko_ingest_btcpay::{BtcPayAdapter, BtcPayAdapterConfig, BtcPayGreenfieldClient};
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -17,7 +15,9 @@ async fn mock_server_info() -> impl IntoResponse {
     }))
 }
 
-async fn mock_lightning_info(Path((_store_id, _crypto)): Path<(String, String)>) -> impl IntoResponse {
+async fn mock_lightning_info(
+    Path((_store_id, _crypto)): Path<(String, String)>,
+) -> impl IntoResponse {
     Json(json!({
         "nodeURIs": ["02112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00@127.0.0.1:9735"],
         "blockHeight": 850000,
@@ -30,7 +30,9 @@ async fn mock_lightning_info(Path((_store_id, _crypto)): Path<(String, String)>)
     }))
 }
 
-async fn mock_lightning_balance(Path((_store_id, _crypto)): Path<(String, String)>) -> impl IntoResponse {
+async fn mock_lightning_balance(
+    Path((_store_id, _crypto)): Path<(String, String)>,
+) -> impl IntoResponse {
     Json(json!({
         "total": 5000000,
         "local": 3000000,
@@ -39,7 +41,9 @@ async fn mock_lightning_balance(Path((_store_id, _crypto)): Path<(String, String
     }))
 }
 
-async fn mock_lightning_channels(Path((_store_id, _crypto)): Path<(String, String)>) -> impl IntoResponse {
+async fn mock_lightning_channels(
+    Path((_store_id, _crypto)): Path<(String, String)>,
+) -> impl IntoResponse {
     Json(json!([
         {
             "channelPoint": "1111111111111111111111111111111111111111111111111111111111111111:0",
@@ -65,7 +69,9 @@ async fn mock_lightning_channels(Path((_store_id, _crypto)): Path<(String, Strin
     ]))
 }
 
-async fn mock_onchain_wallet(Path((_store_id, _crypto)): Path<(String, String)>) -> impl IntoResponse {
+async fn mock_onchain_wallet(
+    Path((_store_id, _crypto)): Path<(String, String)>,
+) -> impl IntoResponse {
     Json(json!({
         "balance": 1500000,
         "confirmedBalance": 1500000,
@@ -120,7 +126,10 @@ async fn polls_greenfield_into_normalized_node_snapshot() {
     assert_eq!(health.source_name, "btcpay");
 
     // Test snapshot fetch and normalization
-    let snapshot = adapter.fetch_snapshot().await.expect("fetch_snapshot passes");
+    let snapshot = adapter
+        .fetch_snapshot()
+        .await
+        .expect("fetch_snapshot passes");
     assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
     assert_eq!(snapshot.active_channels_count, 2);
     assert_eq!(snapshot.inactive_channels_count, 1);

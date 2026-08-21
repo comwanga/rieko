@@ -22,22 +22,26 @@ impl BtcPayGreenfieldClient {
     ///
     /// `base_url` e.g. `https://btcpay.example.com`
     /// `api_key` Greenfield API Key with Store permissions.
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, BtcPayError> {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, BtcPayError> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let api_key = api_key.into().trim().to_string();
 
         if base_url.is_empty() {
-            return Err(BtcPayError::Config("BTCPay Server base URL cannot be empty".into()));
+            return Err(BtcPayError::Config(
+                "BTCPay Server base URL cannot be empty".into(),
+            ));
         }
         if api_key.is_empty() {
-            return Err(BtcPayError::Config("BTCPay Server API key cannot be empty".into()));
+            return Err(BtcPayError::Config(
+                "BTCPay Server API key cannot be empty".into(),
+            ));
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let mut auth_val = HeaderValue::from_str(&format!("token {api_key}"))
             .map_err(|_| BtcPayError::Config("Invalid characters in API key".into()))?;
         auth_val.set_sensitive(true);
@@ -68,7 +72,12 @@ impl BtcPayGreenfieldClient {
     /// Fetches server status and version from `GET /api/v1/server/info`.
     pub async fn get_server_info(&self) -> Result<GreenfieldServerInfo, BtcPayError> {
         let url = format!("{}/api/v1/server/info", self.base_url);
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -77,7 +86,10 @@ impl BtcPayGreenfieldClient {
                 message: body,
             });
         }
-        let info = resp.json::<GreenfieldServerInfo>().await.map_err(BtcPayError::Http)?;
+        let info = resp
+            .json::<GreenfieldServerInfo>()
+            .await
+            .map_err(BtcPayError::Http)?;
         Ok(info)
     }
 
@@ -91,7 +103,12 @@ impl BtcPayGreenfieldClient {
             "{}/api/v1/stores/{}/lightning/{}/info",
             self.base_url, store_id, crypto_code
         );
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -100,7 +117,10 @@ impl BtcPayGreenfieldClient {
                 message: body,
             });
         }
-        let info = resp.json::<GreenfieldLightningInfo>().await.map_err(BtcPayError::Http)?;
+        let info = resp
+            .json::<GreenfieldLightningInfo>()
+            .await
+            .map_err(BtcPayError::Http)?;
         Ok(info)
     }
 
@@ -114,7 +134,12 @@ impl BtcPayGreenfieldClient {
             "{}/api/v1/stores/{}/lightning/{}/balance",
             self.base_url, store_id, crypto_code
         );
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -140,7 +165,12 @@ impl BtcPayGreenfieldClient {
             "{}/api/v1/stores/{}/lightning/{}/channels",
             self.base_url, store_id, crypto_code
         );
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -166,7 +196,12 @@ impl BtcPayGreenfieldClient {
             "{}/api/v1/stores/{}/onchain/{}/wallet",
             self.base_url, store_id, crypto_code
         );
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -192,7 +227,12 @@ impl BtcPayGreenfieldClient {
         if let Some(status) = status_filter {
             url.push_str(&format!("?status={status}"));
         }
-        let resp = self.http.get(&url).send().await.map_err(BtcPayError::Http)?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(BtcPayError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -201,7 +241,10 @@ impl BtcPayGreenfieldClient {
                 message: body,
             });
         }
-        let invoices = resp.json::<Vec<GreenfieldInvoice>>().await.map_err(BtcPayError::Http)?;
+        let invoices = resp
+            .json::<Vec<GreenfieldInvoice>>()
+            .await
+            .map_err(BtcPayError::Http)?;
         Ok(invoices)
     }
 }

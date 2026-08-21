@@ -95,14 +95,12 @@ impl NodeIngestionAdapter for BtcPayAdapter {
         let info = self
             .client
             .get_lightning_info(store_id, crypto_code)
-            .await
-            .map_err(BtcPayError::from)?;
+            .await?;
 
         let raw_channels = self
             .client
             .get_lightning_channels(store_id, crypto_code)
-            .await
-            .map_err(BtcPayError::from)?;
+            .await?;
 
         let wallet = self
             .client

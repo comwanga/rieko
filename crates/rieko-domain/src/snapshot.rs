@@ -217,4 +217,3 @@ mod tests {
         assert_eq!(node_snap.onchain_balance_sats, Some(1_000_000));
     }
 }
-

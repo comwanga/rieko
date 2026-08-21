@@ -54,8 +54,8 @@ pub fn verify_btcpay_sig(secret: &[u8], payload_bytes: &[u8], sig_header: &str) 
 
 /// Parses and normalizes raw Greenfield webhook payload bytes into a `NodeEvent`.
 pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcPayError> {
-    let envelope: BtcPayWebhookEvent =
-        serde_json::from_slice(payload_bytes).map_err(|e| BtcPayError::MalformedPayload(e.to_string()))?;
+    let envelope: BtcPayWebhookEvent = serde_json::from_slice(payload_bytes)
+        .map_err(|e| BtcPayError::MalformedPayload(e.to_string()))?;
 
     let timestamp = envelope.timestamp_utc();
 
