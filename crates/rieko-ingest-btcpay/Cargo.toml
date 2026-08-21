@@ -1,0 +1,31 @@
+[package]
+name = "rieko-ingest-btcpay"
+description = "BTCPay Server Greenfield normalizer and webhook ingestion adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rieko-domain.workspace = true
+rieko-findings.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio-stream.workspace = true
+futures-core.workspace = true
+async-trait.workspace = true
+subtle.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum = "0.7"

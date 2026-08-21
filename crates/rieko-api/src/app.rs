@@ -42,6 +42,10 @@ pub struct AppState {
     pub auth_token: Option<String>,
     /// Sliding-window rate limiter for simulation creation requests.
     pub simulation_rate: tokio::sync::Mutex<Vec<Instant>>,
+    /// Optional webhook secret for BTCPay Server Greenfield HMAC verification.
+    pub btcpay_webhook_secret: Option<String>,
+    /// Optional channel sender for dispatched telemetry events.
+    pub event_sender: Option<tokio::sync::mpsc::Sender<rieko_domain::NodeEvent>>,
 }
 
 pub const SIMULATION_RATE_LIMIT: usize = 5;
@@ -77,6 +81,8 @@ impl RiekoApi {
                 storage: Arc::new(Mutex::new(storage)),
                 auth_token: None,
                 simulation_rate: tokio::sync::Mutex::new(Vec::new()),
+                btcpay_webhook_secret: None,
+                event_sender: None,
             }),
             static_dir: None,
         })
@@ -100,8 +106,26 @@ impl RiekoApi {
             storage: self.state.storage.clone(),
             auth_token: Some(token),
             simulation_rate: tokio::sync::Mutex::new(Vec::new()),
+            btcpay_webhook_secret: self.state.btcpay_webhook_secret.clone(),
+            event_sender: self.state.event_sender.clone(),
         });
         Ok(self)
+    }
+
+    /// Configures BTCPay Server Greenfield webhook secret and event dispatch sender.
+    pub fn with_btcpay_webhook(
+        mut self,
+        secret: impl Into<String>,
+        sender: tokio::sync::mpsc::Sender<rieko_domain::NodeEvent>,
+    ) -> Self {
+        self.state = Arc::new(AppState {
+            storage: self.state.storage.clone(),
+            auth_token: self.state.auth_token.clone(),
+            simulation_rate: tokio::sync::Mutex::new(Vec::new()),
+            btcpay_webhook_secret: Some(secret.into()),
+            event_sender: Some(sender),
+        });
+        self
     }
 
     pub fn router(&self) -> axum::Router {
@@ -158,6 +182,10 @@ impl RiekoApi {
             .route(
                 "/snapshots/channel/:channel_id",
                 axum::routing::get(crate::routes::channel_snapshots),
+            )
+            .route(
+                "/api/v1/integrations/btcpay/webhook",
+                axum::routing::post(crate::routes::btcpay_webhook),
             );
         #[cfg(feature = "simulate")]
         let router = router
@@ -237,6 +265,9 @@ async fn require_auth(
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
+    if req.uri().path() == "/api/v1/integrations/btcpay/webhook" {
+        return Ok(next.run(req).await);
+    }
     if let Some(token) = api.state.auth_token.as_deref() {
         let provided = req
             .headers()

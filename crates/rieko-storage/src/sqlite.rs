@@ -1548,7 +1548,7 @@ impl WriterLock {
     }
 }
 
-/// Flock-based exclusive lock. Returns a backend error when the lock is held
+/// Flock-based exclusive lock on unix. Returns a backend error when the lock is held
 /// by another process (non-blocking attempt).
 #[cfg(target_family = "unix")]
 fn lock(file: &std::fs::File) -> std::io::Result<()> {
@@ -1561,9 +1561,31 @@ fn lock(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-/// Non-unix fallback: real writers are still serialized by SQLite's own
+/// LockFile-based exclusive lock on Windows.
+#[cfg(windows)]
+fn lock(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    extern "system" {
+        fn LockFile(
+            hFile: *mut std::ffi::c_void,
+            dwFileOffsetLow: u32,
+            dwFileOffsetHigh: u32,
+            nNumberOfBytesToLockLow: u32,
+            nNumberOfBytesToLockHigh: u32,
+        ) -> i32;
+    }
+    let handle = file.as_raw_handle();
+    let res = unsafe { LockFile(handle as _, 0, 0, 1, 0) };
+    if res != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Fallback for other platforms: real writers are still serialized by SQLite's own
 /// locking; this only weakens the advisory guard. Kept for portability.
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", windows)))]
 fn lock(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
@@ -1575,6 +1597,23 @@ impl Drop for WriterLock {
             use std::os::unix::io::AsRawFd;
             unsafe {
                 libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn UnlockFile(
+                    hFile: *mut std::ffi::c_void,
+                    dwFileOffsetLow: u32,
+                    dwFileOffsetHigh: u32,
+                    nNumberOfBytesToUnlockLow: u32,
+                    nNumberOfBytesToUnlockHigh: u32,
+                ) -> i32;
+            }
+            let handle = self.file.as_raw_handle();
+            unsafe {
+                UnlockFile(handle as _, 0, 0, 1, 0);
             }
         }
     }

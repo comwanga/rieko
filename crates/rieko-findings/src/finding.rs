@@ -14,6 +14,10 @@ pub enum ObservationSource {
         redacted_endpoint: String,
         configured_node: String,
     },
+    BtcPay {
+        redacted_endpoint: String,
+        configured_store: String,
+    },
 }
 
 /// Pipeline role of the component which produced an observation.

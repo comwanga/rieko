@@ -645,3 +645,60 @@ pub async fn channel_snapshots(
         .collect();
     Ok(Json(out))
 }
+
+/// Webhook ingestion endpoint for BTCPay Server Greenfield notifications.
+///
+/// Verifies `BTCPay-Sig` HMAC-SHA256 signature using constant-time comparison,
+/// normalizes incoming payloads into domain `NodeEvent` instances, and forwards
+/// them onto the ingestion adapter channel.
+pub async fn btcpay_webhook(
+    State(api): State<RiekoApi>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    use rieko_ingest_btcpay::{normalize_webhook_payload, verify_btcpay_sig, BTCPAY_SIG_HEADER};
+
+    if let Some(secret) = api.state.btcpay_webhook_secret.as_deref() {
+        let sig = headers
+            .get(BTCPAY_SIG_HEADER)
+            .or_else(|| headers.get("btcpay-sig"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+
+        if !verify_btcpay_sig(secret.as_bytes(), &body, sig) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_signature",
+                        "message": "BTCPay-Sig HMAC-SHA256 signature verification failed"
+                    }
+                })),
+            ));
+        }
+    }
+
+    let event = normalize_webhook_payload(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_payload",
+                    "message": e.to_string()
+                }
+            })),
+        )
+    })?;
+
+    if let Some(sender) = &api.state.event_sender {
+        let _ = sender.send(event).await;
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "accepted"
+        })),
+    ))
+}
+
