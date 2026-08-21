@@ -1,6 +1,6 @@
 use chrono::Utc;
-use rieko_detectors::SettlementReliabilityDetector;
 use rieko_detectors::registry::{Detector, DetectorContext};
+use rieko_detectors::SettlementReliabilityDetector;
 use rieko_domain::{
     BitcoinNetwork, Channel, ChannelId, ChannelStatus, FeePolicy, InvoiceExpiredEvent,
     InvoiceSettledEvent, LiquidityProfile, NodeEvent, NodeId,
@@ -89,7 +89,8 @@ fn seed_demo_database() {
     ]; // 80% failure rate
 
     let btcpay_source = ObservationSource::BtcPay {
-        redacted_endpoint: "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069".into(),
+        redacted_endpoint:
+            "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069".into(),
         configured_store: "btcpay-store-merchant".into(),
         underlying_node: Some(local_node_str.into()),
     };
@@ -122,7 +123,8 @@ fn seed_demo_database() {
         }
     }
 
-    let snapshot = rieko_domain::ChannelSnapshot::from_channel(&channel, Utc::now(), BitcoinNetwork::Mainnet);
+    let snapshot =
+        rieko_domain::ChannelSnapshot::from_channel(&channel, Utc::now(), BitcoinNetwork::Mainnet);
     storage.save_channel_snapshot(&snapshot).unwrap();
 
     println!("Seeded demo database successfully at {:?}", db_path);
