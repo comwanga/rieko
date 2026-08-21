@@ -519,6 +519,8 @@ mod tests {
             source: Some(&observation_source),
             normalizer: Some(&normalizer),
             node: Some("local-node"),
+            events: None,
+            chain_synchronized: None,
         };
         let cycle = LiquidityDetector::new("local-node")
             .evaluate(&graph, &context)

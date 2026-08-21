@@ -190,6 +190,8 @@ fn full_operational_pipeline_btcpay_lnd_webhooks_to_recommendations() {
         source: Some(&btcpay_source),
         normalizer: Some(&normalizer),
         node: Some("node-merchant-hub"),
+        events: None,
+        chain_synchronized: None,
     };
 
     let detector = LiquidityDetector::new(local_node_id.clone());

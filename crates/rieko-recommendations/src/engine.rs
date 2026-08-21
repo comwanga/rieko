@@ -82,6 +82,16 @@ struct LiquidityTrendInput {
     evidence_refs: Vec<String>,
 }
 
+struct SettlementReliabilityInput {
+    channel: Option<String>,
+    expired_invoices: f64,
+    settled_invoices: f64,
+    failure_rate: f64,
+    chain_synchronized: bool,
+    root_cause: String,
+    evidence_refs: Vec<String>,
+}
+
 /// Maps findings to concrete actions. v1: every action is created at
 /// `Recommended` stage, carries NO execution parameters, and is accompanied by
 /// a deterministic, evidence-backed rationale. LLMs never generate actions or
@@ -101,6 +111,10 @@ impl RecommendationEngine {
             "liquidity_trend" => {
                 let input = LiquidityTrendInput::parse(finding)?;
                 Ok(self.recommend_liquidity_trend(finding, input))
+            }
+            "settlement_reliability" => {
+                let input = SettlementReliabilityInput::parse(finding)?;
+                Ok(self.recommend_settlement_reliability(finding, input))
             }
             detector => Err(RecommendationEngineError::UnsupportedDetector {
                 finding_id: finding.id.clone(),
@@ -194,6 +208,78 @@ impl RecommendationEngine {
             },
         }]
     }
+
+    fn recommend_settlement_reliability(
+        &self,
+        finding: &Finding,
+        input: SettlementReliabilityInput,
+    ) -> Vec<Recommendation> {
+        let SettlementReliabilityInput {
+            channel,
+            expired_invoices,
+            settled_invoices,
+            failure_rate,
+            chain_synchronized,
+            root_cause,
+            evidence_refs,
+        } = input;
+
+        let target_chan = channel.unwrap_or_else(|| "primary-routing-path".to_string());
+
+        let summary = if chain_synchronized {
+            format!(
+                "Lightning invoice settlement degradation detected: {:.1}% failure rate ({} expired, {} settled). \
+                 Bitcoin Core node is synchronized; rebalance channel {} to restore outbound liquidity on merchant settlement paths.",
+                failure_rate * 100.0,
+                expired_invoices as u64,
+                settled_invoices as u64,
+                target_chan
+            )
+        } else {
+            format!(
+                "Invoice settlement failure rate is elevated ({:.1}% failure rate). \
+                 Bitcoin Core is not synchronized; verify chain synchronization before executing Lightning rebalances.",
+                failure_rate * 100.0
+            )
+        };
+
+        vec![Recommendation {
+            finding_id: finding.id.clone(),
+            action: Action::for_recommendation(
+                &finding.id,
+                ActionType::RebalanceChannel,
+                Some(target_chan.clone()),
+                serde_json::json!({
+                    "reason": "lightning invoice settlement reliability degradation",
+                    "failure_rate": failure_rate,
+                    "expired_invoices": expired_invoices,
+                    "settled_invoices": settled_invoices,
+                    "chain_synchronized": chain_synchronized,
+                    "root_cause": root_cause,
+                    "target_channel": target_chan,
+                }),
+                summary,
+            ),
+            rationale: Rationale {
+                evidence: evidence_refs,
+                preconditions: vec![
+                    format!("Inspect channel {target_chan} local and remote balance split."),
+                    "Verify node on-chain and off-chain liquidity reserves.".into(),
+                    "Confirm Bitcoin Core RPC connection remains responsive.".into(),
+                ],
+                expected_effect: "Restores local outbound liquidity on settlement channels, reducing invoice expiry failures.".into(),
+                risks: vec![
+                    "Circular rebalance consumes routing fees on intermediate hops.".into(),
+                    "Opening or resizing channels during mempool congestion increases on-chain fee cost.".into(),
+                ],
+                limitations: vec![
+                    "Metric aggregates failures across recent webhook/event window.".into(),
+                    "Individual payment failures may also be caused by destination invoice expiry or path unreachability.".into(),
+                ],
+                actionability: Actionability::OperatorActionable,
+            },
+        }]
+    }
 }
 
 impl ChannelLiquidityInput {
@@ -260,6 +346,30 @@ impl LiquidityTrendInput {
             current_ratio,
             decline,
             window: raw_window as u64,
+            evidence_refs: evidence_refs(finding),
+        })
+    }
+}
+
+impl SettlementReliabilityInput {
+    fn parse(finding: &Finding) -> Result<Self, RecommendationEngineError> {
+        validate_common(finding)?;
+        let expired_invoices = required_nonnegative_number(finding, "expired_invoices")?;
+        let settled_invoices = required_nonnegative_number(finding, "settled_invoices")?;
+        let failure_rate = required_ratio(finding, "failure_rate")?;
+        let chain_sync_str = required_nonempty_text(finding, "chain_synchronized")?;
+        let chain_synchronized = chain_sync_str == "true";
+        let root_cause = required_nonempty_text(finding, "root_cause")?.to_string();
+
+        let channel = finding.channel.clone().filter(|c| !c.trim().is_empty());
+
+        Ok(Self {
+            channel,
+            expired_invoices,
+            settled_invoices,
+            failure_rate,
+            chain_synchronized,
+            root_cause,
             evidence_refs: evidence_refs(finding),
         })
     }
@@ -975,6 +1085,51 @@ mod tests {
         assert!(
             summary.contains("0.24"),
             "summary must include current ratio"
+        );
+    }
+
+    #[test]
+    fn settlement_reliability_produces_rebalance_recommendation() {
+        let now = chrono::Utc::now();
+        let finding = Finding {
+            id: "settlement-finding-1".into(),
+            detector: "settlement_reliability".into(),
+            detector_version: "1".into(),
+            schema_version: FINDING_SCHEMA_VERSION,
+            severity: Severity::Critical,
+            node: Some("node-test".into()),
+            channel: Some("chan-bottleneck".into()),
+            evidence: vec![
+                Evidence::number("expired_invoices", 4.0),
+                Evidence::number("settled_invoices", 1.0),
+                Evidence::number("total_invoices", 5.0),
+                Evidence::number("failure_rate", 0.80),
+                Evidence::number("drained_channels_count", 1.0),
+                Evidence::number("inactive_channels_count", 0.0),
+                Evidence::string("chain_synchronized", "true"),
+                Evidence::string("diagnosis", "lightning_settlement_degraded"),
+                Evidence::string("root_cause", "lightning_operational_degradation"),
+            ],
+            provenance: None,
+            explanation: Some("Degraded settlement reliability".into()),
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: FindingLifecycle::Active,
+        };
+
+        let engine = RecommendationEngine;
+        let recs = engine.recommend(&finding).unwrap();
+        assert_eq!(recs.len(), 1);
+        let rec = &recs[0];
+        assert_eq!(rec.action.action_type, ActionType::RebalanceChannel);
+        assert_eq!(rec.action.stage, ActionStage::Recommended);
+        assert_eq!(rec.action.target.as_deref(), Some("chan-bottleneck"));
+        assert!(rec.action.summary.contains("chan-bottleneck"));
+        assert!(rec.action.summary.contains("80.0% failure rate"));
+        assert_eq!(
+            rec.rationale.actionability,
+            Actionability::OperatorActionable
         );
     }
 }

@@ -485,6 +485,8 @@ mod tests {
             source: Some(&source),
             normalizer: Some(&normalizer),
             node: Some("local-node"),
+            events: None,
+            chain_synchronized: None,
         };
 
         let cycle = detector.evaluate(&graph, &context).unwrap();

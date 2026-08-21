@@ -1005,6 +1005,8 @@ mod tests {
                     source: Some(&source),
                     normalizer: None,
                     node: Some("local-node"),
+                    events: None,
+                    chain_synchronized: None,
                 },
             )
             .unwrap();

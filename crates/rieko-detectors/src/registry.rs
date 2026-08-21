@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use rieko_domain::BitcoinNetwork;
+use rieko_domain::{BitcoinNetwork, NodeEvent};
 use rieko_findings::{
     finding_identity, Finding, FindingCycleScope, FindingLifecycle, ObservationSource,
     ProducerRole, ProducerVersion,
@@ -8,14 +8,17 @@ use rieko_findings::{
 use rieko_graph::{GraphView, HistoryView};
 use thiserror::Error;
 
-/// Read-only context handed to a detector. Carries optional history so
-/// trend-based detectors can reason over time while staying pure.
+/// Read-only context handed to a detector. Carries optional history, temporal events,
+/// and chain synchronization status so trend-based and multi-source correlation
+/// detectors can reason over time while staying pure.
 pub struct DetectorContext<'a> {
     pub network: BitcoinNetwork,
     pub history: Option<&'a dyn HistoryView>,
     pub source: Option<&'a ObservationSource>,
     pub normalizer: Option<&'a ProducerVersion>,
     pub node: Option<&'a str>,
+    pub events: Option<&'a [NodeEvent]>,
+    pub chain_synchronized: Option<bool>,
 }
 
 impl<'a> DetectorContext<'a> {
@@ -26,6 +29,8 @@ impl<'a> DetectorContext<'a> {
             source: None,
             normalizer: None,
             node: None,
+            events: None,
+            chain_synchronized: None,
         }
     }
 }

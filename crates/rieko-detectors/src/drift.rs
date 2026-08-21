@@ -229,6 +229,8 @@ mod tests {
             source: None,
             normalizer: None,
             node: None,
+            events: None,
+            chain_synchronized: None,
         }
     }
 
@@ -253,6 +255,8 @@ mod tests {
             source: None,
             normalizer: None,
             node: Some("local-node"),
+            events: None,
+            chain_synchronized: None,
         };
         let cycle = detector.evaluate(&graph, &context).unwrap();
         assert!(!cycle.scope.complete);
