@@ -127,11 +127,6 @@ pub enum NodeEvent {
     ChannelStateChanged(ChannelStateChangedEvent),
     PeerStatusChanged(PeerStatusChangedEvent),
     SnapshotUpdated(Box<NodeSnapshot>),
-    Custom {
-        kind: String,
-        payload: serde_json::Value,
-        timestamp: DateTime<Utc>,
-    },
 }
 
 impl NodeEvent {
@@ -146,7 +141,6 @@ impl NodeEvent {
             Self::ChannelStateChanged(e) => e.timestamp,
             Self::PeerStatusChanged(e) => e.timestamp,
             Self::SnapshotUpdated(e) => e.captured_at,
-            Self::Custom { timestamp, .. } => *timestamp,
         }
     }
 }

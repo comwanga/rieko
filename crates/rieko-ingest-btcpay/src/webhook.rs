@@ -136,14 +136,9 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
                 timestamp,
             }))
         }
-        other_type => {
-            let raw_json: serde_json::Value = serde_json::from_slice(payload_bytes)?;
-            Ok(NodeEvent::Custom {
-                kind: other_type.to_string(),
-                payload: raw_json,
-                timestamp,
-            })
-        }
+        other_type => Err(BtcPayError::MalformedPayload(format!(
+            "unsupported or non-telemetry webhook event type: {other_type}"
+        ))),
     }
 }
 

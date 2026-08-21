@@ -1405,6 +1405,7 @@ dependencies = [
 name = "rieko-ingest-lnd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "rcgen",
  "reqwest",
@@ -1417,6 +1418,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
 ]
 
 [[package]]

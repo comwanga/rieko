@@ -17,6 +17,8 @@ pub enum ObservationSource {
     BtcPay {
         redacted_endpoint: String,
         configured_store: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        underlying_node: Option<String>,
     },
 }
 
