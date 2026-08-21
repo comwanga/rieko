@@ -108,6 +108,7 @@ cargo run -- serve --addr 0.0.0.0:8080 --allow-external \
 | `GET /snapshots?limit=N` | Channel snapshots |
 | `GET /snapshots/channel/:id` | Snapshots for a channel |
 | `GET /snapshots/channel/:id?network=N&node_id=N` | Network-filtered snapshots |
+| `POST /api/v1/integrations/btcpay/webhook` | BTCPay Server Greenfield webhook receiver (HMAC-SHA256) |
 | `POST /api/v2/simulations` | Create local deterministic projection |
 | `GET /api/v2/simulations?limit=N` | Recent replayable projections |
 | `GET /api/v2/simulations/:id` | Projection detail |
@@ -118,6 +119,13 @@ Simulation POST routes produce local projections only — they never contact or
 mutate a node. All other routes are read-only. Request size is capped at 1 MB
 and pagination is bounded 1–500 (default 50). Simulation creation is rate-limited
 to 5 requests per second.
+
+## BTCPay Server Greenfield Integration
+
+Rieko supports ingestion from BTCPay Server Greenfield:
+- **Webhook Ingestion**: Real-time event streaming (`InvoiceSettled`, `InvoiceExpired`, `InvoicePaymentReceived`) via `POST /api/v1/integrations/btcpay/webhook` with constant-time HMAC-SHA256 signature verification (`BTCPay-Sig`).
+- **REST Client**: Asynchronous polling of Lightning info, channels, balances, on-chain wallets, and invoices.
+- **Normalized Ingestion Adapter**: Pluggable `NodeIngestionAdapter` yielding an asynchronous stream of normalized domain `NodeEvent` and `NodeSnapshot` objects.
 
 ## Simulation (v2, enabled by default)
 
@@ -171,11 +179,11 @@ Failed deliveries do not consume the cooldown. Severity escalation (Warning
 ## Architecture
 
 ```
-LND / Core ──▶ Normalizers ──▶ Domain Objects ──▶ Graph ──▶ Detectors ──▶ Recommendations
-                                                    │               │
-                                              Explanations      Simulations
-                                                    │          (deterministic)
-                                               Alerts
+LND / BTCPay / Core ──▶ Ingestion Adapters ──▶ Normalized Domain Events / Snapshots ──▶ Graph ──▶ Detectors ──▶ Recommendations
+                                                                                                      │               │
+                                                                                                Explanations      Simulations
+                                                                                                      │          (deterministic)
+                                                                                                 Alerts
 ```
 
 ### Detectors
@@ -192,10 +200,11 @@ zero duplicates.
 
 | Crate | Layer | Description |
 |-------|-------|-------------|
-| `rieko-domain` | Kernel | Domain model |
+| `rieko-domain` | Kernel | Domain models (`NodeEvent`, `NodeSnapshot`, `NodeIngestionAdapter`) |
 | `rieko-graph` | Kernel | Typed graph with path-finding |
 | `rieko-storage` | Persistence | SQLite + in-memory storage |
-| `rieko-findings` | Engine | Typed findings, actions, identity |
+| `rieko-findings` | Engine | Typed findings, actions, identity, observation sources |
+| `rieko-ingest-btcpay` | Ingest | BTCPay Server Greenfield client, webhook verifier, and adapter |
 | `rieko-ingest-lnd` | Ingest | LND REST client and normalizer |
 | `rieko-ingest-core` | Ingest | Bitcoin Core normalizer |
 | `rieko-detectors` | Engine | Liquidity and drift detectors |

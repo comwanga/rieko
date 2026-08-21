@@ -56,9 +56,7 @@ pub fn transition(
             to,
         });
     }
-    if to == ActionStage::Approved && actor.trim().is_empty()
-        || to == ActionStage::Approved && actor == SYSTEM_ACTOR
-    {
+    if to == ActionStage::Approved && (actor.trim().is_empty() || actor == SYSTEM_ACTOR) {
         return Err(ExecutionError::NeedsHuman(actor.to_string()));
     }
     Ok(to)

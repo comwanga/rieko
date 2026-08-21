@@ -18,12 +18,14 @@ fn binary() -> PathBuf {
         .status()
         .expect("cargo build failed");
     assert!(status.success(), "binary must compile");
+    let bin_name = if cfg!(windows) { "rieko.exe" } else { "rieko" };
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("target/debug/rieko")
+        .join("target/debug")
+        .join(bin_name)
 }
 
 fn fixture() -> PathBuf {

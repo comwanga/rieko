@@ -26,6 +26,7 @@ rieko-alerts.workspace = true
 rieko-llm.workspace = true
 rieko-status.workspace = true
 rieko-ingest-lnd.workspace = true
+rieko-ingest-btcpay.workspace = true
 rieko-api.workspace = true
 
 anyhow.workspace = true

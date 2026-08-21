@@ -7,6 +7,7 @@ members = [
     "crates/rieko-findings",
     "crates/rieko-ingest-lnd",
     "crates/rieko-ingest-core",
+    "crates/rieko-ingest-btcpay",
     "crates/rieko-detectors",
     "crates/rieko-recommendations",
     "crates/rieko-simulation",
@@ -39,6 +40,7 @@ rieko-storage = { path = "crates/rieko-storage", version = "0.1.0" }
 rieko-findings = { path = "crates/rieko-findings", version = "0.1.0" }
 rieko-ingest-lnd = { path = "crates/rieko-ingest-lnd", version = "0.1.0" }
 rieko-ingest-core = { path = "crates/rieko-ingest-core", version = "0.1.0" }
+rieko-ingest-btcpay = { path = "crates/rieko-ingest-btcpay", version = "0.1.0" }
 rieko-detectors = { path = "crates/rieko-detectors", version = "0.1.0" }
 rieko-recommendations = { path = "crates/rieko-recommendations", version = "0.1.0" }
 rieko-simulation = { path = "crates/rieko-simulation", version = "0.1.0" }
@@ -57,10 +59,19 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libc = "0.2"
 
 [profile.release]
