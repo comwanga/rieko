@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
-use rieko_detectors::{Detector, DetectorContext, DriftDetector, LiquidityDetector};
+use rieko_detectors::{
+    Detector, DetectorContext, DriftDetector, LiquidityDetector, SettlementReliabilityDetector,
+};
 use rieko_domain::BitcoinNetwork;
 use rieko_findings::{channel_snapshot_state_digest, Finding};
 use rieko_graph::{GraphView, InMemoryGraph, InMemoryHistory};
@@ -170,6 +172,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let detectors: Vec<Box<dyn Detector>> = vec![
         Box::new(LiquidityDetector::new(args.node.clone())),
         Box::new(DriftDetector::new(args.node.clone())),
+        Box::new(SettlementReliabilityDetector::new(args.node.clone())),
     ];
     let normalizer = source.normalizer();
 
@@ -250,6 +253,8 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             source: Some(&observation_source),
             normalizer: Some(&normalizer),
             node: Some(&args.node),
+            events: None,
+            chain_synchronized: None,
         };
         let mut cycles = Vec::new();
         for detector in &detectors {

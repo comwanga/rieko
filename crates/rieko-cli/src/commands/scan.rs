@@ -91,10 +91,15 @@ pub fn run(args: ScanArgs) -> Result<()> {
         source: Some(&observation_source),
         normalizer: Some(&normalizer),
         node: Some(&args.node),
+        events: None,
+        chain_synchronized: None,
     };
     let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
         Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
         Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
+        Box::new(rieko_detectors::SettlementReliabilityDetector::new(
+            args.node.clone(),
+        )),
     ];
     let mut cycles = Vec::new();
     for detector in &detectors {

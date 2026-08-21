@@ -82,6 +82,8 @@ fn correlates_btcpay_and_lnd_operational_evidence_into_typed_findings() {
         source: Some(&btcpay_source),
         normalizer: Some(&normalizer),
         node: Some("node-alpha"),
+        events: None,
+        chain_synchronized: None,
     };
 
     // 5. Run pure deterministic liquidity detector (no LLM, no I/O)
