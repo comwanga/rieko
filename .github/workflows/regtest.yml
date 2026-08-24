@@ -114,6 +114,16 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/lnd"
 
+          # Pre-generate RFC 5280 compliant end-entity TLS cert/key (CA:FALSE) with SANs
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -nodes \
+            -keyout "${RUNNER_TEMP}/lnd/tls.key" \
+            -out "${RUNNER_TEMP}/lnd/tls.cert" \
+            -days 365 \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName = DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints = critical,CA:FALSE"
+
           docker run -d \
             --name lnd \
             --network regtest-net \
@@ -131,8 +141,6 @@ jobs:
             --rpclisten=0.0.0.0:10009 \
             --restlisten=0.0.0.0:8080 \
             --listen=0.0.0.0:9735 \
-            --tlsextraip=127.0.0.1 \
-            --tlsextradomain=localhost \
             --noseedbackup
 
       - name: Initialize LND wallet and wait for readiness
