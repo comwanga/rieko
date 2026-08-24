@@ -39,12 +39,12 @@ fn build_http_client(
 ) -> Result<reqwest::blocking::Client, LndClientError> {
     let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
     if let Some(pem) = tls_cert_pem {
-        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(&pem))
-            .next()
-            .transpose()
-            .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?
-            .ok_or_else(|| LndClientError::Tls("no certificate found in --tls-cert".into()))?;
-        let cert = reqwest::Certificate::from_der(der.as_ref())
+        let pem_str = std::str::from_utf8(&pem)
+            .map_err(|e| LndClientError::Tls(format!("invalid certificate encoding: {e}")))?;
+        if !pem_str.contains("-----BEGIN CERTIFICATE-----") {
+            return Err(LndClientError::Tls("no certificate found in --tls-cert".into()));
+        }
+        let cert = reqwest::Certificate::from_pem(&pem)
             .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?;
         builder = builder.add_root_certificate(cert);
     }
