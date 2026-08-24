@@ -1,10 +1,10 @@
-﻿name: Regtest Integration
+name: Regtest Integration
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
-    branches: [main]
+    branches: ["**"]
   schedule:
     # Run nightly at 02:00 UTC
     - cron: "0 2 * * *"
@@ -44,5 +44,5 @@ jobs:
         run: |
           cargo run -- scan \
             --network regtest \
-            --fixture fixtures/snapshot_regtest.json \
+            --fixture fixtures/channels.json \
             --db /tmp/rieko_regtest.db

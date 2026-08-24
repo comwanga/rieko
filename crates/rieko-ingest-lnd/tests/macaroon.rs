@@ -74,8 +74,7 @@ fn macaroon_secret_is_absent_from_errors() {
     // Point at a dead port so the fetch fails; the macaroon value must not
     // leak into the error message.
     let macaroon = vec![0xde, 0xad, 0xbe, 0xef];
-    let client =
-        LndClient::new_allow_insecure("http://127.0.0.1:1", Some(macaroon), None).unwrap();
+    let client = LndClient::new_allow_insecure("http://127.0.0.1:1", Some(macaroon), None).unwrap();
     let err = client
         .channels(&NodeId::new("local"))
         .unwrap_err()

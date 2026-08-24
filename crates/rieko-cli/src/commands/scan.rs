@@ -60,7 +60,6 @@ pub struct ScanArgs {
     allow_insecure: bool,
 }
 
-
 pub fn run(args: ScanArgs) -> Result<()> {
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
     let mut storage = SqliteStorage::open(&db_path)
@@ -107,7 +106,9 @@ pub fn run(args: ScanArgs) -> Result<()> {
     };
     if source.lnd_rest.is_none() {
         // No BTCPay events wired; settlement detector will produce no findings.
-        info!("settlement_reliability detector: no BTCPay events configured; detector will be silent");
+        info!(
+            "settlement_reliability detector: no BTCPay events configured; detector will be silent"
+        );
     }
     let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
         Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
@@ -173,12 +174,14 @@ pub fn run(args: ScanArgs) -> Result<()> {
                     super::common::ComponentKind::AlertSink,
                     rieko_status::ComponentState::Configured,
                 )?;
-                Some(PersistentDedupingSink::new(
-                    sink,
-                    store,
-                    Duration::from_secs(args.alert_cooldown),
+                Some(
+                    PersistentDedupingSink::new(
+                        sink,
+                        store,
+                        Duration::from_secs(args.alert_cooldown),
+                    )
+                    .with_sink_id("live|telegram"),
                 )
-                .with_sink_id("live|telegram"))
             }
             Err(e) => {
                 super::common::record_component(

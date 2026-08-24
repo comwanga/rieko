@@ -39,12 +39,14 @@ fn build_http_client(
 ) -> Result<reqwest::blocking::Client, LndClientError> {
     let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
     if let Some(pem) = tls_cert_pem {
-        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(&pem))
-            .next()
-            .transpose()
-            .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?
-            .ok_or_else(|| LndClientError::Tls("no certificate found in --tls-cert".into()))?;
-        let cert = reqwest::Certificate::from_der(der.as_ref())
+        let pem_str = std::str::from_utf8(&pem)
+            .map_err(|e| LndClientError::Tls(format!("invalid certificate encoding: {e}")))?;
+        if !pem_str.contains("-----BEGIN CERTIFICATE-----") {
+            return Err(LndClientError::Tls(
+                "no certificate found in --tls-cert".into(),
+            ));
+        }
+        let cert = reqwest::Certificate::from_pem(&pem)
             .map_err(|e| LndClientError::Tls(format!("invalid certificate: {e}")))?;
         builder = builder.add_root_certificate(cert);
     }
@@ -103,7 +105,12 @@ impl LndClient {
         allow_insecure: bool,
     ) -> Result<Self, LndClientError> {
         let rest_base = rest_base.into();
-        if !allow_insecure && rest_base.trim_start().to_ascii_lowercase().starts_with("http://") {
+        if !allow_insecure
+            && rest_base
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("http://")
+        {
             return Err(LndClientError::InsecureTransport);
         }
         Ok(Self {
@@ -277,8 +284,7 @@ mod tests {
     #[test]
     fn macaroon_is_lowercase_hex() {
         let mac = vec![0xde, 0xad, 0xbe, 0xef];
-        let client =
-            LndClient::new_allow_insecure("http://127.0.0.1:1", Some(mac), None).unwrap();
+        let client = LndClient::new_allow_insecure("http://127.0.0.1:1", Some(mac), None).unwrap();
         assert_eq!(client.macaroon_hex.as_deref(), Some("deadbeef"));
     }
 

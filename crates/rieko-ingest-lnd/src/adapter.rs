@@ -70,9 +70,7 @@ impl NodeIngestionAdapter for LndAdapter {
 
         // Warn if the caller supplied a different pubkey than what LND reports.
         if let Some(hint) = &self.local_node_hint {
-            if hint.as_ref() != info.identity_pubkey.as_str()
-                && hint.as_ref() != "local-node"
-            {
+            if hint.as_ref() != info.identity_pubkey.as_str() && hint.as_ref() != "local-node" {
                 warn!(
                     supplied = %hint,
                     actual = %info.identity_pubkey,
@@ -92,7 +90,11 @@ impl NodeIngestionAdapter for LndAdapter {
         for c in &raw_channels {
             match Normalizer::channel(c, &local_node, now) {
                 Ok(channel) => {
-                    channel_snapshots.push(ChannelSnapshot::from_channel(&channel, now, self.network));
+                    channel_snapshots.push(ChannelSnapshot::from_channel(
+                        &channel,
+                        now,
+                        self.network,
+                    ));
                 }
                 Err(e) => {
                     warn!(

@@ -22,7 +22,6 @@ tokio-stream.workspace = true
 tracing.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
-rustls-pemfile = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -18,10 +18,8 @@ use std::path::PathBuf;
 const BTCPAY_ENDPOINT: &str =
     "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069";
 /// Synthetic peer pubkey — prefix "SYNTH" makes the intent obvious.
-const PEER_PUBKEY: &str =
-    "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const CHANNEL_POINT: &str =
-    "2222222222222222222222222222222222222222222222222222222222222222:1";
+const PEER_PUBKEY: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CHANNEL_POINT: &str = "2222222222222222222222222222222222222222222222222222222222222222:1";
 
 #[test]
 fn seed_demo_database() {
@@ -37,8 +35,7 @@ fn seed_demo_database() {
 
     let mut storage = SqliteStorage::open(&db_path).expect("open sqlite db");
 
-    let local_node_str =
-        "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let local_node_str = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let local_node = NodeId::new(local_node_str);
     let bottleneck_channel_id = "800000x100x1";
 
@@ -128,9 +125,7 @@ fn seed_demo_database() {
     };
 
     let detector = SettlementReliabilityDetector::new(local_node.clone());
-    let cycle = detector
-        .evaluate(&graph, &ctx)
-        .expect("evaluate detector");
+    let cycle = detector.evaluate(&graph, &ctx).expect("evaluate detector");
 
     let engine = RecommendationEngine;
     for finding in &cycle.findings {
@@ -141,11 +136,8 @@ fn seed_demo_database() {
         }
     }
 
-    let snapshot = rieko_domain::ChannelSnapshot::from_channel(
-        &channel,
-        now,
-        BitcoinNetwork::Mainnet,
-    );
+    let snapshot =
+        rieko_domain::ChannelSnapshot::from_channel(&channel, now, BitcoinNetwork::Mainnet);
     storage.save_channel_snapshot(&snapshot).unwrap();
 
     println!("Seeded demo database successfully at {:?}", db_path);
