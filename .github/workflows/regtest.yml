@@ -110,14 +110,10 @@ jobs:
       # ---------------------------------------------------------
       # 3. LND Regtest Setup & Initialization
       # ---------------------------------------------------------
-      - name: Prepare LND data directory & credentials
-        run: |
-          mkdir -p "${RUNNER_TEMP}/lnd"
-          echo "let-me-in-12345" > "${RUNNER_TEMP}/lnd/pwd.txt"
-          chmod 600 "${RUNNER_TEMP}/lnd/pwd.txt"
-
       - name: Start LND regtest node
         run: |
+          mkdir -p "${RUNNER_TEMP}/lnd"
+
           docker run -d \
             --name lnd \
             --network regtest-net \
@@ -125,7 +121,6 @@ jobs:
             -p 127.0.0.1:10009:10009 \
             -v "${RUNNER_TEMP}/lnd:/root/.lnd" \
             ${{ env.LND_IMAGE }} \
-            --bitcoin.active \
             --bitcoin.regtest \
             --bitcoin.node=bitcoind \
             --bitcoind.rpchost=bitcoind:18443 \
@@ -138,11 +133,22 @@ jobs:
             --listen=0.0.0.0:9735 \
             --tlsextraip=127.0.0.1 \
             --tlsextradomain=localhost \
-            --wallet-unlock-password-file=/root/.lnd/pwd.txt \
-            --wallet-unlock-allow-create
+            --noseedbackup
 
-      - name: Wait for LND readiness
+      - name: Initialize LND wallet and wait for readiness
         run: |
+          echo "Waiting for LND RPC listener..."
+          for i in $(seq 1 30); do
+            if docker exec lnd lncli --network=regtest state 2>&1 | grep -qE "NON_EXISTING|LOCKED|UNLOCKED|WAITING_TO_START"; then
+              echo "LND RPC is accepting commands."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Initializing LND wallet non-interactively..."
+          printf "let-me-in-12345\nlet-me-in-12345\n" | docker exec -i lnd lncli --network=regtest create --noseedbackup || true
+
           echo "Waiting for LND TLS cert, macaroon, and REST readiness..."
           LND_TLS="${RUNNER_TEMP}/lnd/tls.cert"
           LND_MAC="${RUNNER_TEMP}/lnd/data/chain/bitcoin/regtest/readonly.macaroon"
