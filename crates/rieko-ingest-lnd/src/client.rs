@@ -66,7 +66,7 @@ fn macaroon_header(bytes: Vec<u8>) -> String {
 /// RPC; write operations live on the execute-gated mutator instead. Certificate
 /// validation is never disabled, so an optional certificate only narrows trust
 /// to the configured peer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LndClient {
     rest_base: String,
     macaroon_hex: Option<String>,

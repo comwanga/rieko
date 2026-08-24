@@ -12,6 +12,7 @@ use crate::client::LndClient;
 use crate::normalize::Normalizer;
 
 /// Ingestion adapter bridging LND REST into Rieko's normalized operational intelligence engine.
+#[derive(Clone)]
 pub struct LndAdapter {
     client: LndClient,
     /// Fallback local node identity used when the caller explicitly supplies one.
@@ -51,15 +52,8 @@ impl LndAdapter {
     pub fn network(&self) -> BitcoinNetwork {
         self.network
     }
-}
 
-#[async_trait]
-impl NodeIngestionAdapter for LndAdapter {
-    fn source_name(&self) -> &'static str {
-        "lnd"
-    }
-
-    async fn fetch_snapshot(&self) -> Result<NodeSnapshot, IngestionError> {
+    fn fetch_snapshot_blocking(&self) -> Result<NodeSnapshot, IngestionError> {
         // Derive identity from the live node rather than trusting a CLI argument.
         let info = self
             .client
@@ -118,11 +112,7 @@ impl NodeIngestionAdapter for LndAdapter {
         Ok(snapshot)
     }
 
-    async fn event_stream(&self) -> Result<BoxEventStream, IngestionError> {
-        Ok(Box::pin(tokio_stream::empty()))
-    }
-
-    async fn health_check(&self) -> Result<AdapterHealth, IngestionError> {
+    fn health_check_blocking(&self) -> Result<AdapterHealth, IngestionError> {
         let start = Instant::now();
         // Prefer GetInfo for health checks — it confirms auth + connectivity in one call.
         match self.client.get_info() {
@@ -142,6 +132,39 @@ impl NodeIngestionAdapter for LndAdapter {
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 message: Some(e.to_string()),
             }),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeIngestionAdapter for LndAdapter {
+    fn source_name(&self) -> &'static str {
+        "lnd"
+    }
+
+    async fn fetch_snapshot(&self) -> Result<NodeSnapshot, IngestionError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || this.fetch_snapshot_blocking())
+                .await
+                .map_err(|e| IngestionError::Connection(format!("spawn_blocking error: {e}")))?
+        } else {
+            self.fetch_snapshot_blocking()
+        }
+    }
+
+    async fn event_stream(&self) -> Result<BoxEventStream, IngestionError> {
+        Ok(Box::pin(tokio_stream::empty()))
+    }
+
+    async fn health_check(&self) -> Result<AdapterHealth, IngestionError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || this.health_check_blocking())
+                .await
+                .map_err(|e| IngestionError::Connection(format!("spawn_blocking error: {e}")))?
+        } else {
+            self.health_check_blocking()
         }
     }
 }

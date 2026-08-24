@@ -1,8 +1,8 @@
-﻿use rieko_domain::{BitcoinNetwork, NodeIngestionAdapter};
+use rieko_domain::{BitcoinNetwork, NodeIngestionAdapter};
 use rieko_ingest_lnd::{LndAdapter, LndClient};
 
-#[test]
-fn live_regtest_adapter_fetches_snapshot() {
+#[tokio::test]
+async fn live_regtest_adapter_fetches_snapshot() {
     let Ok(rest) = std::env::var("LND_REST") else {
         // Skipped in environments without a running LND instance.
         return;
@@ -21,31 +21,24 @@ fn live_regtest_adapter_fetches_snapshot() {
         .expect("LndClient::new must accept valid TLS cert and macaroon");
     let adapter = LndAdapter::new_auto(client, BitcoinNetwork::Regtest);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
+    // 1. Verify health_check executes against live /v1/getinfo over TLS with macaroon
+    let health = adapter.health_check().await.expect("health check");
+    assert!(
+        health.is_connected,
+        "health_check must report connected for live LND node: {:?}",
+        health.message
+    );
+    assert_eq!(health.source_name, "lnd");
 
-    rt.block_on(async {
-        // 1. Verify health_check executes against live /v1/getinfo over TLS with macaroon
-        let health = adapter.health_check().await.expect("health check");
-        assert!(
-            health.is_connected,
-            "health_check must report connected for live LND node: {:?}",
-            health.message
-        );
-        assert_eq!(health.source_name, "lnd");
-
-        // 2. Verify fetch_snapshot derives identity from GetInfo and fetches channel snapshot
-        let snapshot = adapter.fetch_snapshot().await.expect("fetch snapshot");
-        assert!(
-            !snapshot.node_id.is_empty(),
-            "node_id must be populated from live GetInfo identity_pubkey"
-        );
-        assert_ne!(
-            snapshot.node_id, "local-node",
-            "node_id must be the real LND pubkey, not fallback default"
-        );
-        assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
-    });
+    // 2. Verify fetch_snapshot derives identity from GetInfo and fetches channel snapshot
+    let snapshot = adapter.fetch_snapshot().await.expect("fetch snapshot");
+    assert!(
+        !snapshot.node_id.is_empty(),
+        "node_id must be populated from live GetInfo identity_pubkey"
+    );
+    assert_ne!(
+        snapshot.node_id, "local-node",
+        "node_id must be the real LND pubkey, not fallback default"
+    );
+    assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
 }
