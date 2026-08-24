@@ -17,21 +17,37 @@ async fn live_regtest_adapter_fetches_snapshot() {
     let macaroon = std::fs::read(&mac_path)
         .unwrap_or_else(|e| panic!("failed to read macaroon from {mac_path}: {e}"));
 
-    let client = LndClient::new(rest, Some(macaroon), Some(tls_cert))
+    let client = LndClient::new(&rest, Some(macaroon), Some(tls_cert))
         .expect("LndClient::new must accept valid TLS cert and macaroon");
     let adapter = LndAdapter::new_auto(client, BitcoinNetwork::Regtest);
 
-    // 1. Verify health_check executes against live /v1/getinfo over TLS with macaroon
-    let health = adapter.health_check().await.expect("health check");
+    // 1. Direct client get_info verification
+    let info = adapter
+        .client()
+        .get_info()
+        .unwrap_or_else(|e| panic!("client.get_info() failed against {rest}: {e:?}"));
+    println!(
+        "Live regtest node identity: {} (version: {:?})",
+        info.identity_pubkey, info.version
+    );
+
+    // 2. Adapter health_check
+    let health = adapter
+        .health_check()
+        .await
+        .unwrap_or_else(|e| panic!("health_check() returned error: {e:?}"));
     assert!(
         health.is_connected,
-        "health_check must report connected for live LND node: {:?}",
+        "health_check must report connected for live LND node: message={:?}",
         health.message
     );
     assert_eq!(health.source_name, "lnd");
 
-    // 2. Verify fetch_snapshot derives identity from GetInfo and fetches channel snapshot
-    let snapshot = adapter.fetch_snapshot().await.expect("fetch snapshot");
+    // 3. Adapter fetch_snapshot
+    let snapshot = adapter
+        .fetch_snapshot()
+        .await
+        .unwrap_or_else(|e| panic!("fetch_snapshot() failed: {e:?}"));
     assert!(
         !snapshot.node_id.is_empty(),
         "node_id must be populated from live GetInfo identity_pubkey"
