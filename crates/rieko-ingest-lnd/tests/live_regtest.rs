@@ -1,8 +1,8 @@
 use rieko_domain::{BitcoinNetwork, NodeIngestionAdapter};
 use rieko_ingest_lnd::{LndAdapter, LndClient};
 
-#[tokio::test]
-async fn live_regtest_adapter_fetches_snapshot() {
+#[test]
+fn live_regtest_adapter_fetches_snapshot() {
     let Ok(rest) = std::env::var("LND_REST") else {
         // Skipped in environments without a running LND instance.
         return;
@@ -17,6 +17,7 @@ async fn live_regtest_adapter_fetches_snapshot() {
     let macaroon = std::fs::read(&mac_path)
         .unwrap_or_else(|e| panic!("failed to read macaroon from {mac_path}: {e}"));
 
+    // Construct client outside of async context so reqwest::blocking initializes cleanly
     let client = LndClient::new(&rest, Some(macaroon), Some(tls_cert))
         .expect("LndClient::new must accept valid TLS cert and macaroon");
     let adapter = LndAdapter::new_auto(client, BitcoinNetwork::Regtest);
@@ -31,30 +32,36 @@ async fn live_regtest_adapter_fetches_snapshot() {
         info.identity_pubkey, info.version
     );
 
-    // 2. Adapter health_check
-    let health = adapter
-        .health_check()
-        .await
-        .unwrap_or_else(|e| panic!("health_check() returned error: {e:?}"));
-    assert!(
-        health.is_connected,
-        "health_check must report connected for live LND node: message={:?}",
-        health.message
-    );
-    assert_eq!(health.source_name, "lnd");
+    // 2. Adapter health_check & fetch_snapshot via multi-threaded runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build multi-thread tokio runtime");
 
-    // 3. Adapter fetch_snapshot
-    let snapshot = adapter
-        .fetch_snapshot()
-        .await
-        .unwrap_or_else(|e| panic!("fetch_snapshot() failed: {e:?}"));
-    assert!(
-        !snapshot.node_id.is_empty(),
-        "node_id must be populated from live GetInfo identity_pubkey"
-    );
-    assert_ne!(
-        snapshot.node_id, "local-node",
-        "node_id must be the real LND pubkey, not fallback default"
-    );
-    assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
+    rt.block_on(async {
+        let health = adapter
+            .health_check()
+            .await
+            .unwrap_or_else(|e| panic!("health_check() returned error: {e:?}"));
+        assert!(
+            health.is_connected,
+            "health_check must report connected for live LND node: message={:?}",
+            health.message
+        );
+        assert_eq!(health.source_name, "lnd");
+
+        let snapshot = adapter
+            .fetch_snapshot()
+            .await
+            .unwrap_or_else(|e| panic!("fetch_snapshot() failed: {e:?}"));
+        assert!(
+            !snapshot.node_id.is_empty(),
+            "node_id must be populated from live GetInfo identity_pubkey"
+        );
+        assert_ne!(
+            snapshot.node_id, "local-node",
+            "node_id must be the real LND pubkey, not fallback default"
+        );
+        assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
+    });
 }
