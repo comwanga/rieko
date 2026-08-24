@@ -2,9 +2,9 @@ name: Regtest Integration
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
-    branches: [main]
+    branches: ["**"]
   schedule:
     # Run nightly at 02:00 UTC
     - cron: "0 2 * * *"
