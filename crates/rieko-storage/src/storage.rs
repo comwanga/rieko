@@ -124,10 +124,8 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     /// Mark all recommendations linked to `finding_id` as resolved. Called
     /// when the corresponding finding transitions to `Resolved`
     /// (RIEKO-REMEDIATION-6).
-    fn resolve_recommendations_for_finding(
-        &mut self,
-        finding_id: &str,
-    ) -> Result<(), StorageError>;
+    fn resolve_recommendations_for_finding(&mut self, finding_id: &str)
+        -> Result<(), StorageError>;
     /// Look up one recommendation by its action id (for approve/execute).
     fn recommendation_for_action(
         &mut self,

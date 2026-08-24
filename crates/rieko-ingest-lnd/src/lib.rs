@@ -10,7 +10,7 @@ pub use adapter::LndAdapter;
 pub use client::LndMutator;
 pub use client::{LndClient, LndClientError};
 pub use model::{
-    LndChannel, LndChannelResponse, LndChainInfo, LndForward, LndForwardResponse,
+    LndChainInfo, LndChannel, LndChannelResponse, LndForward, LndForwardResponse,
     LndGetInfoResponse,
 };
 pub use normalize::{Normalizer, NormalizerError, ShortChanResolver};
