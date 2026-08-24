@@ -138,7 +138,6 @@ jobs:
             --listen=0.0.0.0:9735 \
             --tlsextraip=127.0.0.1 \
             --tlsextradomain=localhost \
-            --noseedbackup \
             --wallet-unlock-password-file=/root/.lnd/pwd.txt \
             --wallet-unlock-allow-create
 
@@ -151,11 +150,11 @@ jobs:
 
           for i in $(seq 1 45); do
             # Fix volume permissions so runner user can access generated credentials
-            sudo chmod -R 755 "${RUNNER_TEMP}/lnd" 2>/dev/null || true
+            sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/lnd" 2>/dev/null || true
 
             if [ -f "$LND_TLS" ] && [ -f "$LND_MAC" ]; then
               MAC_HEX=$(xxd -p -c 1000 "$LND_MAC" | tr -d '\n')
-              HTTP_CODE=$(curl -s -k -o /dev/null -w "%{http_code}" -H "Grpc-Metadata-macaroon: $MAC_HEX" https://127.0.0.1:8080/v1/getinfo 2>/dev/null || true)
+              HTTP_CODE=$(curl -s --cacert "$LND_TLS" -o /dev/null -w "%{http_code}" -H "Grpc-Metadata-macaroon: $MAC_HEX" https://localhost:8080/v1/getinfo 2>/dev/null || true)
               if [ "$HTTP_CODE" = "200" ]; then
                 echo "LND REST is fully ready (HTTP 200) after ${i}s."
                 READY=1
@@ -176,7 +175,7 @@ jobs:
       # ---------------------------------------------------------
       - name: Run live LND adapter integration test
         env:
-          LND_REST: "https://127.0.0.1:8080"
+          LND_REST: "https://localhost:8080"
           LND_TLS_CERT: "${{ runner.temp }}/lnd/tls.cert"
           LND_MACAROON: "${{ runner.temp }}/lnd/data/chain/bitcoin/regtest/readonly.macaroon"
         run: |
@@ -188,7 +187,7 @@ jobs:
           echo "Running live scan against LND regtest node..."
           cargo run -- scan \
             --network regtest \
-            --lnd-rest https://127.0.0.1:8080 \
+            --lnd-rest https://localhost:8080 \
             --tls-cert "${RUNNER_TEMP}/lnd/tls.cert" \
             --macaroon "${RUNNER_TEMP}/lnd/data/chain/bitcoin/regtest/readonly.macaroon" \
             --db "${RUNNER_TEMP}/rieko_live.db" \
