@@ -12,7 +12,7 @@ on:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
-  BITCOIND_IMAGE: ruimarinho/bitcoin-core:28.0
+  BITCOIND_IMAGE: ruimarinho/bitcoin-core:28
   LND_IMAGE: lightninglabs/lnd:v0.18.5-beta
   RPC_USER: rieko
   RPC_PASS: riekopass
