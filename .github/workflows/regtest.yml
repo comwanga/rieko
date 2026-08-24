@@ -1,4 +1,4 @@
-﻿name: Regtest Integration
+name: Regtest Integration
 
 on:
   push:
@@ -44,5 +44,5 @@ jobs:
         run: |
           cargo run -- scan \
             --network regtest \
-            --fixture fixtures/snapshot_regtest.json \
+            --fixture fixtures/channels.json \
             --db /tmp/rieko_regtest.db
