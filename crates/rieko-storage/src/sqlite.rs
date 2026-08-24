@@ -198,6 +198,9 @@ impl SqliteStorage {
                 updated_at,
             },
             rationale,
+            // Column 10: lifecycle added in V14. Rows that predate the
+            // migration return NULL which maps to None via `ok()`.
+            lifecycle: row.get::<_, Option<String>>(10).unwrap_or(None),
         })
     }
 
@@ -553,7 +556,7 @@ impl Storage for SqliteStorage {
 
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at, lifecycle
              FROM recommendations ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit], Self::row_to_recommendation)?;
@@ -564,12 +567,42 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
+    fn latest_active_recommendations(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<Recommendation>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at, lifecycle
+             FROM recommendations
+             WHERE lifecycle IS NULL OR lifecycle = 'active'
+             ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map([limit], Self::row_to_recommendation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn resolve_recommendations_for_finding(
+        &mut self,
+        finding_id: &str,
+    ) -> Result<(), StorageError> {
+        let updated = chrono::Utc::now();
+        self.conn.execute(
+            "UPDATE recommendations SET lifecycle = 'resolved', updated_at = ?1 WHERE finding_id = ?2",
+            params![updated.to_rfc3339(), finding_id],
+        )?;
+        Ok(())
+    }
+
     fn recommendation_for_action(
         &mut self,
         action_id: &str,
     ) -> Result<Option<Recommendation>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at
+            "SELECT finding_id, action_id, action_type, stage, target, params, summary, rationale, created_at, updated_at, lifecycle
              FROM recommendations WHERE action_id = ?1",
         )?;
         let mut rows = stmt.query_map([action_id], Self::row_to_recommendation)?;
@@ -585,6 +618,23 @@ impl Storage for SqliteStorage {
         self.conn.execute(
             "UPDATE recommendations SET stage = ?1, updated_at = ?2 WHERE action_id = ?3",
             params![format!("{:?}", stage), updated.to_rfc3339(), action_id],
+        )?;
+        Ok(())
+    }
+
+    fn sync_recommendation_lifecycles(&mut self) -> Result<(), StorageError> {
+        let updated = chrono::Utc::now();
+        // Mark recommendations as resolved when their linked finding is resolved.
+        // The correlated sub-select is the safest approach for SQLite's limited
+        // UPDATE..FROM syntax (not universally supported before 3.33.0).
+        self.conn.execute(
+            "UPDATE recommendations
+             SET lifecycle = 'resolved', updated_at = ?1
+             WHERE (lifecycle IS NULL OR lifecycle = 'active')
+               AND finding_id IN (
+                   SELECT id FROM findings WHERE lifecycle = 'resolved'
+               )",
+            params![updated.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -1953,6 +2003,7 @@ mod tests {
             finding_id: finding_id.into(),
             action,
             rationale: Rationale::default(),
+            lifecycle: None,
         }
     }
 

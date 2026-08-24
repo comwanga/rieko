@@ -95,6 +95,42 @@ pub struct LndForwardResponse {
     pub forwarding_events: Vec<LndForward>,
 }
 
+/// Response from `/v1/getinfo`. Only the fields Rieko uses are captured;
+/// unknown fields are silently ignored by serde.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LndGetInfoResponse {
+    /// Node public key (33-byte compressed, hex-encoded).
+    pub identity_pubkey: String,
+    /// Human-readable node alias, if set.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// LND version string, e.g. `"0.18.5-beta commit=abc"`.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Chains this node is synced to (one entry per chain).
+    #[serde(default)]
+    pub chains: Vec<LndChainInfo>,
+}
+
+impl LndGetInfoResponse {
+    /// Returns the first network name reported by LND (e.g. `"mainnet"`,
+    /// `"testnet"`, `"regtest"`, `"signet"`).
+    pub fn network(&self) -> Option<&str> {
+        self.chains.first().map(|c| c.network.as_str())
+    }
+}
+
+/// One entry in `GetInfoResponse.chains`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LndChainInfo {
+    /// e.g. `"bitcoin"`
+    #[serde(default)]
+    pub chain: String,
+    /// e.g. `"mainnet"`, `"testnet"`, `"regtest"`, `"signet"`
+    #[serde(default)]
+    pub network: String,
+}
+
 /// Deserialise a required 64-bit integer from either a JSON number or a JSON
 /// string (grpc-gateway emits strings for 64-bit fields).
 fn de_u64<'de, D>(d: D) -> Result<u64, D::Error>

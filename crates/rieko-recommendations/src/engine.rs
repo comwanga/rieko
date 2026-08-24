@@ -206,6 +206,7 @@ impl RecommendationEngine {
                 ],
                 actionability: Actionability::OperatorActionable,
             },
+            lifecycle: None,
         }]
     }
 
@@ -278,6 +279,7 @@ impl RecommendationEngine {
                 ],
                 actionability: Actionability::OperatorActionable,
             },
+            lifecycle: None,
         }]
     }
 }
@@ -581,6 +583,7 @@ fn build_rebased_review(
             ],
             actionability: Actionability::OperatorActionable,
         },
+        lifecycle: None,
     }
 }
 
@@ -623,6 +626,7 @@ fn build_fee_review(
             ],
             actionability: Actionability::OperatorActionable,
         },
+        lifecycle: None,
     }
 }
 

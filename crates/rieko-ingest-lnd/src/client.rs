@@ -3,7 +3,7 @@ use std::time::Duration;
 use rieko_domain::{Channel, NodeId};
 use thiserror::Error;
 
-use crate::model::{LndChannel, LndChannelResponse, LndForwardResponse};
+use crate::model::{LndChannel, LndChannelResponse, LndForwardResponse, LndGetInfoResponse};
 use crate::{Normalizer, ShortChanResolver};
 
 #[derive(Debug, Error)]
@@ -18,6 +18,17 @@ pub enum LndClientError {
     Normalize(#[from] crate::NormalizerError),
     #[error("TLS setup failed: {0}")]
     Tls(String),
+    /// The caller supplied a node pubkey that contradicts what LND's GetInfo
+    /// reports. Raised only when the caller explicitly provides a value.
+    #[error("node pubkey mismatch: expected {expected} but LND GetInfo returned {actual}")]
+    GetInfoMismatch { expected: String, actual: String },
+    /// The LND REST endpoint uses plain HTTP. Pass `allow_insecure: true` only
+    /// for local regtest/signet nodes that are not accessible from the internet.
+    #[error(
+        "insecure transport: LND REST URL uses http:// which transmits the macaroon in \
+         plaintext; use https:// or pass allow_insecure=true for local-only nodes"
+    )]
+    InsecureTransport,
 }
 
 /// Build the shared HTTP/TLS client. A provided PEM certificate is added as a
@@ -53,6 +64,7 @@ fn macaroon_header(bytes: Vec<u8>) -> String {
 /// RPC; write operations live on the execute-gated mutator instead. Certificate
 /// validation is never disabled, so an optional certificate only narrows trust
 /// to the configured peer.
+#[derive(Debug)]
 pub struct LndClient {
     rest_base: String,
     macaroon_hex: Option<String>,
@@ -62,16 +74,52 @@ pub struct LndClient {
 impl LndClient {
     /// `macaroon` and `tls_cert_pem` are raw file bytes, read binary-safe by the
     /// caller — a macaroon is not UTF-8 text.
+    ///
+    /// By default this constructor rejects `http://` URLs to prevent transmitting
+    /// the macaroon in plaintext. Set `allow_insecure = true` only for local
+    /// regtest or signet nodes that are not reachable from the network.
     pub fn new(
         rest_base: impl Into<String>,
         macaroon: Option<Vec<u8>>,
         tls_cert_pem: Option<Vec<u8>>,
     ) -> Result<Self, LndClientError> {
+        Self::new_inner(rest_base, macaroon, tls_cert_pem, false)
+    }
+
+    /// Same as [`new`] but skips the HTTPS enforcement check. Use only for
+    /// local regtest or signet nodes.
+    pub fn new_allow_insecure(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+    ) -> Result<Self, LndClientError> {
+        Self::new_inner(rest_base, macaroon, tls_cert_pem, true)
+    }
+
+    fn new_inner(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+        allow_insecure: bool,
+    ) -> Result<Self, LndClientError> {
+        let rest_base = rest_base.into();
+        if !allow_insecure && rest_base.trim_start().to_ascii_lowercase().starts_with("http://") {
+            return Err(LndClientError::InsecureTransport);
+        }
         Ok(Self {
-            rest_base: rest_base.into(),
+            rest_base,
             macaroon_hex: macaroon.map(macaroon_header),
             client: build_http_client(tls_cert_pem)?,
         })
+    }
+
+    /// Call `/v1/getinfo` and return the node's declared identity and network.
+    /// Use this to derive the local node pubkey rather than trusting the
+    /// operator-supplied `--node` argument.
+    pub fn get_info(&self) -> Result<LndGetInfoResponse, LndClientError> {
+        let body = self.get("/v1/getinfo")?;
+        let info: LndGetInfoResponse = serde_json::from_str(&body)?;
+        Ok(info)
     }
 
     fn get(&self, path: &str) -> Result<String, LndClientError> {
@@ -198,8 +246,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http_url_is_rejected_by_default() {
+        let err = LndClient::new("http://127.0.0.1:1", None, None).unwrap_err();
+        assert!(
+            matches!(err, LndClientError::InsecureTransport),
+            "expected InsecureTransport, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn https_url_is_accepted() {
+        // No real server needed; we just want the constructor to succeed.
+        // The TLS handshake failure happens at send time, not construction.
+        assert!(LndClient::new("https://127.0.0.1:1", None, None).is_ok());
+    }
+
+    #[test]
+    fn allow_insecure_bypasses_scheme_check() {
+        // Regtest / local nodes may use plain http.
+        assert!(LndClient::new_allow_insecure("http://127.0.0.1:1", None, None).is_ok());
+    }
+
+    #[test]
     fn channels_fetch_fails_cleanly_offline() {
-        let client = LndClient::new("http://127.0.0.1:1", None, None).unwrap();
+        let client = LndClient::new_allow_insecure("http://127.0.0.1:1", None, None).unwrap();
         let err = client.channels(&NodeId::new("local")).unwrap_err();
         assert!(matches!(err, LndClientError::Transport(_)));
     }
@@ -207,14 +277,15 @@ mod tests {
     #[test]
     fn macaroon_is_lowercase_hex() {
         let mac = vec![0xde, 0xad, 0xbe, 0xef];
-        let client = LndClient::new("http://127.0.0.1:1", Some(mac), None).unwrap();
+        let client =
+            LndClient::new_allow_insecure("http://127.0.0.1:1", Some(mac), None).unwrap();
         assert_eq!(client.macaroon_hex.as_deref(), Some("deadbeef"));
     }
 
     #[test]
     fn read_client_exposes_no_mutation_method() {
         // The read-only v1 client must not compile a `put`/mutation surface.
-        let client = LndClient::new("http://127.0.0.1:1", None, None).unwrap();
+        let client = LndClient::new_allow_insecure("http://127.0.0.1:1", None, None).unwrap();
         assert!(client.macaroon_hex.is_none());
         assert!(client.rest_base.starts_with("http"));
     }

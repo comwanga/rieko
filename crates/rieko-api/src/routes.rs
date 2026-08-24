@@ -254,7 +254,9 @@ pub async fn recommendations(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
     let rows = block_storage(api.state.storage.clone(), move |s| {
-        s.latest_recommendations(limit(&q))
+        // Return only active recommendations; resolved ones are archived and
+        // still visible via the audit trail (RIEKO-REMEDIATION-6).
+        s.latest_active_recommendations(limit(&q))
             .map_err(|e| e.to_string())
     })
     .await?;

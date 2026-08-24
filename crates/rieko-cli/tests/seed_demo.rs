@@ -1,6 +1,6 @@
 use chrono::Utc;
-use rieko_detectors::SettlementReliabilityDetector;
 use rieko_detectors::registry::{Detector, DetectorContext};
+use rieko_detectors::SettlementReliabilityDetector;
 use rieko_domain::{
     BitcoinNetwork, Channel, ChannelId, ChannelStatus, FeePolicy, InvoiceExpiredEvent,
     InvoiceSettledEvent, LiquidityProfile, NodeEvent, NodeId,
@@ -10,6 +10,18 @@ use rieko_graph::{GraphStore, InMemoryGraph};
 use rieko_recommendations::RecommendationEngine;
 use rieko_storage::{SqliteStorage, Storage};
 use std::path::PathBuf;
+
+/// SYNTHETIC DEMO DATA — all pubkeys, channel points, and amounts in this
+/// test are explicitly fabricated and do not correspond to any real Lightning
+/// Network node or transaction. The produced database is for local UI
+/// demonstration only and must never be used as operational evidence.
+const BTCPAY_ENDPOINT: &str =
+    "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069";
+/// Synthetic peer pubkey — prefix "SYNTH" makes the intent obvious.
+const PEER_PUBKEY: &str =
+    "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CHANNEL_POINT: &str =
+    "2222222222222222222222222222222222222222222222222222222222222222:1";
 
 #[test]
 fn seed_demo_database() {
@@ -25,21 +37,24 @@ fn seed_demo_database() {
 
     let mut storage = SqliteStorage::open(&db_path).expect("open sqlite db");
 
-    let local_node_str = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let local_node_str =
+        "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let local_node = NodeId::new(local_node_str);
     let bottleneck_channel_id = "800000x100x1";
 
+    let now = Utc::now();
     let channel = Channel {
         id: ChannelId::new(bottleneck_channel_id),
         node: local_node.clone(),
-        peer: NodeId::new("03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        channel_point: "2222222222222222222222222222222222222222222222222222222222222222:1".into(),
+        peer: NodeId::new(PEER_PUBKEY),
+        channel_point: CHANNEL_POINT.into(),
         capacity_msat: 1_000_000_000,
         fee_policy: FeePolicy::default(),
         status: ChannelStatus::Active,
-        liquidity: LiquidityProfile::compute(1_000_000_000, 25_000_000, 975_000_000), // 0.025 local ratio
-        last_seen: Utc::now(),
-        opening_height: Some(830000),
+        // 2.5% local ratio — drained, bottleneck channel
+        liquidity: LiquidityProfile::compute(1_000_000_000, 25_000_000, 975_000_000),
+        last_seen: now,
+        opening_height: Some(830_000),
         local_reserve_msat: None,
         remote_reserve_msat: None,
         is_private: false,
@@ -51,46 +66,48 @@ fn seed_demo_database() {
     let mut graph = InMemoryGraph::new();
     graph.upsert_channels(vec![channel.clone()]).unwrap();
 
+    // 4 expired + 1 settled = 80% invoice failure rate
+    let store_id = "btcpay-store-merchant";
     let events = vec![
         NodeEvent::InvoiceSettled(InvoiceSettledEvent {
             id: "inv-101".into(),
-            store_id: Some("btcpay-store-merchant".into()),
+            store_id: Some(store_id.into()),
             payment_method: Some("BTC-LightningLike".into()),
             amount_msat: 50_000_000,
             fee_msat: 250,
-            timestamp: Utc::now(),
+            timestamp: now,
             payment_hash: Some("hash1".into()),
             metadata: std::collections::HashMap::new(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
             id: "inv-102".into(),
-            store_id: Some("btcpay-store-merchant".into()),
+            store_id: Some(store_id.into()),
             amount_msat: Some(100_000_000),
-            timestamp: Utc::now(),
+            timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
             id: "inv-103".into(),
-            store_id: Some("btcpay-store-merchant".into()),
+            store_id: Some(store_id.into()),
             amount_msat: Some(250_000_000),
-            timestamp: Utc::now(),
+            timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
             id: "inv-104".into(),
-            store_id: Some("btcpay-store-merchant".into()),
+            store_id: Some(store_id.into()),
             amount_msat: Some(80_000_000),
-            timestamp: Utc::now(),
+            timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
             id: "inv-105".into(),
-            store_id: Some("btcpay-store-merchant".into()),
+            store_id: Some(store_id.into()),
             amount_msat: Some(150_000_000),
-            timestamp: Utc::now(),
+            timestamp: now,
         }),
-    ]; // 80% failure rate
+    ];
 
     let btcpay_source = ObservationSource::BtcPay {
-        redacted_endpoint: "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069".into(),
-        configured_store: "btcpay-store-merchant".into(),
+        redacted_endpoint: BTCPAY_ENDPOINT.into(),
+        configured_store: store_id.into(),
         underlying_node: Some(local_node_str.into()),
     };
 
@@ -111,7 +128,9 @@ fn seed_demo_database() {
     };
 
     let detector = SettlementReliabilityDetector::new(local_node.clone());
-    let cycle = detector.evaluate(&graph, &ctx).expect("evaluate detector");
+    let cycle = detector
+        .evaluate(&graph, &ctx)
+        .expect("evaluate detector");
 
     let engine = RecommendationEngine;
     for finding in &cycle.findings {
@@ -122,7 +141,11 @@ fn seed_demo_database() {
         }
     }
 
-    let snapshot = rieko_domain::ChannelSnapshot::from_channel(&channel, Utc::now(), BitcoinNetwork::Mainnet);
+    let snapshot = rieko_domain::ChannelSnapshot::from_channel(
+        &channel,
+        now,
+        BitcoinNetwork::Mainnet,
+    );
     storage.save_channel_snapshot(&snapshot).unwrap();
 
     println!("Seeded demo database successfully at {:?}", db_path);

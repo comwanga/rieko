@@ -4,13 +4,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_alerts::{Alert, AlertSink, AlertStateStore, PersistentDedupingSink, TelegramSink};
-use rieko_domain::BitcoinNetwork;
+use rieko_domain::{BitcoinNetwork, ChannelSnapshot};
+use rieko_findings::channel_snapshot_state_digest;
+use rieko_graph::GraphView;
 use rieko_llm::{LlmClient, OpenAiCompatibleClient};
 use rieko_storage::SqliteStorage;
 use tracing::info;
 use tracing::warn;
 
-use super::common::{persist_and_recommend, GraphSource};
+use super::common::{persist_monitor_cycle, GraphSource};
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
@@ -36,6 +38,8 @@ pub struct ScanArgs {
     tls_cert: Option<PathBuf>,
 
     /// Local node id (pubkey). Defaults to `local-node`.
+    /// When --lnd-rest is provided, the live pubkey from /v1/getinfo is used
+    /// instead and this value is only a fallback.
     #[arg(long, default_value = "local-node")]
     node: String,
 
@@ -50,7 +54,12 @@ pub struct ScanArgs {
     /// Print a summary even when nothing was found.
     #[arg(long)]
     verbose: bool,
+
+    /// Allow plain http:// for --lnd-rest (only safe for local regtest/signet).
+    #[arg(long)]
+    allow_insecure: bool,
 }
+
 
 pub fn run(args: ScanArgs) -> Result<()> {
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
@@ -64,7 +73,9 @@ pub fn run(args: ScanArgs) -> Result<()> {
         macaroon: args.macaroon.clone(),
         tls_cert: args.tls_cert.clone(),
         node: args.node.clone(),
+        allow_insecure: args.allow_insecure,
     };
+    let is_fixture = source.fixture.is_some();
     super::common::record_ingestion_attempt(&mut storage, &source)?;
     let graph = match source.build() {
         Ok(graph) => graph,
@@ -94,6 +105,10 @@ pub fn run(args: ScanArgs) -> Result<()> {
         events: None,
         chain_synchronized: None,
     };
+    if source.lnd_rest.is_none() {
+        // No BTCPay events wired; settlement detector will produce no findings.
+        info!("settlement_reliability detector: no BTCPay events configured; detector will be silent");
+    }
     let detectors: Vec<Box<dyn rieko_detectors::Detector>> = vec![
         Box::new(rieko_detectors::LiquidityDetector::new(args.node.clone())),
         Box::new(rieko_detectors::DriftDetector::new(args.node.clone())),
@@ -112,6 +127,18 @@ pub fn run(args: ScanArgs) -> Result<()> {
         .collect();
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
+    // Collect channel snapshots — scan also persists them so /snapshots
+    // returns data for one-shot users, not just monitor users (Item 3).
+    let channels = graph.channels();
+    let snapshots: Vec<ChannelSnapshot> = channels
+        .iter()
+        .map(|ch| {
+            let mut snap = ChannelSnapshot::from_channel(ch, ch.last_seen, source.network);
+            snap.state_digest = Some(channel_snapshot_state_digest(&snap));
+            snap
+        })
+        .collect();
+
     let llm = OpenAiCompatibleClient::from_env().context("building LLM client")?;
     super::common::record_component(
         &mut storage,
@@ -124,7 +151,17 @@ pub fn run(args: ScanArgs) -> Result<()> {
     )?;
     let engine = rieko_recommendations::RecommendationEngine;
 
-    let mut alert_sink = if TelegramSink::is_configured() {
+    // Alerting is suppressed for fixture sources so fixture scans cannot
+    // consume the Telegram cooldown or re-send live alerts (Item 4).
+    let mut alert_sink = if is_fixture {
+        info!("alerting suppressed: source is a fixture, not a live node");
+        super::common::record_component(
+            &mut storage,
+            super::common::ComponentKind::AlertSink,
+            rieko_status::ComponentState::NotConfigured,
+        )?;
+        None
+    } else if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
             Ok(sink) => {
                 let store: Box<dyn AlertStateStore> =
@@ -140,7 +177,8 @@ pub fn run(args: ScanArgs) -> Result<()> {
                     sink,
                     store,
                     Duration::from_secs(args.alert_cooldown),
-                ))
+                )
+                .with_sink_id("live|telegram"))
             }
             Err(e) => {
                 super::common::record_component(
@@ -161,11 +199,12 @@ pub fn run(args: ScanArgs) -> Result<()> {
         None
     };
 
-    let recommendations = persist_and_recommend(
+    let recommendations = persist_monitor_cycle(
         &mut storage,
         llm.as_ref().map(|client| client as &dyn LlmClient),
         &engine,
         &args.node,
+        &snapshots,
         &scopes,
         &mut findings,
     )?;

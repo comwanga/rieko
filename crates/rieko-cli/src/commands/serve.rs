@@ -28,6 +28,12 @@ pub struct ServeArgs {
     /// requests (RIEKO-AUDIT-014). Overrides `RIEKO_API_TOKEN`.
     #[arg(long, value_name = "FILE")]
     token_file: Option<PathBuf>,
+
+    /// Trust `X-Forwarded-For` / `X-Real-IP` headers set by an upstream
+    /// reverse proxy (nginx, Caddy, Traefik). Do NOT set this flag if rieko
+    /// is directly internet-accessible — any client could spoof the header.
+    #[arg(long)]
+    behind_proxy: bool,
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
@@ -55,9 +61,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(args.addr).await?;
         info!(
             addr = %args.addr,
+            behind_proxy = args.behind_proxy,
             static_dir = args.static_dir.as_ref().map(|d| d.display().to_string()),
             "rieko api listening (read-only)"
         );
+        if args.behind_proxy {
+            info!("trusting X-Forwarded-For / X-Real-IP headers from upstream proxy");
+        }
         axum::serve(listener, app)
             .await
             .context("axum serve failed")
