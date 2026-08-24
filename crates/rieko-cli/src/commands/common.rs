@@ -25,6 +25,8 @@ pub struct GraphSource {
     pub macaroon: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
     pub node: String,
+    /// Skip the HTTPS enforcement check for local regtest/signet nodes.
+    pub allow_insecure: bool,
 }
 
 impl GraphSource {
@@ -75,23 +77,55 @@ impl GraphSource {
                 .map(|p| std::fs::read(p).map_err(anyhow::Error::from))
                 .transpose()
                 .context("reading TLS certificate")?;
-            let client = LndClient::new(rest, macaroon, tls_cert).context("building LND client")?;
+            let client = if self.allow_insecure {
+                LndClient::new_allow_insecure(rest, macaroon, tls_cert)
+            } else {
+                LndClient::new(rest, macaroon, tls_cert)
+            }
+            .context("building LND client")?;
+
+            // Derive the live node identity from GetInfo so the --node
+            // argument is never blindly trusted for a live connection.
+            let resolved_local = match client.get_info() {
+                Ok(info) => {
+                    let live = NodeId::new(&info.identity_pubkey);
+                    if local.as_ref() != "local-node"
+                        && local.as_ref() != info.identity_pubkey.as_str()
+                    {
+                        warn!(
+                            supplied = %local,
+                            actual = %info.identity_pubkey,
+                            "--node does not match LND GetInfo identity_pubkey; using live identity"
+                        );
+                    }
+                    live
+                }
+                Err(e) => {
+                    warn!(error = %e, "GetInfo failed; falling back to --node value");
+                    local
+                }
+            };
+
             let raw = client
                 .raw_channels()
                 .context("fetching channels from LND")?;
             let observed_at = chrono::Utc::now();
-            let channels = raw
-                .iter()
-                .map(|c| Normalizer::channel(c, &local, observed_at).map_err(anyhow::Error::from))
-                .collect::<Result<Vec<_>, _>>()
-                .context("normalizing channels from LND")?;
+            let mut channels = Vec::with_capacity(raw.len());
+            for c in &raw {
+                match Normalizer::channel(c, &resolved_local, observed_at) {
+                    Ok(ch) => channels.push(ch),
+                    Err(e) => warn!(
+                        channel_point = %c.channel_point,
+                        error = %e,
+                        "skipping malformed channel during normalization"
+                    ),
+                }
+            }
             graph
                 .upsert_channels(channels)
                 .context("loading channels into graph")?;
 
             // Best-effort: routing history sharpens later volume detectors.
-            // Short channel ids are resolved to channel points where a channel
-            // is known; unresolvable ids are preserved explicitly.
             let resolver = ShortChanResolver::from_channels(&raw);
             match client.forwards(&resolver) {
                 Ok(forwards) => {
@@ -279,6 +313,7 @@ pub fn run_cleanup_if_due<S: Storage + rieko_status::OperationalStateStore>(
 /// for a plain-language explanation (optional), turn the finding into auditable
 /// recommendations. Returns everything that was recommended so callers can
 /// alert/report.
+#[allow(dead_code)]
 pub fn persist_and_recommend<S: Storage + rieko_status::OperationalStateStore>(
     storage: &mut S,
     llm: Option<&dyn LlmClient>,
@@ -324,6 +359,10 @@ fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
         for scope in scopes {
             storage.resolve_findings_for_scope(scope)?;
         }
+        // Cascade any newly-resolved findings to their recommendations (Item 6).
+        storage
+            .sync_recommendation_lifecycles()
+            .context("syncing recommendation lifecycles")?;
         let recommendations = persist_cycle_locked(storage, engine, findings)?;
         record_cycle_success(storage)?;
         Ok(recommendations)
@@ -508,6 +547,7 @@ mod tests {
             macaroon: None,
             tls_cert: None,
             node: "local-node".into(),
+            allow_insecure: false,
         };
         let graph = source.build().expect("fixture should load");
 
@@ -611,6 +651,7 @@ mod tests {
             tls_cert: None,
             macaroon: None,
             node: "local-node".into(),
+            allow_insecure: false,
         };
         let first = source.observation_source().unwrap();
         std::fs::write(fixture.path(), b"second observation").unwrap();
@@ -628,10 +669,11 @@ mod tests {
         let source = GraphSource {
             network: BitcoinNetwork::Regtest,
             fixture: None,
-            lnd_rest: Some("http://127.0.0.1:1".into()),
+            lnd_rest: Some("https://127.0.0.1:1".into()),
             macaroon: Some(std::path::PathBuf::from("/definitely/not/a/macaroon")),
             tls_cert: None,
             node: "local-node".into(),
+            allow_insecure: false,
         };
         let msg = source.build().unwrap_err().to_string();
         assert!(
@@ -939,6 +981,7 @@ mod tests {
             macaroon: None,
             tls_cert: None,
             node: "local-node".into(),
+            allow_insecure: false,
         };
         let graph = drained_graph(20_000, 980_000);
         let observed_at = newest_source_data_at(&graph);

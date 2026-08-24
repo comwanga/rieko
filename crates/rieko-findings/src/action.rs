@@ -121,6 +121,10 @@ pub struct Recommendation {
     /// Structured, evidence-backed reasoning. Filled deterministically by the
     /// engine — never by an LLM — and always present.
     pub rationale: Rationale,
+    /// Lifecycle of this recommendation. `None` or `"active"` = current;
+    /// `"resolved"` = the linked finding has been resolved (V14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
 }
 
 /// Whether a recommendation asks the operator to act or merely informs them.

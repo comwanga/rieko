@@ -91,6 +91,10 @@ pub struct MonitorArgs {
     /// How often a cleanup pass runs, in hours. Default: 6.
     #[arg(long, default_value_t = 6, value_name = "HOURS")]
     cleanup_interval: u64,
+
+    /// Allow plain http:// for --lnd-rest (only safe for local regtest/signet).
+    #[arg(long)]
+    allow_insecure: bool,
 }
 
 pub fn run(args: MonitorArgs) -> Result<()> {
@@ -111,7 +115,9 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         macaroon: args.macaroon.clone(),
         tls_cert: args.tls_cert.clone(),
         node: args.node.clone(),
+        allow_insecure: args.allow_insecure,
     };
+    let is_fixture = source.fixture.is_some();
 
     let llm = OpenAiCompatibleClient::from_env().context("building LLM client")?;
     super::common::record_component(
@@ -125,7 +131,17 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     )?;
     let engine = rieko_recommendations::RecommendationEngine;
 
-    let mut alert_sink = if TelegramSink::is_configured() {
+    let mut alert_sink = if is_fixture {
+        // Alerting suppressed for fixture sources to avoid consuming the live
+        // Telegram deduplication cooldown (Item 4).
+        info!("alerting suppressed: source is a fixture, not a live node");
+        super::common::record_component(
+            &mut storage,
+            super::common::ComponentKind::AlertSink,
+            rieko_status::ComponentState::NotConfigured,
+        )?;
+        None
+    } else if TelegramSink::is_configured() {
         match TelegramSink::from_env() {
             Ok(sink) => {
                 // Dedup state lives in a separate connection to the same DB,
@@ -141,11 +157,14 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                     super::common::ComponentKind::AlertSink,
                     rieko_status::ComponentState::Configured,
                 )?;
-                Some(PersistentDedupingSink::new(
-                    sink,
-                    store,
-                    Duration::from_secs(args.alert_cooldown),
-                ))
+                Some(
+                    PersistentDedupingSink::new(
+                        sink,
+                        store,
+                        Duration::from_secs(args.alert_cooldown),
+                    )
+                    .with_sink_id("live|telegram"),
+                )
             }
             Err(e) => {
                 super::common::record_component(
@@ -421,6 +440,7 @@ mod tests {
             macaroon: None,
             tls_cert: None,
             node: "local-node".into(),
+            allow_insecure: false,
         }
     }
 
@@ -503,6 +523,7 @@ mod tests {
             macaroon: None,
             tls_cert: None,
             node: "local-node".into(),
+            allow_insecure: false,
         };
         let mut attempts = 0;
         let mut sleeps = 0;

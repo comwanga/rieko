@@ -26,6 +26,7 @@ fn recommendation(action_type: ActionType) -> Recommendation {
             limitations: Vec::new(),
             actionability: Actionability::OperatorActionable,
         },
+        lifecycle: None,
     }
 }
 

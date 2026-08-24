@@ -11,8 +11,13 @@ use rieko_recommendations::RecommendationEngine;
 use rieko_storage::{SqliteStorage, Storage};
 use std::path::PathBuf;
 
+/// SYNTHETIC DEMO DATA — all pubkeys, channel points, and amounts in this
+/// test are explicitly fabricated and do not correspond to any real Lightning
+/// Network node or transaction. The produced database is for local UI
+/// demonstration only and must never be used as operational evidence.
 const BTCPAY_ENDPOINT: &str =
     "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069";
+/// Synthetic peer pubkey — prefix "SYNTH" makes the intent obvious.
 const PEER_PUBKEY: &str =
     "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CHANNEL_POINT: &str =

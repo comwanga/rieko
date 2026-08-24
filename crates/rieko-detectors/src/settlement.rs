@@ -77,6 +77,9 @@ impl Detector for SettlementReliabilityDetector {
 
     fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding> {
         let Some(events) = ctx.events else {
+            // No BTCPay webhook events available. Operators who have not wired
+            // up the webhook integration will see no findings from this detector.
+            // Use `rieko serve` + the BTCPay webhook endpoint to enable it.
             return Vec::new();
         };
 

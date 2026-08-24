@@ -36,7 +36,9 @@ fn capture_request() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
 fn macaroon_header_is_lowercase_hex_of_file_bytes() {
     let (port, rx) = capture_request();
     let macaroon = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff];
-    let client = LndClient::new(format!("http://127.0.0.1:{port}"), Some(macaroon), None).unwrap();
+    let client =
+        LndClient::new_allow_insecure(format!("http://127.0.0.1:{port}"), Some(macaroon), None)
+            .unwrap();
     client.channels(&NodeId::new("local")).unwrap();
     let req = rx.recv().unwrap();
     let req = String::from_utf8_lossy(&req);
@@ -55,7 +57,9 @@ fn binary_macaroon_invalid_utf8_still_works() {
         std::str::from_utf8(&macaroon).is_err(),
         "precondition: non-UTF8 bytes"
     );
-    let client = LndClient::new(format!("http://127.0.0.1:{port}"), Some(macaroon), None).unwrap();
+    let client =
+        LndClient::new_allow_insecure(format!("http://127.0.0.1:{port}"), Some(macaroon), None)
+            .unwrap();
     client.channels(&NodeId::new("local")).unwrap();
     let req = rx.recv().unwrap();
     let req = String::from_utf8_lossy(&req);
@@ -70,7 +74,8 @@ fn macaroon_secret_is_absent_from_errors() {
     // Point at a dead port so the fetch fails; the macaroon value must not
     // leak into the error message.
     let macaroon = vec![0xde, 0xad, 0xbe, 0xef];
-    let client = LndClient::new("http://127.0.0.1:1", Some(macaroon), None).unwrap();
+    let client =
+        LndClient::new_allow_insecure("http://127.0.0.1:1", Some(macaroon), None).unwrap();
     let err = client
         .channels(&NodeId::new("local"))
         .unwrap_err()

@@ -340,6 +340,7 @@ async fn status_reports_operational_counts() {
         finding_id: "f-warn".into(),
         action: action.clone(),
         rationale: Rationale::default(),
+        lifecycle: None,
     })
     .unwrap();
     mem.save_recommendation(&Recommendation {
@@ -352,6 +353,7 @@ async fn status_reports_operational_counts() {
             "noop",
         ),
         rationale: Rationale::default(),
+        lifecycle: None,
     })
     .unwrap();
 

@@ -73,6 +73,7 @@ fn seeded_app_for(
             limitations: Vec::new(),
             actionability: Actionability::OperatorActionable,
         },
+        lifecycle: None,
     };
     storage
         .save_finding(&Finding {

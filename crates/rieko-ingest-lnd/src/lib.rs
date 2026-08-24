@@ -9,5 +9,8 @@ pub use adapter::LndAdapter;
 #[cfg(feature = "execute")]
 pub use client::LndMutator;
 pub use client::{LndClient, LndClientError};
-pub use model::{LndChannel, LndChannelResponse, LndForward, LndForwardResponse};
+pub use model::{
+    LndChannel, LndChannelResponse, LndChainInfo, LndForward, LndForwardResponse,
+    LndGetInfoResponse,
+};
 pub use normalize::{Normalizer, NormalizerError, ShortChanResolver};

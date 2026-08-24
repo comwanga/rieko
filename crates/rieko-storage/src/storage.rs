@@ -116,6 +116,18 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
 
     fn save_recommendation(&mut self, rec: &Recommendation) -> Result<(), StorageError>;
     fn latest_recommendations(&mut self, limit: u32) -> Result<Vec<Recommendation>, StorageError>;
+    /// Return only active (non-resolved) recommendations.
+    fn latest_active_recommendations(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<Recommendation>, StorageError>;
+    /// Mark all recommendations linked to `finding_id` as resolved. Called
+    /// when the corresponding finding transitions to `Resolved`
+    /// (RIEKO-REMEDIATION-6).
+    fn resolve_recommendations_for_finding(
+        &mut self,
+        finding_id: &str,
+    ) -> Result<(), StorageError>;
     /// Look up one recommendation by its action id (for approve/execute).
     fn recommendation_for_action(
         &mut self,
@@ -125,6 +137,12 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     /// transitions are enforced upstream by `rieko-execution`.
     fn set_action_stage(&mut self, action_id: &str, stage: ActionStage)
         -> Result<(), StorageError>;
+    /// Reconcile recommendation lifecycles with finding lifecycles.
+    ///
+    /// Marks any recommendation whose linked finding is now `Resolved` as
+    /// `resolved` itself. Idempotent and safe to call every cycle
+    /// (RIEKO-REMEDIATION-6).
+    fn sync_recommendation_lifecycles(&mut self) -> Result<(), StorageError>;
 
     fn append_audit(&mut self, entry: &AuditEntry) -> Result<(), StorageError>;
     fn recent_audit(&mut self, limit: u32) -> Result<Vec<AuditEntry>, StorageError>;
@@ -522,6 +540,34 @@ impl Storage for MemoryStorage {
             .collect())
     }
 
+    fn latest_active_recommendations(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<Recommendation>, StorageError> {
+        Ok(self
+            .recommendations
+            .iter()
+            .filter(|r| r.lifecycle.as_deref().unwrap_or("active") == "active")
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    fn resolve_recommendations_for_finding(
+        &mut self,
+        finding_id: &str,
+    ) -> Result<(), StorageError> {
+        for rec in self
+            .recommendations
+            .iter_mut()
+            .filter(|r| r.finding_id == finding_id)
+        {
+            rec.lifecycle = Some("resolved".into());
+        }
+        Ok(())
+    }
+
     fn recommendation_for_action(
         &mut self,
         action_id: &str,
@@ -545,6 +591,21 @@ impl Storage for MemoryStorage {
         {
             rec.action.stage = stage;
             rec.action.updated_at = chrono::Utc::now();
+        }
+        Ok(())
+    }
+
+    fn sync_recommendation_lifecycles(&mut self) -> Result<(), StorageError> {
+        let resolved_ids: std::collections::HashSet<String> = self
+            .findings
+            .iter()
+            .filter(|f| f.lifecycle == FindingLifecycle::Resolved)
+            .map(|f| f.id.clone())
+            .collect();
+        for rec in self.recommendations.iter_mut() {
+            if resolved_ids.contains(&rec.finding_id) {
+                rec.lifecycle = Some("resolved".into());
+            }
         }
         Ok(())
     }
