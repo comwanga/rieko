@@ -207,6 +207,14 @@ jobs:
             --db "${RUNNER_TEMP}/rieko_live.db" \
             --verbose
 
+      - name: Run real BTCPay Greenfield health smoke test
+        if: ${{ vars.BTCPAY_REGTEST_SMOKE_ENABLED == 'true' }}
+        env:
+          BTCPAY_GREENFIELD_URL: ${{ vars.BTCPAY_REGTEST_URL }}
+          BTCPAY_GREENFIELD_STORE: ${{ vars.BTCPAY_REGTEST_STORE }}
+          BTCPAY_GREENFIELD_API_KEY: ${{ secrets.BTCPAY_REGTEST_API_KEY }}
+        run: cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture
+
       # ---------------------------------------------------------
       # 5. Diagnostics & Teardown
       # ---------------------------------------------------------
