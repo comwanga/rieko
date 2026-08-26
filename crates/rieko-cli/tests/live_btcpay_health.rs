@@ -7,6 +7,7 @@ use reqwest::{StatusCode, Url};
 use rieko_findings::{Finding, FindingLifecycle, FindingLifecycleFilter};
 use rieko_status::{BitcoinCoreState, OperationalStateStore, SourceState};
 use rieko_storage::{SqliteStorage, Storage};
+use sha2::{Digest, Sha256};
 use tokio::io::copy_bidirectional;
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -224,30 +225,26 @@ fn blockchain_info() -> serde_json::Value {
         .expect("getblockchaininfo returns JSON")
 }
 
-struct InvalidatedCoreTip {
-    block_hash: String,
+struct CoreHeaderGap {
     restored: bool,
 }
 
-impl InvalidatedCoreTip {
+impl CoreHeaderGap {
     fn induce() -> (Self, u64, u64) {
         let before = blockchain_info();
         assert_eq!(before["chain"], "regtest");
         assert_eq!(before["blocks"], before["headers"]);
         assert_eq!(before["initialblockdownload"], false);
 
-        let block_hash = bitcoin_cli("getbestblockhash", &[]);
-        bitcoin_cli("invalidateblock", &[&block_hash]);
-        let guard = Self {
-            block_hash,
-            restored: false,
-        };
+        let header = mine_next_regtest_header();
+        bitcoin_cli("submitheader", &[&header]);
+        let guard = Self { restored: false };
         let degraded = blockchain_info();
         let blocks = degraded["blocks"].as_u64().expect("numeric block height");
         let headers = degraded["headers"].as_u64().expect("numeric header height");
         assert!(
             blocks < headers,
-            "invalidating the regtest tip must retain a higher known header"
+            "submitting a header without its block must create a header gap"
         );
         assert_eq!(degraded["initialblockdownload"], false);
 
@@ -256,19 +253,93 @@ impl InvalidatedCoreTip {
 
     fn restore(&mut self) {
         if !self.restored {
-            bitcoin_cli("reconsiderblock", &[&self.block_hash]);
+            bitcoin_cli("-generate", &["2"]);
             self.restored = true;
         }
     }
 }
 
-impl Drop for InvalidatedCoreTip {
+impl Drop for CoreHeaderGap {
     fn drop(&mut self) {
         if !self.restored {
-            let _ = bitcoin_cli_result("reconsiderblock", &[&self.block_hash]);
+            let _ = bitcoin_cli_result("-generate", &["2"]);
             self.restored = true;
         }
     }
+}
+
+fn mine_next_regtest_header() -> String {
+    let template: serde_json::Value = serde_json::from_str(&bitcoin_cli(
+        "getblocktemplate",
+        &[r#"{"rules":["segwit"]}"#],
+    ))
+    .expect("getblocktemplate returns JSON");
+    let version = template["version"].as_u64().expect("template version") as u32;
+    let mut previous = decode_hex(
+        template["previousblockhash"]
+            .as_str()
+            .expect("template previous block hash"),
+    );
+    previous.reverse();
+    let timestamp = template["curtime"].as_u64().expect("template time") as u32;
+    let bits_text = template["bits"].as_str().expect("template compact target");
+    let bits = u32::from_str_radix(bits_text, 16).expect("hex compact target");
+    let target = compact_target(bits);
+
+    let mut header = Vec::with_capacity(80);
+    header.extend_from_slice(&version.to_le_bytes());
+    header.extend_from_slice(&previous);
+    header.extend_from_slice(&[0_u8; 32]);
+    header.extend_from_slice(&timestamp.to_le_bytes());
+    header.extend_from_slice(&bits.to_le_bytes());
+    header.extend_from_slice(&0_u32.to_le_bytes());
+
+    for nonce in 0..=u32::MAX {
+        header[76..80].copy_from_slice(&nonce.to_le_bytes());
+        let first = Sha256::digest(&header);
+        let second = Sha256::digest(first);
+        let hash_as_big_endian = second.iter().rev().copied().collect::<Vec<_>>();
+        if hash_as_big_endian.as_slice() <= target.as_slice() {
+            return encode_hex(&header);
+        }
+    }
+    panic!("regtest header nonce space unexpectedly exhausted");
+}
+
+fn compact_target(bits: u32) -> [u8; 32] {
+    let exponent = (bits >> 24) as usize;
+    let mantissa = bits & 0x007f_ffff;
+    assert!((3..=32).contains(&exponent), "supported compact target");
+    let mut target = [0_u8; 32];
+    let offset = 32 - exponent;
+    target[offset] = (mantissa >> 16) as u8;
+    target[offset + 1] = (mantissa >> 8) as u8;
+    target[offset + 2] = mantissa as u8;
+    target
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0, "hex has an even length");
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(text, 16).expect("valid hex")
+        })
+        .collect()
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    value.iter().fold(
+        String::with_capacity(value.len() * 2),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").unwrap();
+            output
+        },
+    )
 }
 
 async fn upstream_address(base_url: &str) -> SocketAddr {
@@ -621,7 +692,7 @@ async fn live_core_sync_correlation_flow() {
     assert!(initial_core.connected);
     assert!(initial_core.snapshot.unwrap().synchronized);
 
-    let (mut invalidated_tip, expected_blocks, expected_headers) = InvalidatedCoreTip::induce();
+    let (mut header_gap, expected_blocks, expected_headers) = CoreHeaderGap::induce();
 
     let unauthorized = client
         .get(format!("{api_url}/findings"))
@@ -682,7 +753,7 @@ async fn live_core_sync_correlation_flow() {
     assert_eq!(persisted.len(), 1);
     assert_eq!(persisted[0], finding);
 
-    invalidated_tip.restore();
+    header_gap.restore();
 }
 
 #[tokio::test(flavor = "multi_thread")]
