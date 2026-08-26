@@ -1,8 +1,8 @@
 # Real BTCPay regtest health smoke test
 
-`live_btcpay_health` is an ignored integration test because it requires a real,
-pre-provisioned BTCPay Server deployment. It never substitutes fixture or mock
-Greenfield responses.
+`live_btcpay_health` is an ignored integration test because it requires a real
+BTCPay Server deployment. It never substitutes fixture or mock Greenfield
+responses.
 
 The deployment must provide:
 
@@ -10,8 +10,7 @@ The deployment must provide:
 - a regtest store with Lightning configured so the existing snapshot endpoints
   return successfully;
 - a Greenfield API key restricted to the read-only permissions required for
-  server information, store Lightning information/channels, and the on-chain
-  wallet view.
+  server information and store Lightning information/channels.
 
 Run it with:
 
@@ -22,14 +21,15 @@ export BTCPAY_GREENFIELD_API_KEY=<scoped-read-only-key>
 cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture
 ```
 
-The test starts `rieko-agent` with four one-second polling cycles. A local TCP
+The test starts `rieko-agent` with seven one-second polling cycles. A local TCP
 proxy initially forwards to the real BTCPay endpoint. After `/status` proves a
 healthy persisted Greenfield observation, the test closes the proxy and its
 active connections. Three subsequent polling cycles therefore observe a real
-connectivity failure without reconfiguring or stopping BTCPay. The test then
-requires authentication on `/findings`, verifies one typed health finding and
-its evidence, stops the agent, and verifies the same finding directly in the
-test database.
+connectivity failure without reconfiguring or stopping BTCPay. It then restores
+the same proxy address and waits for the existing three-cycle resolution
+hysteresis. The test verifies the original finding becomes resolved through the
+authenticated API, stops the agent, and confirms the connected operational
+state and single resolved finding after reopening the test database.
 
 The existing `regtest.yml` workflow provisions this path on every run. It pins
 BTCPay Server 1.13.7, NBXplorer 2.5.12, and PostgreSQL 13.13, attaches them to

@@ -3,7 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
-use rieko_findings::{Finding, FindingLifecycleFilter};
+use rieko_findings::{Finding, FindingLifecycle, FindingLifecycleFilter};
 use rieko_status::{OperationalStateStore, SourceState};
 use rieko_storage::{SqliteStorage, Storage};
 use tokio::io::copy_bidirectional;
@@ -38,7 +38,15 @@ struct IsolationProxy {
 
 impl IsolationProxy {
     async fn start(upstream: SocketAddr) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::bind("127.0.0.1:0".parse().unwrap(), upstream).await
+    }
+
+    async fn restore(address: SocketAddr, upstream: SocketAddr) -> Self {
+        Self::bind(address, upstream).await
+    }
+
+    async fn bind(address: SocketAddr, upstream: SocketAddr) -> Self {
+        let listener = TcpListener::bind(address).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -148,6 +156,29 @@ async fn wait_for_three_degraded_cycles(client: &reqwest::Client, api_url: &str)
     panic!("three bounded degraded health cycles did not complete");
 }
 
+async fn wait_for_resolved_finding(
+    client: &reqwest::Client,
+    api_url: &str,
+    finding_id: &str,
+) -> Finding {
+    for _ in 0..120 {
+        let response = client
+            .get(format!("{api_url}/findings/{finding_id}"))
+            .bearer_auth(API_TOKEN)
+            .send()
+            .await;
+        if let Ok(response) = response {
+            if let Ok(finding) = response.json::<Finding>().await {
+                if finding.lifecycle == FindingLifecycle::Resolved {
+                    return finding;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("three bounded healthy recovery cycles did not resolve the finding");
+}
+
 async fn live_flow() {
     let base_url = std::env::var("BTCPAY_GREENFIELD_URL")
         .expect("BTCPAY_GREENFIELD_URL must point to a real BTCPay regtest deployment");
@@ -156,7 +187,9 @@ async fn live_flow() {
     let store_id = std::env::var("BTCPAY_GREENFIELD_STORE")
         .expect("BTCPAY_GREENFIELD_STORE must identify the configured regtest store");
 
-    let proxy = IsolationProxy::start(upstream_address(&base_url).await).await;
+    let upstream = upstream_address(&base_url).await;
+    let proxy = IsolationProxy::start(upstream).await;
+    let proxy_address = proxy.address;
     let api_address = free_address();
     let api_url = format!("http://{api_address}");
     let temp = tempfile::tempdir().unwrap();
@@ -190,7 +223,7 @@ async fn live_flow() {
                 "--btcpay-poll-timeout",
                 "2",
                 "--btcpay-poll-cycles",
-                "4",
+                "7",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -235,13 +268,44 @@ async fn live_flow() {
                 .unwrap(),
         }))
     );
+    let active_id = health[0].id.clone();
+
+    // Rebind the same proxy address to the unchanged real BTCPay upstream.
+    // The agent keeps its original Greenfield URL and observes recovery without
+    // being restarted or reconfigured.
+    let restored_proxy = IsolationProxy::restore(proxy_address, upstream).await;
+    let resolved = wait_for_resolved_finding(&client, &api_url, &active_id).await;
+    assert_eq!(
+        resolved.id, active_id,
+        "recovery preserves logical identity"
+    );
+    assert_eq!(resolved.detector, "btcpay_backend_health");
+    assert_eq!(resolved.lifecycle, FindingLifecycle::Resolved);
+
+    let active_after_recovery = client
+        .get(format!("{api_url}/findings?limit=50"))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<Finding>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|finding| finding.detector == "btcpay_backend_health")
+        .collect::<Vec<_>>();
+    assert!(
+        active_after_recovery.is_empty(),
+        "resolved health finding is absent from the active collection"
+    );
 
     agent.stop();
+    restored_proxy.isolate().await;
     let mut storage = SqliteStorage::open(&db_path).unwrap();
     let operational = storage.read_operational_state().unwrap().unwrap();
     assert_eq!(
         operational.source,
-        SourceState::BtcPayGreenfield { connected: false }
+        SourceState::BtcPayGreenfield { connected: true }
     );
     let persisted = storage
         .latest_findings_by_lifecycle(50, FindingLifecycleFilter::All)
@@ -250,12 +314,13 @@ async fn live_flow() {
         .filter(|finding| finding.detector == "btcpay_backend_health")
         .collect::<Vec<_>>();
     assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0].id, health[0].id);
+    assert_eq!(persisted[0].id, active_id);
+    assert_eq!(persisted[0].lifecycle, FindingLifecycle::Resolved);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a real BTCPay regtest deployment; see docs/testing-btcpay-regtest.md"]
-async fn real_btcpay_greenfield_failure_reaches_authenticated_findings_api() {
+async fn real_btcpay_greenfield_failure_and_recovery_reaches_authenticated_findings_api() {
     tokio::time::timeout(Duration::from_secs(30), live_flow())
         .await
         .expect("live BTCPay health smoke test exceeded its 30-second bound");
