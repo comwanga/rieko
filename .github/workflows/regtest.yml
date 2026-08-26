@@ -294,21 +294,41 @@ jobs:
             -d "$(jq -n --arg email "$BTCPAY_CI_USER" --arg password "$BTCPAY_CI_PASSWORD" '{email:$email,password:$password,isAdministrator:true}')" \
             "${BTCPAY_URL}/api/v1/users" > /dev/null
 
-          BOOTSTRAP_KEY_JSON=$(curl --fail-with-body --silent --show-error \
+          echo "Creating temporary BTCPay bootstrap API key..."
+          BOOTSTRAP_KEY_FILE="${RUNNER_TEMP}/btcpay-bootstrap-key.json"
+          BOOTSTRAP_KEY_STATUS=$(curl --silent --show-error \
+            --output "$BOOTSTRAP_KEY_FILE" \
+            --write-out '%{http_code}' \
             -H 'Content-Type: application/json' \
             --user "${BTCPAY_CI_USER}:${BTCPAY_CI_PASSWORD}" \
             -X POST \
             -d '{"label":"rieko-regtest-bootstrap","permissions":["unrestricted"]}' \
             "${BTCPAY_URL}/api/v1/api-keys")
+          if [ "$BOOTSTRAP_KEY_STATUS" != "200" ]; then
+            echo "ERROR: bootstrap API key creation returned HTTP ${BOOTSTRAP_KEY_STATUS}."
+            cat "$BOOTSTRAP_KEY_FILE"
+            exit 1
+          fi
+          BOOTSTRAP_KEY_JSON=$(< "$BOOTSTRAP_KEY_FILE")
           BOOTSTRAP_API_KEY=$(jq -er '.apiKey' <<< "$BOOTSTRAP_KEY_JSON")
           echo "::add-mask::${BOOTSTRAP_API_KEY}"
 
-          STORE_JSON=$(curl --fail-with-body --silent --show-error \
+          echo "Creating BTCPay regtest store..."
+          STORE_FILE="${RUNNER_TEMP}/btcpay-store.json"
+          STORE_STATUS=$(curl --silent --show-error \
+            --output "$STORE_FILE" \
+            --write-out '%{http_code}' \
             -H 'Content-Type: application/json' \
             -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
             -X POST \
             -d '{"name":"Rieko regtest health smoke"}' \
             "${BTCPAY_URL}/api/v1/stores")
+          if [ "$STORE_STATUS" != "200" ]; then
+            echo "ERROR: store creation returned HTTP ${STORE_STATUS}."
+            cat "$STORE_FILE"
+            exit 1
+          fi
+          STORE_JSON=$(< "$STORE_FILE")
           STORE_ID=$(jq -er '.id' <<< "$STORE_JSON")
 
           curl --fail-with-body --silent --show-error \
