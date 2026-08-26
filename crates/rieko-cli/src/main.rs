@@ -34,7 +34,7 @@ enum Command {
     /// Show operational status reported by the running agent.
     Status(commands::status::StatusArgs),
     /// Run the read-only HTTP API.
-    Serve(commands::serve::ServeArgs),
+    Serve(Box<commands::serve::ServeArgs>),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         Command::Findings(args) => commands::findings::run(args),
         Command::Watch(args) => commands::watch::run(args),
         Command::Status(args) => commands::status::run(args),
-        Command::Serve(args) => commands::serve::run(args),
+        Command::Serve(args) => commands::serve::run(*args),
     }
 }
 

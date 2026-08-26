@@ -10,13 +10,14 @@ use clap::Args;
 use rieko_api::RiekoApi;
 use rieko_detectors::{
     BitcoinCoreSyncCorrelationDetector, BtcPayBackendHealthDetector, Detector, DetectorContext,
-    SettlementReliabilityDetector,
+    LightningChainSyncCorrelationDetector, SettlementReliabilityDetector,
 };
 use rieko_domain::{BitcoinNetwork, NodeEvent, NodeIngestionAdapter, NodeSnapshot};
 use rieko_findings::channel_snapshot_state_digest;
 use rieko_graph::InMemoryGraph;
 use rieko_ingest_btcpay::{BtcPayAdapter, BtcPayAdapterConfig, BtcPayGreenfieldClient};
 use rieko_ingest_core::BitcoinCoreRpcClient;
+use rieko_ingest_lnd::{LndAdapter, LndClient};
 use rieko_storage::{SqliteStorage, Storage, WebhookEventRecord};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
@@ -141,6 +142,42 @@ pub struct AgentArgs {
     /// Stop Bitcoin Core polling after this many attempts; zero polls until shutdown.
     #[arg(long, default_value_t = 0)]
     bitcoin_core_poll_cycles: u64,
+
+    /// LND REST URL for bounded read-only Lightning observation.
+    #[arg(
+        long,
+        value_name = "URL",
+        requires_all = ["lnd_macaroon_file", "lnd_network"]
+    )]
+    lnd_rest_url: Option<String>,
+
+    /// File containing a scoped, read-only LND macaroon.
+    #[arg(long, value_name = "FILE", requires = "lnd_rest_url")]
+    lnd_macaroon_file: Option<PathBuf>,
+
+    /// Optional LND TLS certificate in PEM format.
+    #[arg(long, value_name = "FILE", requires = "lnd_rest_url")]
+    lnd_tls_cert_file: Option<PathBuf>,
+
+    /// Bitcoin network associated with the observed LND node.
+    #[arg(long, value_name = "NETWORK", requires = "lnd_rest_url")]
+    lnd_network: Option<BitcoinNetwork>,
+
+    /// Allow plaintext LND REST only for local regtest/signet deployments.
+    #[arg(long, requires = "lnd_rest_url")]
+    lnd_allow_insecure: bool,
+
+    /// Seconds between Lightning observation cycles.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    lnd_poll_interval: u64,
+
+    /// Maximum seconds for one Lightning observation.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    lnd_poll_timeout: u64,
+
+    /// Stop Lightning polling after this many attempts; zero polls until shutdown.
+    #[arg(long, default_value_t = 0)]
+    lnd_poll_cycles: u64,
 }
 
 struct GreenfieldPollConfig {
@@ -154,6 +191,13 @@ struct GreenfieldPollConfig {
 
 struct BitcoinCorePollConfig {
     client: BitcoinCoreRpcClient,
+    interval: Duration,
+    timeout: Duration,
+    cycles: u64,
+}
+
+struct LndPollConfig {
+    adapter: LndAdapter,
     interval: Duration,
     timeout: Duration,
     cycles: u64,
@@ -186,12 +230,14 @@ async fn run_until(
     };
     let greenfield_config = build_greenfield_poll_config(&args)?;
     let bitcoin_core_config = build_bitcoin_core_poll_config(&args)?;
+    let lnd_config = build_lnd_poll_config(&args).await?;
 
     let storage = SqliteStorage::open(&db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
     let _writer = if btcpay_config.is_some()
         || greenfield_config.is_some()
         || bitcoin_core_config.is_some()
+        || lnd_config.is_some()
     {
         Some(
             storage
@@ -216,6 +262,7 @@ async fn run_until(
     });
     let greenfield_storage = api.state.storage.clone();
     let bitcoin_core_storage = api.state.storage.clone();
+    let lnd_storage = api.state.storage.clone();
 
     let app = api.router();
     drop(api);
@@ -225,6 +272,7 @@ async fn run_until(
     });
     let (poll_shutdown_tx, poll_shutdown_rx) = watch::channel(false);
     let bitcoin_core_shutdown_rx = poll_shutdown_tx.subscribe();
+    let lnd_shutdown_rx = poll_shutdown_tx.subscribe();
     let mut greenfield_worker = greenfield_config.map(|config| {
         info!(
             interval_seconds = config.interval.as_secs(),
@@ -251,6 +299,15 @@ async fn run_until(
             bitcoin_core_shutdown_rx,
         ))
     });
+    let mut lnd_worker = lnd_config.map(|config| {
+        info!(
+            interval_seconds = config.interval.as_secs(),
+            timeout_seconds = config.timeout.as_secs(),
+            cycle_limit = config.cycles,
+            "LND REST polling enabled"
+        );
+        tokio::spawn(run_lnd_poll_loop(config, lnd_storage, lnd_shutdown_rx))
+    });
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
     info!(
         addr = %args.addr,
@@ -275,7 +332,46 @@ async fn run_until(
     stop_worker(&mut webhook_worker, "BTCPay finding").await;
     stop_worker(&mut greenfield_worker, "BTCPay Greenfield polling").await;
     stop_worker(&mut bitcoin_core_worker, "Bitcoin Core RPC polling").await;
+    stop_worker(&mut lnd_worker, "LND REST polling").await;
     result
+}
+
+async fn build_lnd_poll_config(args: &AgentArgs) -> Result<Option<LndPollConfig>> {
+    let Some(endpoint) = args.lnd_rest_url.as_deref() else {
+        return Ok(None);
+    };
+    let macaroon_file = args
+        .lnd_macaroon_file
+        .as_deref()
+        .context("--lnd-macaroon-file is required with --lnd-rest-url")?;
+    let network = args
+        .lnd_network
+        .context("--lnd-network is required with --lnd-rest-url")?;
+    let macaroon = std::fs::read(macaroon_file)
+        .with_context(|| format!("reading LND macaroon file {}", macaroon_file.display()))?;
+    let tls_cert = args
+        .lnd_tls_cert_file
+        .as_deref()
+        .map(|path| {
+            std::fs::read(path)
+                .with_context(|| format!("reading LND TLS certificate {}", path.display()))
+        })
+        .transpose()?;
+    let timeout = Duration::from_secs(args.lnd_poll_timeout);
+    let endpoint = endpoint.to_owned();
+    let allow_insecure = args.lnd_allow_insecure;
+    let client = tokio::task::spawn_blocking(move || {
+        LndClient::new_with_timeout(endpoint, Some(macaroon), tls_cert, timeout, allow_insecure)
+    })
+    .await
+    .context("joining read-only LND client construction")?
+    .context("building read-only LND client")?;
+    Ok(Some(LndPollConfig {
+        adapter: LndAdapter::new_auto(client, network),
+        interval: Duration::from_secs(args.lnd_poll_interval),
+        timeout,
+        cycles: args.lnd_poll_cycles,
+    }))
 }
 
 fn build_bitcoin_core_poll_config(args: &AgentArgs) -> Result<Option<BitcoinCorePollConfig>> {
@@ -480,6 +576,80 @@ async fn run_bitcoin_core_poll_loop(
     }
 }
 
+async fn run_lnd_poll_loop(
+    config: LndPollConfig,
+    storage: Arc<Mutex<Box<dyn Storage + Send>>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let LndPollConfig {
+        adapter,
+        interval,
+        timeout,
+        cycles,
+    } = config;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut attempts = 0_u64;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                attempts += 1;
+                if let Err(error) = record_lnd_attempt(&storage).await {
+                    warn!(%error, "failed to persist LND polling attempt");
+                }
+                match tokio::time::timeout(timeout, adapter.fetch_operational_snapshot()).await {
+                    Ok(Ok(snapshot)) => {
+                        let node = snapshot.node_id.clone();
+                        let synced_to_chain = snapshot.synced_to_chain;
+                        let active_channels = snapshot.active_channels;
+                        let inactive_channels = snapshot.inactive_channels;
+                        match record_lnd_success(&storage, snapshot).await {
+                            Ok(()) => {
+                                info!(
+                                    attempt = attempts,
+                                    %node,
+                                    synced_to_chain,
+                                    active_channels,
+                                    inactive_channels,
+                                    "Lightning state persisted"
+                                );
+                                run_lightning_chain_sync_correlation_detector(&storage).await;
+                            }
+                            Err(error) => warn!(attempt = attempts, %error, "Lightning state persistence failed"),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        warn!(attempt = attempts, %error, "LND REST polling failed");
+                        if let Err(state_error) = record_lnd_failure(&storage).await {
+                            warn!(%state_error, "failed to persist LND failure state");
+                        }
+                    }
+                    Err(_) => {
+                        warn!(attempt = attempts, timeout_seconds = timeout.as_secs(), "LND REST polling timed out");
+                        if let Err(error) = record_lnd_failure(&storage).await {
+                            warn!(%error, "failed to persist LND timeout state");
+                        }
+                    }
+                }
+
+                if cycles > 0 && attempts >= cycles {
+                    break;
+                }
+            }
+        }
+    }
+    // reqwest's blocking client owns a small internal runtime and must be
+    // dropped outside Tokio's async context.
+    if let Err(error) = tokio::task::spawn_blocking(move || drop(adapter)).await {
+        warn!(%error, "failed to join LND client shutdown");
+    }
+}
+
 async fn run_btcpay_health_detector(
     storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
     network: BitcoinNetwork,
@@ -494,6 +664,46 @@ async fn run_bitcoin_core_sync_correlation_detector(storage: &Arc<Mutex<Box<dyn 
     if let Err(error) = evaluate_persisted_bitcoin_core_sync_correlation(storage).await {
         warn!(%error, "Bitcoin Core sync correlation detector cycle failed");
     }
+}
+
+async fn run_lightning_chain_sync_correlation_detector(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+) {
+    if let Err(error) = evaluate_persisted_lightning_chain_sync_correlation(storage).await {
+        warn!(%error, "Lightning chain-sync correlation detector cycle failed");
+    }
+}
+
+async fn evaluate_persisted_lightning_chain_sync_correlation(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut storage = storage.blocking_lock();
+        let state = storage
+            .read_operational_state()
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?
+            .unwrap_or_default();
+        let network = state
+            .bitcoin_core
+            .as_ref()
+            .and_then(|core| core.snapshot.as_ref())
+            .map_or(BitcoinNetwork::Mainnet, |snapshot| snapshot.network);
+        let detector = LightningChainSyncCorrelationDetector::new(state);
+        let graph = InMemoryGraph::new();
+        let context = DetectorContext {
+            node: Some(BTCPAY_CORE_CORRELATION_NODE),
+            ..DetectorContext::no_context(network)
+        };
+        let cycle = detector
+            .evaluate(&graph, &context)
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
+
+        persist_operational_detector_cycle(&mut **storage, &cycle)
+    })
+    .await
+    .context("joining Lightning chain-sync correlation detector persistence")??;
+    Ok(())
 }
 
 async fn evaluate_persisted_bitcoin_core_sync_correlation(
@@ -680,6 +890,78 @@ async fn record_bitcoin_core_failure(storage: &Arc<Mutex<Box<dyn Storage + Send>
     })
     .await
     .context("joining Bitcoin Core failure persistence")??;
+    Ok(())
+}
+
+async fn record_lnd_attempt(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let attempted_at = chrono::Utc::now();
+            match state.lightning.as_mut() {
+                Some(lightning) => lightning.last_attempt = attempted_at,
+                None => {
+                    state.lightning = Some(rieko_status::LightningState {
+                        connected: false,
+                        last_attempt: attempted_at,
+                        last_success: None,
+                        snapshot: None,
+                    });
+                }
+            }
+        })
+    })
+    .await
+    .context("joining LND attempt persistence")??;
+    Ok(())
+}
+
+async fn record_lnd_success(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    snapshot: rieko_domain::LightningSnapshot,
+) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let completed_at = chrono::Utc::now();
+            let last_attempt = state
+                .lightning
+                .as_ref()
+                .map_or(completed_at, |lightning| lightning.last_attempt);
+            state.lightning = Some(rieko_status::LightningState {
+                connected: true,
+                last_attempt,
+                last_success: Some(completed_at),
+                snapshot: Some(snapshot.clone()),
+            });
+            state.last_persist_success = Some(completed_at);
+        })
+    })
+    .await
+    .context("joining LND success persistence")??;
+    Ok(())
+}
+
+async fn record_lnd_failure(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let failed_at = chrono::Utc::now();
+            match state.lightning.as_mut() {
+                Some(lightning) => lightning.connected = false,
+                None => {
+                    state.lightning = Some(rieko_status::LightningState {
+                        connected: false,
+                        last_attempt: failed_at,
+                        last_success: None,
+                        snapshot: None,
+                    });
+                }
+            }
+        })
+    })
+    .await
+    .context("joining LND failure persistence")??;
     Ok(())
 }
 
@@ -1140,6 +1422,262 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         run_bitcoin_core_poll_loop(config, storage.clone(), shutdown_rx).await;
         storage
+    }
+
+    async fn lnd_poll_config(
+        endpoint: &str,
+        interval: Duration,
+        timeout: Duration,
+        cycles: u64,
+    ) -> LndPollConfig {
+        let endpoint = endpoint.to_owned();
+        let client = tokio::task::spawn_blocking(move || {
+            LndClient::new_with_timeout(
+                endpoint,
+                Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                None,
+                timeout,
+                true,
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        LndPollConfig {
+            adapter: LndAdapter::new_auto(client, BitcoinNetwork::Regtest),
+            interval,
+            timeout,
+            cycles,
+        }
+    }
+
+    async fn run_finite_lnd_poll(
+        config: LndPollConfig,
+        storage: Arc<Mutex<Box<dyn Storage + Send>>>,
+    ) -> Arc<Mutex<Box<dyn Storage + Send>>> {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_lnd_poll_loop(config, storage.clone(), shutdown_rx).await;
+        storage
+    }
+
+    fn lnd_info() -> serde_json::Value {
+        json!({
+            "identity_pubkey": "02abcdef",
+            "alias": "rieko-regtest",
+            "version": "0.18.5-beta",
+            "chains": [{"chain": "bitcoin", "network": "regtest"}],
+            "synced_to_chain": true,
+            "num_active_channels": 3,
+            "num_inactive_channels": 1
+        })
+    }
+
+    fn healthy_btcpay_core_state(
+        observed_at: chrono::DateTime<Utc>,
+    ) -> rieko_status::OperationalState {
+        rieko_status::OperationalState {
+            source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+            bitcoin_core: Some(rieko_status::BitcoinCoreState {
+                connected: true,
+                last_attempt: observed_at,
+                last_success: Some(observed_at),
+                snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
+                    network: BitcoinNetwork::Regtest,
+                    block_height: 250,
+                    header_height: 250,
+                    synchronized: true,
+                    observed_at,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_lnd_poll_persists_normalized_state_without_overwriting_other_sources() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/getinfo",
+            get(move |headers: HeaderMap| {
+                let observed_requests = observed_requests.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("grpc-metadata-macaroon")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("deadbeef")
+                    );
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    Json(lnd_info())
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = memory_storage();
+        let observed_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        storage
+            .lock()
+            .await
+            .write_operational_state(&healthy_btcpay_core_state(observed_at))
+            .unwrap();
+
+        let storage = run_finite_lnd_poll(
+            lnd_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                2,
+            )
+            .await,
+            storage,
+        )
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        let state = storage.read_operational_state().unwrap().unwrap();
+        let lightning = state.lightning.unwrap();
+        let snapshot = lightning.snapshot.unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "cycle limit must bound polling"
+        );
+        assert_eq!(
+            state.source,
+            rieko_status::SourceState::BtcPayGreenfield { connected: true }
+        );
+        assert!(state.bitcoin_core.unwrap().connected);
+        assert!(lightning.connected);
+        assert!(lightning.last_success.is_some());
+        assert_eq!(snapshot.node_id, "02abcdef");
+        assert!(snapshot.synced_to_chain);
+        assert_eq!(snapshot.active_channels, 3);
+        assert_eq!(snapshot.inactive_channels, 1);
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lnd_poll_runs_persisted_chain_sync_correlation_detector() {
+        let mut response = lnd_info();
+        response["synced_to_chain"] = serde_json::Value::Bool(false);
+        let app = axum::Router::new().route(
+            "/v1/getinfo",
+            get(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = memory_storage();
+        storage
+            .lock()
+            .await
+            .write_operational_state(&healthy_btcpay_core_state(
+                Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let storage = run_finite_lnd_poll(
+            lnd_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                1,
+            )
+            .await,
+            storage,
+        )
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        let findings = storage.latest_findings(10).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector, "lightning_chain_sync_correlation");
+        assert_eq!(
+            findings[0]
+                .evidence_value("lightning_state")
+                .and_then(|evidence| evidence.get("synced_to_chain")),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_lnd_failure_marks_disconnected_and_preserves_last_snapshot() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/getinfo",
+            get(move || {
+                let attempt = observed_requests.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Json(lnd_info()).into_response()
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = run_finite_lnd_poll(
+            lnd_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                2,
+            )
+            .await,
+            memory_storage(),
+        )
+        .await;
+        server.abort();
+
+        let state = storage
+            .lock()
+            .await
+            .read_operational_state()
+            .unwrap()
+            .unwrap();
+        let lightning = state.lightning.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(!lightning.connected);
+        assert!(lightning.last_success.is_some());
+        assert_eq!(lightning.snapshot.unwrap().node_id, "02abcdef");
+    }
+
+    #[tokio::test]
+    async fn malformed_lnd_response_is_persisted_as_unavailable() {
+        let app = axum::Router::new().route(
+            "/v1/getinfo",
+            get(|| async { Json(json!({"identity_pubkey": 42})) }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = run_finite_lnd_poll(
+            lnd_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                1,
+            )
+            .await,
+            memory_storage(),
+        )
+        .await;
+        server.abort();
+
+        let state = storage
+            .lock()
+            .await
+            .read_operational_state()
+            .unwrap()
+            .unwrap();
+        let lightning = state.lightning.unwrap();
+        assert!(!lightning.connected);
+        assert!(lightning.last_success.is_none());
+        assert!(lightning.snapshot.is_none());
     }
 
     #[tokio::test]
@@ -1678,6 +2216,97 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn persisted_lightning_correlation_deduplicates_and_resolves_through_existing_hysteresis()
+    {
+        let backends: Vec<Arc<Mutex<Box<dyn Storage + Send>>>> = vec![
+            memory_storage(),
+            Arc::new(Mutex::new(Box::new(SqliteStorage::in_memory().unwrap()))),
+        ];
+        for storage in backends {
+            let observed_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+            storage
+                .lock()
+                .await
+                .write_operational_state(&rieko_status::OperationalState {
+                    source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+                    last_ingestion_attempt: Some(observed_at),
+                    last_ingestion_success: Some(observed_at),
+                    bitcoin_core: Some(rieko_status::BitcoinCoreState {
+                        connected: true,
+                        last_attempt: observed_at,
+                        last_success: Some(observed_at),
+                        snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
+                            network: BitcoinNetwork::Regtest,
+                            block_height: 250,
+                            header_height: 250,
+                            synchronized: true,
+                            observed_at,
+                        }),
+                    }),
+                    lightning: Some(rieko_status::LightningState {
+                        connected: true,
+                        last_attempt: observed_at,
+                        last_success: Some(observed_at),
+                        snapshot: Some(rieko_domain::LightningSnapshot {
+                            node_id: "02abcdef".into(),
+                            synced_to_chain: false,
+                            active_channels: 3,
+                            inactive_channels: 1,
+                            observed_at,
+                        }),
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            evaluate_persisted_lightning_chain_sync_correlation(&storage)
+                .await
+                .unwrap();
+            let first_id = storage.lock().await.latest_findings(10).unwrap()[0]
+                .id
+                .clone();
+            evaluate_persisted_lightning_chain_sync_correlation(&storage)
+                .await
+                .unwrap();
+            {
+                let mut storage = storage.lock().await;
+                let findings = storage.latest_findings(10).unwrap();
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].id, first_id);
+                assert_eq!(
+                    findings[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Active
+                );
+                storage
+                    .update_operational_state(&|state| {
+                        state
+                            .lightning
+                            .as_mut()
+                            .and_then(|lightning| lightning.snapshot.as_mut())
+                            .unwrap()
+                            .synced_to_chain = true;
+                    })
+                    .unwrap();
+            }
+
+            for _ in 0..3 {
+                evaluate_persisted_lightning_chain_sync_correlation(&storage)
+                    .await
+                    .unwrap();
+            }
+
+            let mut storage = storage.lock().await;
+            let findings = storage.latest_findings(10).unwrap();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].id, first_id);
+            assert_eq!(
+                findings[0].lifecycle,
+                rieko_findings::FindingLifecycle::Resolved
+            );
+        }
+    }
+
     #[derive(clap::Parser)]
     struct TestAgentCli {
         #[command(flatten)]
@@ -1758,6 +2387,52 @@ mod tests {
             invalid.extend(invalid_tail);
             assert!(TestAgentCli::try_parse_from(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn lnd_polling_configuration_is_bounded_and_requires_read_only_credentials() {
+        use clap::Parser;
+
+        let required = [
+            "--lnd-rest-url",
+            "https://127.0.0.1:8080",
+            "--lnd-macaroon-file",
+            "readonly.macaroon",
+            "--lnd-network",
+            "regtest",
+        ];
+        let mut valid = vec!["rieko-agent"];
+        valid.extend(required);
+        valid.extend([
+            "--lnd-poll-interval",
+            "1",
+            "--lnd-poll-timeout",
+            "300",
+            "--lnd-poll-cycles",
+            "2",
+        ]);
+        assert!(TestAgentCli::try_parse_from(valid).is_ok());
+
+        for invalid_tail in [
+            ["--lnd-poll-interval", "0"],
+            ["--lnd-poll-interval", "86401"],
+            ["--lnd-poll-timeout", "0"],
+            ["--lnd-poll-timeout", "301"],
+        ] {
+            let mut invalid = vec!["rieko-agent"];
+            invalid.extend(required);
+            invalid.extend(invalid_tail);
+            assert!(TestAgentCli::try_parse_from(invalid).is_err());
+        }
+
+        assert!(TestAgentCli::try_parse_from([
+            "rieko-agent",
+            "--lnd-rest-url",
+            "https://127.0.0.1:8080",
+            "--lnd-network",
+            "regtest",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2025,6 +2700,14 @@ mod tests {
             bitcoin_core_poll_interval: 60,
             bitcoin_core_poll_timeout: 10,
             bitcoin_core_poll_cycles: 0,
+            lnd_rest_url: None,
+            lnd_macaroon_file: None,
+            lnd_tls_cert_file: None,
+            lnd_network: None,
+            lnd_allow_insecure: false,
+            lnd_poll_interval: 60,
+            lnd_poll_timeout: 10,
+            lnd_poll_cycles: 0,
         };
 
         let task = tokio::spawn(run_until(args, async {

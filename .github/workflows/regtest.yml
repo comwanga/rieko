@@ -63,6 +63,7 @@ jobs:
       - name: Start Bitcoin Core regtest node
         run: |
           docker network create regtest-net
+          docker network create lightning-service-net
 
           RPC_READONLY_SALT=rieko-regtest-readonly
           RPC_READONLY_HASH=$(printf '%s' "${RPC_READONLY_PASS}" | openssl dgst -sha256 -hmac "${RPC_READONLY_SALT}" | awk '{print $NF}')
@@ -70,7 +71,7 @@ jobs:
           docker run -d \
             --name bitcoind \
             --network regtest-net \
-            -p 127.0.0.1:18443:18443 \
+            -p 18443:18443 \
             -p 127.0.0.1:28332:28332 \
             -p 127.0.0.1:28333:28333 \
             ${{ env.BITCOIND_IMAGE }} \
@@ -142,13 +143,14 @@ jobs:
           docker run -d \
             --name lnd \
             --network regtest-net \
+            --add-host=host.docker.internal:host-gateway \
             -p 127.0.0.1:8080:8080 \
             -p 127.0.0.1:10009:10009 \
             -v "${RUNNER_TEMP}/lnd:/root/.lnd" \
             ${{ env.LND_IMAGE }} \
             --bitcoin.regtest \
             --bitcoin.node=bitcoind \
-            --bitcoind.rpchost=bitcoind:18443 \
+            --bitcoind.rpchost=host.docker.internal:18443 \
             --bitcoind.rpcuser=${{ env.RPC_USER }} \
             --bitcoind.rpcpass=${{ env.RPC_PASS }} \
             --bitcoind.zmqpubrawblock=tcp://bitcoind:28332 \
@@ -157,6 +159,10 @@ jobs:
             --restlisten=0.0.0.0:8080 \
             --listen=0.0.0.0:9735 \
             --noseedbackup
+
+          # Keep LND REST reachable by BTCPay while the smoke test selectively
+          # removes only LND's Core-facing network.
+          docker network connect --alias lnd-service lightning-service-net lnd
 
       - name: Initialize LND wallet and wait for readiness
         run: |
@@ -260,7 +266,7 @@ jobs:
             exit 1
           fi
 
-          docker run -d \
+          docker create \
             --name btcpayserver \
             --network regtest-net \
             -p 127.0.0.1:23000:49392 \
@@ -272,8 +278,11 @@ jobs:
             -e BTCPAY_BIND=0.0.0.0:49392 \
             -e BTCPAY_CHAINS=btc \
             -e BTCPAY_BTCEXPLORERURL=http://nbxplorer:32838/ \
-            -e 'BTCPAY_BTCLIGHTNING=type=lnd-rest;server=https://lnd:8080/;macaroonfilepath=/etc/lnd/data/chain/bitcoin/regtest/admin.macaroon;allowinsecure=true' \
+            -e 'BTCPAY_BTCLIGHTNING=type=lnd-rest;server=https://lnd-service:8080/;macaroonfilepath=/etc/lnd/data/chain/bitcoin/regtest/admin.macaroon;allowinsecure=true' \
             "${BTCPAY_IMAGE}"
+
+          docker network connect lightning-service-net btcpayserver
+          docker start btcpayserver
 
           BTCPAY_READY=0
           for i in $(seq 1 120); do
@@ -424,6 +433,10 @@ jobs:
       - name: Run real BTCPay Greenfield health smoke test
         env:
           BTCPAY_REGTEST_SMOKE_ENABLED: "true"
+          LND_REST: "https://localhost:8080"
+          LND_TLS_CERT: "${{ runner.temp }}/lnd/tls.cert"
+          LND_MACAROON: "${{ runner.temp }}/lnd/data/chain/bitcoin/regtest/readonly.macaroon"
+          LND_CORE_NETWORK: "regtest-net"
         run: cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture --test-threads=1
 
       # ---------------------------------------------------------
@@ -450,5 +463,6 @@ jobs:
         run: |
           docker stop btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
           docker rm btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
+          docker network rm lightning-service-net 2>/dev/null || true
           docker network rm regtest-net 2>/dev/null || true
           rm -rf "${RUNNER_TEMP}/lnd" "${RUNNER_TEMP}/nbxplorer" "${RUNNER_TEMP}/rieko_live.db" "${RUNNER_TEMP}/rieko_fixture.db" 2>/dev/null || true

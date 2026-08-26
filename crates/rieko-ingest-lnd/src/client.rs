@@ -36,8 +36,9 @@ pub enum LndClientError {
 /// never disabled. Returns a clear error on an unparseable certificate.
 fn build_http_client(
     tls_cert_pem: Option<Vec<u8>>,
+    timeout: Duration,
 ) -> Result<reqwest::blocking::Client, LndClientError> {
-    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
+    let mut builder = reqwest::blocking::Client::builder().timeout(timeout);
     if let Some(pem) = tls_cert_pem {
         let pem_str = std::str::from_utf8(&pem)
             .map_err(|e| LndClientError::Tls(format!("invalid certificate encoding: {e}")))?;
@@ -85,7 +86,13 @@ impl LndClient {
         macaroon: Option<Vec<u8>>,
         tls_cert_pem: Option<Vec<u8>>,
     ) -> Result<Self, LndClientError> {
-        Self::new_inner(rest_base, macaroon, tls_cert_pem, false)
+        Self::new_inner(
+            rest_base,
+            macaroon,
+            tls_cert_pem,
+            Duration::from_secs(30),
+            false,
+        )
     }
 
     /// Same as [`new`] but skips the HTTPS enforcement check. Use only for
@@ -95,13 +102,33 @@ impl LndClient {
         macaroon: Option<Vec<u8>>,
         tls_cert_pem: Option<Vec<u8>>,
     ) -> Result<Self, LndClientError> {
-        Self::new_inner(rest_base, macaroon, tls_cert_pem, true)
+        Self::new_inner(
+            rest_base,
+            macaroon,
+            tls_cert_pem,
+            Duration::from_secs(30),
+            true,
+        )
+    }
+
+    /// Build the read-only client with an explicit request timeout. The
+    /// insecure transport escape hatch is intended only for local regtest or
+    /// signet deployments.
+    pub fn new_with_timeout(
+        rest_base: impl Into<String>,
+        macaroon: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+        timeout: Duration,
+        allow_insecure: bool,
+    ) -> Result<Self, LndClientError> {
+        Self::new_inner(rest_base, macaroon, tls_cert_pem, timeout, allow_insecure)
     }
 
     fn new_inner(
         rest_base: impl Into<String>,
         macaroon: Option<Vec<u8>>,
         tls_cert_pem: Option<Vec<u8>>,
+        timeout: Duration,
         allow_insecure: bool,
     ) -> Result<Self, LndClientError> {
         let rest_base = rest_base.into();
@@ -116,7 +143,7 @@ impl LndClient {
         Ok(Self {
             rest_base,
             macaroon_hex: macaroon.map(macaroon_header),
-            client: build_http_client(tls_cert_pem)?,
+            client: build_http_client(tls_cert_pem, timeout)?,
         })
     }
 
@@ -193,7 +220,7 @@ impl LndMutator {
         Ok(Self {
             rest_base: rest_base.into(),
             macaroon_hex: macaroon.map(macaroon_header),
-            client: build_http_client(tls_cert_pem)?,
+            client: build_http_client(tls_cert_pem, Duration::from_secs(30))?,
         })
     }
 

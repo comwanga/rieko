@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rieko_domain::{
-    Channel, ChannelId, ChannelStatus, FeePolicy, ForwardEvent, LiquidityProfile, NodeId,
+    Channel, ChannelId, ChannelStatus, FeePolicy, ForwardEvent, LightningSnapshot,
+    LiquidityProfile, NodeId,
 };
 use thiserror::Error;
 
@@ -54,6 +55,21 @@ impl ShortChanResolver {
 }
 
 impl Normalizer {
+    /// Normalize the minimal LND node health fields used by the agent's
+    /// durable operational-state boundary.
+    pub fn lightning_snapshot(
+        info: &crate::LndGetInfoResponse,
+        observed_at: DateTime<Utc>,
+    ) -> LightningSnapshot {
+        LightningSnapshot {
+            node_id: info.identity_pubkey.clone(),
+            synced_to_chain: info.synced_to_chain,
+            active_channels: info.num_active_channels,
+            inactive_channels: info.num_inactive_channels,
+            observed_at,
+        }
+    }
+
     pub fn channel(
         lnd: &LndChannel,
         local_node: &NodeId,
@@ -286,6 +302,31 @@ fn classify_status_bits(bits: u64, known: u64) -> ChannelStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_minimal_lightning_operational_state() {
+        let observed_at = Utc::now();
+        let info = crate::LndGetInfoResponse {
+            identity_pubkey: "02abcdef".into(),
+            alias: Some("rieko-regtest".into()),
+            version: Some("0.18.5-beta".into()),
+            chains: vec![crate::LndChainInfo {
+                chain: "bitcoin".into(),
+                network: "regtest".into(),
+            }],
+            synced_to_chain: true,
+            num_active_channels: 3,
+            num_inactive_channels: 1,
+        };
+
+        let snapshot = Normalizer::lightning_snapshot(&info, observed_at);
+
+        assert_eq!(snapshot.node_id, "02abcdef");
+        assert!(snapshot.synced_to_chain);
+        assert_eq!(snapshot.active_channels, 3);
+        assert_eq!(snapshot.inactive_channels, 1);
+        assert_eq!(snapshot.observed_at, observed_at);
+    }
 
     fn lnd_channel(point: &str, flags: &str) -> LndChannel {
         LndChannel {
