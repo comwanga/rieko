@@ -77,6 +77,7 @@ jobs:
             -rpcport=18443 \
             -port=18444 \
             -bind=0.0.0.0:18444 \
+            -whitelist=0.0.0.0/0 \
             -zmqpubrawblock=tcp://0.0.0.0:28332 \
             -zmqpubrawtx=tcp://0.0.0.0:28333 \
             -txindex=1 \
@@ -194,6 +195,8 @@ jobs:
       # ---------------------------------------------------------
       - name: Start pinned BTCPay Server regtest services
         run: |
+          mkdir -p "${RUNNER_TEMP}/nbxplorer"
+
           docker run -d \
             --name postgres \
             --network regtest-net \
@@ -221,9 +224,11 @@ jobs:
           docker run -d \
             --name nbxplorer \
             --network regtest-net \
+            -v "${RUNNER_TEMP}/nbxplorer:/datadir" \
             -e NBXPLORER_NETWORK=regtest \
             -e NBXPLORER_BIND=0.0.0.0:32838 \
             -e NBXPLORER_CHAINS=btc \
+            -e NBXPLORER_SIGNALFILESDIR=/datadir \
             -e NBXPLORER_BTCRPCURL=http://bitcoind:18443/ \
             -e NBXPLORER_BTCRPCUSER="${RPC_USER}" \
             -e NBXPLORER_BTCRPCPASSWORD="${RPC_PASS}" \
@@ -231,11 +236,27 @@ jobs:
             -e 'NBXPLORER_POSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=nbxplorer;MaxPoolSize=20;Database=nbxplorerregtest' \
             "${NBXPLORER_IMAGE}"
 
+          NBXPLORER_READY=0
+          for i in $(seq 1 60); do
+            if [ -s "${RUNNER_TEMP}/nbxplorer/RegTest/.cookie" ]; then
+              echo "NBXplorer authentication cookie is ready after ${i}s."
+              NBXPLORER_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$NBXPLORER_READY" -ne 1 ]; then
+            echo "ERROR: NBXplorer failed to create its auth cookie within 60 seconds."
+            docker logs nbxplorer --tail 100
+            exit 1
+          fi
+
           docker run -d \
             --name btcpayserver \
             --network regtest-net \
             -p 127.0.0.1:23000:49392 \
             -v "${RUNNER_TEMP}/lnd:/etc/lnd:ro" \
+            -v "${RUNNER_TEMP}/nbxplorer:/root/.nbxplorer:ro" \
             -e 'BTCPAY_POSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=btcpayserver;Database=btcpayserverregtest' \
             -e 'BTCPAY_EXPLORERPOSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=btcpayserver;MaxPoolSize=80;Database=nbxplorerregtest' \
             -e BTCPAY_NETWORK=regtest \
@@ -270,7 +291,7 @@ jobs:
           curl --fail-with-body --silent --show-error \
             -H 'Content-Type: application/json' \
             -X POST \
-            -d "$(jq -n --arg email "$BTCPAY_CI_USER" --arg password "$BTCPAY_CI_PASSWORD" '{email:$email,password:$password}')" \
+            -d "$(jq -n --arg email "$BTCPAY_CI_USER" --arg password "$BTCPAY_CI_PASSWORD" '{email:$email,password:$password,isAdministrator:true}')" \
             "${BTCPAY_URL}/api/v1/users" > /dev/null
 
           STORE_JSON=$(curl --fail-with-body --silent --show-error \
@@ -371,4 +392,4 @@ jobs:
           docker stop btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
           docker rm btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
           docker network rm regtest-net 2>/dev/null || true
-          rm -rf "${RUNNER_TEMP}/lnd" "${RUNNER_TEMP}/rieko_live.db" "${RUNNER_TEMP}/rieko_fixture.db" 2>/dev/null || true
+          rm -rf "${RUNNER_TEMP}/lnd" "${RUNNER_TEMP}/nbxplorer" "${RUNNER_TEMP}/rieko_live.db" "${RUNNER_TEMP}/rieko_fixture.db" 2>/dev/null || true
