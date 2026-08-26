@@ -9,7 +9,7 @@ use rieko_findings::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::storage::{SimulationCounts, StorageCounts, StorageError};
+use crate::storage::{SimulationCounts, StorageCounts, StorageError, WebhookEventRecord};
 use crate::Storage;
 
 /// SQLite-backed storage, WAL mode (D6). Synchronous — used by the CLI scan
@@ -287,6 +287,176 @@ impl Storage for SqliteStorage {
                 ],
             )
             .map_err(|e| StorageError::Backend(format!("recording webhook delivery: {e}")))?;
+        Ok(())
+    }
+
+    fn enqueue_webhook_event(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        event: &rieko_domain::NodeEvent,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let event_json = serde_json::to_string(event).map_err(|error| {
+            StorageError::Backend(format!("serializing webhook event: {error}"))
+        })?;
+        self.begin_transaction()?;
+        let result = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO webhook_deliveries
+                     (delivery_id, webhook_id, event_type, processed_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        delivery_id,
+                        webhook_id,
+                        event_type,
+                        accepted_at.to_rfc3339()
+                    ],
+                )
+                .map_err(|error| {
+                    StorageError::Backend(format!("recording webhook delivery: {error}"))
+                })?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO webhook_events
+                     (delivery_id, event_json, accepted_at, processed_at)
+                     VALUES (?1, ?2, ?3, NULL)",
+                    params![delivery_id, event_json, accepted_at.to_rfc3339()],
+                )
+                .map_err(|error| {
+                    StorageError::Backend(format!("enqueueing webhook event: {error}"))
+                })?;
+            Ok::<_, StorageError>(())
+        })();
+        match result {
+            Ok(()) => {
+                if let Err(error) = self.commit_transaction() {
+                    let _ = self.rollback_transaction();
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction();
+                Err(error)
+            }
+        }
+    }
+
+    fn pending_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let row_limit = limit.clamp(1, 1_000);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT delivery_id, event_json, accepted_at, processed_at
+                 FROM webhook_events
+                 WHERE processed_at IS NULL
+                 ORDER BY accepted_at ASC, delivery_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(|error| {
+                StorageError::Backend(format!("preparing pending webhook query: {error}"))
+            })?;
+        let rows = statement
+            .query_map([row_limit], |row| {
+                let event_json: String = row.get(1)?;
+                let event = serde_json::from_str(&event_json).map_err(|error| {
+                    invalid_storage_column(1, format!("invalid webhook event: {error}"))
+                })?;
+                let accepted_at = parse_persisted_timestamp(2, "webhook accepted_at", row.get(2)?)?;
+                let processed_at = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| parse_persisted_timestamp(3, "webhook processed_at", value))
+                    .transpose()?;
+                Ok(WebhookEventRecord {
+                    delivery_id: row.get(0)?,
+                    event,
+                    accepted_at,
+                    processed_at,
+                })
+            })
+            .map_err(|error| {
+                StorageError::Backend(format!("querying pending webhook events: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            StorageError::Corrupt(format!("reading pending webhook event: {error}"))
+        })
+    }
+
+    fn recent_processed_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let row_limit = limit.clamp(1, 1_000);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT delivery_id, event_json, accepted_at, processed_at
+                 FROM (
+                     SELECT delivery_id, event_json, accepted_at, processed_at
+                     FROM webhook_events
+                     WHERE processed_at IS NOT NULL
+                     ORDER BY accepted_at DESC, delivery_id DESC
+                     LIMIT ?1
+                 )
+                 ORDER BY accepted_at ASC, delivery_id ASC",
+            )
+            .map_err(|error| {
+                StorageError::Backend(format!(
+                    "preparing processed webhook history query: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map([row_limit], |row| {
+                let event_json: String = row.get(1)?;
+                let event = serde_json::from_str(&event_json).map_err(|error| {
+                    invalid_storage_column(1, format!("invalid webhook event: {error}"))
+                })?;
+                let accepted_at = parse_persisted_timestamp(2, "webhook accepted_at", row.get(2)?)?;
+                let processed_at = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| parse_persisted_timestamp(3, "webhook processed_at", value))
+                    .transpose()?;
+                Ok(WebhookEventRecord {
+                    delivery_id: row.get(0)?,
+                    event,
+                    accepted_at,
+                    processed_at,
+                })
+            })
+            .map_err(|error| {
+                StorageError::Backend(format!("querying processed webhook history: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            StorageError::Corrupt(format!("reading processed webhook history: {error}"))
+        })
+    }
+
+    fn mark_webhook_event_processed(
+        &mut self,
+        delivery_id: &str,
+        processed_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE webhook_events SET processed_at = ?2
+                 WHERE delivery_id = ?1 AND processed_at IS NULL",
+                params![delivery_id, processed_at.to_rfc3339()],
+            )
+            .map_err(|error| {
+                StorageError::Backend(format!("marking webhook event processed: {error}"))
+            })?;
+        if changed == 0 {
+            return Err(StorageError::Backend(format!(
+                "unknown or already processed webhook event {delivery_id}"
+            )));
+        }
         Ok(())
     }
 
@@ -1854,7 +2024,8 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
         use rieko_status::OperationalStateError;
         let connected = match state.source {
             rieko_status::SourceState::Fixture => None,
-            rieko_status::SourceState::LndRest { connected } => Some(connected as i64),
+            rieko_status::SourceState::LndRest { connected }
+            | rieko_status::SourceState::BtcPayGreenfield { connected } => Some(connected as i64),
         };
         self.conn
             .execute(
@@ -1932,6 +2103,11 @@ fn parse_source(s: &str, connected: Option<i64>) -> Result<rieko_status::SourceS
             Some(0) => Ok(SourceState::LndRest { connected: false }),
             Some(1) => Ok(SourceState::LndRest { connected: true }),
             _ => Err("lnd_rest source must have a boolean connection state".into()),
+        },
+        "btcpay_greenfield" => match connected {
+            Some(0) => Ok(SourceState::BtcPayGreenfield { connected: false }),
+            Some(1) => Ok(SourceState::BtcPayGreenfield { connected: true }),
+            _ => Err("btcpay_greenfield source must have a boolean connection state".into()),
         },
         "fixture" if connected.is_none() => Ok(SourceState::Fixture),
         "fixture" => Err("fixture source cannot have a connection state".into()),
@@ -2832,6 +3008,16 @@ mod tests {
         // Upsert keeps a single row.
         let again = sqlite.read_operational_state().unwrap().unwrap();
         assert_eq!(again.llm, rieko_status::ComponentState::NotConfigured);
+
+        let btcpay_state = rieko_status::OperationalState {
+            source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+            ..state.clone()
+        };
+        sqlite.write_operational_state(&btcpay_state).unwrap();
+        assert_eq!(
+            sqlite.read_operational_state().unwrap().unwrap(),
+            btcpay_state
+        );
 
         let mut mem = MemoryStorage::new();
         assert!(mem.read_operational_state().unwrap().is_none());

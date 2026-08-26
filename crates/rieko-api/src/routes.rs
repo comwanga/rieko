@@ -20,10 +20,10 @@ use rieko_simulation_app::{
     SimulationComparison, SimulationView,
 };
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
-    pub engine: &'static str,
-    pub version: &'static str,
+    pub engine: String,
+    pub version: String,
     pub schema_version: i64,
     pub read_only: bool,
     pub integrity: String,
@@ -39,13 +39,13 @@ pub struct Status {
     pub counts: StatusCounts,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationTimes {
     pub attempt: Option<String>,
     pub success: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusCounts {
     pub findings: usize,
     pub recommendations: usize,
@@ -136,8 +136,8 @@ pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (Status
     };
 
     Ok(Json(Status {
-        engine: "rieko",
-        version: VERSION,
+        engine: "rieko".into(),
+        version: VERSION.into(),
         schema_version,
         read_only,
         integrity: if integrity_ok {
@@ -180,6 +180,16 @@ fn source_label(state: &rieko_status::OperationalState) -> String {
                 }
             )
         }
+        rieko_status::SourceState::BtcPayGreenfield { connected } => {
+            format!(
+                "btcpay-greenfield ({})",
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+            )
+        }
     }
 }
 
@@ -214,6 +224,10 @@ fn lifecycle(
     }
 }
 
+fn recommendation_history(q: &LimitQuery) -> bool {
+    q.lifecycle.as_deref() == Some("all")
+}
+
 pub async fn findings(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
@@ -229,6 +243,23 @@ pub async fn findings(
         .map(|f| serde_json::to_value(&f).unwrap_or(Value::Null))
         .collect();
     Ok(Json(out))
+}
+
+pub async fn finding_by_id(
+    State(api): State<RiekoApi>,
+    Path(finding_id): Path<String>,
+) -> Result<Json<rieko_findings::Finding>, (StatusCode, String)> {
+    let requested_id = finding_id.clone();
+    let finding = block_storage(api.state.storage.clone(), move |storage| {
+        storage
+            .finding_by_id(&finding_id)
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    finding.map(Json).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("finding {requested_id} not found"),
+    ))
 }
 
 pub async fn findings_for_channel(
@@ -253,11 +284,16 @@ pub async fn recommendations(
     State(api): State<RiekoApi>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let include_history = recommendation_history(&q);
     let rows = block_storage(api.state.storage.clone(), move |s| {
-        // Return only active recommendations; resolved ones are archived and
-        // still visible via the audit trail (RIEKO-REMEDIATION-6).
-        s.latest_active_recommendations(limit(&q))
-            .map_err(|e| e.to_string())
+        if include_history {
+            s.latest_recommendations(limit(&q))
+        } else {
+            // Preserve the existing default: resolved recommendations remain
+            // archived unless a caller explicitly requests history.
+            s.latest_active_recommendations(limit(&q))
+        }
+        .map_err(|e| e.to_string())
     })
     .await?;
     let out: Vec<Value> = rows
@@ -656,8 +692,8 @@ pub async fn channel_snapshots(
 /// 3. Payload deserialization and delivery identity extraction (`deliveryId` / `originalDeliveryId`).
 /// 4. Deduplication check against persistent storage (acknowledged as `already_processed` without re-queueing).
 /// 5. Normalization into strongly-typed `NodeEvent`.
-/// 6. Bounded event enqueueing with timeout protection against prolonged saturation (returns 503 if full).
-/// 7. Mark delivery as accepted in durable storage only after successful enqueue.
+/// 6. Atomic persistence of delivery identity and the normalized event.
+/// 7. Best-effort bounded wake-up of the agent worker; durable replay is authoritative.
 pub async fn btcpay_webhook(
     State(api): State<RiekoApi>,
     headers: axum::http::HeaderMap,
@@ -667,25 +703,36 @@ pub async fn btcpay_webhook(
         normalize_webhook_payload, verify_btcpay_sig, BtcPayWebhookEvent, BTCPAY_SIG_HEADER,
     };
 
-    // 1. Signature Verification (HMAC-SHA256 constant-time)
-    if let Some(secret) = api.state.btcpay_webhook_secret.as_deref() {
-        let sig = headers
-            .get(BTCPAY_SIG_HEADER)
-            .or_else(|| headers.get("btcpay-sig"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
+    // 1. Signature Verification (HMAC-SHA256 constant-time). The public route
+    // exists on every API instance, but it must fail closed until the runtime
+    // explicitly configures both its secret and event consumer.
+    let Some(secret) = api.state.btcpay_webhook_secret.as_deref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "integration_not_configured",
+                    "message": "BTCPay webhook ingestion is not configured"
+                }
+            })),
+        ));
+    };
+    let sig = headers
+        .get(BTCPAY_SIG_HEADER)
+        .or_else(|| headers.get("btcpay-sig"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
 
-        if !verify_btcpay_sig(secret.as_bytes(), &body, sig) {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "invalid_signature",
-                        "message": "BTCPay-Sig HMAC-SHA256 signature verification failed"
-                    }
-                })),
-            ));
-        }
+    if !verify_btcpay_sig(secret.as_bytes(), &body, sig) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_signature",
+                    "message": "BTCPay-Sig HMAC-SHA256 signature verification failed"
+                }
+            })),
+        ));
     }
 
     // 2. Extract delivery envelope and identity
@@ -708,25 +755,34 @@ pub async fn btcpay_webhook(
         .as_deref()
         .filter(|s| !s.is_empty())
         .or(fallback_delivery_id);
+    let canonical_delivery_id = canonical_delivery_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_payload",
+                    "message": "deliveryId or originalDeliveryId is required"
+                }
+            })),
+        )
+    })?;
 
     // 3. Deduplication check against persistent storage
-    if let Some(del_id) = canonical_delivery_id {
-        let is_already_processed = {
-            let mut storage = api.state.storage.lock().await;
-            storage
-                .is_webhook_delivery_processed(del_id)
-                .unwrap_or(false)
-        };
+    let is_already_processed = {
+        let mut storage = api.state.storage.lock().await;
+        storage
+            .is_webhook_delivery_processed(canonical_delivery_id)
+            .unwrap_or(false)
+    };
 
-        if is_already_processed {
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "already_processed",
-                    "delivery_id": del_id
-                })),
-            ));
-        }
+    if is_already_processed {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "already_processed",
+                "delivery_id": canonical_delivery_id
+            })),
+        ));
     }
 
     // 4. Normalization into strongly-typed domain event
@@ -742,60 +798,48 @@ pub async fn btcpay_webhook(
         )
     })?;
 
-    // 5. Backpressure-safe event enqueueing
-    if let Some(sender) = &api.state.event_sender {
-        // Enqueue with bounded timeout (2 seconds) to avoid indefinite blocking
-        match tokio::time::timeout(std::time::Duration::from_secs(2), sender.send(event)).await {
-            Ok(Ok(())) => {
-                // Enqueue succeeded — now record delivery in storage
-                if let Some(del_id) = canonical_delivery_id {
-                    let mut storage = api.state.storage.lock().await;
-                    let _ = storage.record_webhook_delivery(
-                        del_id,
-                        Some(envelope.webhook_id.as_str()),
-                        Some(&envelope.event_type),
-                        chrono::Utc::now(),
-                    );
+    // 5. Durably hand the normalized event to the agent before acknowledging.
+    let delivery_id = canonical_delivery_id.to_string();
+    let webhook_id = envelope.webhook_id.clone();
+    let event_type = envelope.event_type.clone();
+    let durable_event = event.clone();
+    block_storage(api.state.storage.clone(), move |storage| {
+        storage
+            .enqueue_webhook_event(
+                &delivery_id,
+                Some(&webhook_id),
+                Some(&event_type),
+                &durable_event,
+                chrono::Utc::now(),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|(_, message)| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "persistence_failed",
+                    "message": message
                 }
-            }
-            Ok(Err(_)) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "ingestion_unavailable",
-                            "message": "Ingestion event stream is closed"
-                        }
-                    })),
-                ));
-            }
-            Err(_) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "queue_saturated",
-                            "message": "Ingestion event queue is saturated; retry later"
-                        }
-                    })),
-                ));
-            }
+            })),
+        )
+    })?;
+
+    // 6. Best-effort wake-up. A full or closed channel cannot lose the event:
+    // the worker drains durable pending rows on its next wake-up or restart.
+    if let Some(sender) = &api.state.event_sender {
+        if let Err(error) = sender.try_send(event) {
+            tracing::warn!(%error, %canonical_delivery_id, "BTCPay event persisted; worker wake-up deferred");
         }
-    } else if let Some(del_id) = canonical_delivery_id {
-        let mut storage = api.state.storage.lock().await;
-        let _ = storage.record_webhook_delivery(
-            del_id,
-            Some(envelope.webhook_id.as_str()),
-            Some(&envelope.event_type),
-            chrono::Utc::now(),
-        );
     }
 
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "accepted",
-            "delivery_id": canonical_delivery_id.unwrap_or_default()
+            "delivery_id": canonical_delivery_id
         })),
     ))
 }

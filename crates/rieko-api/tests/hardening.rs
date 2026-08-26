@@ -252,3 +252,50 @@ async fn findings_lifecycle_filter_defaults_active_and_validates_input() {
     let response = get(&app, "/findings?lifecycle=unknown", None).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn recommendations_default_active_behavior_is_preserved_and_history_is_opt_in() {
+    use rieko_findings::{Action, ActionType, Actionability, Rationale, Recommendation};
+
+    let recommendation = |finding_id: &str, lifecycle: Option<&str>| Recommendation {
+        finding_id: finding_id.into(),
+        action: Action::for_recommendation(
+            finding_id,
+            ActionType::RestartService,
+            Some("btcpay".into()),
+            serde_json::json!({}),
+            format!("review {finding_id}"),
+        ),
+        rationale: Rationale {
+            evidence: Vec::new(),
+            preconditions: Vec::new(),
+            expected_effect: "operator review".into(),
+            risks: Vec::new(),
+            limitations: Vec::new(),
+            actionability: Actionability::OperatorActionable,
+        },
+        lifecycle: lifecycle.map(str::to_owned),
+    };
+    let historical = recommendation("historical", Some("resolved"));
+    let current = recommendation("current", None);
+    let mut storage = MemoryStorage::new();
+    storage.save_recommendation(&historical).unwrap();
+    storage.save_recommendation(&current).unwrap();
+    let app = RiekoApi::new(Box::new(storage)).unwrap().router();
+
+    for (uri, expected) in [
+        ("/recommendations", vec![current.clone()]),
+        ("/recommendations?lifecycle=active", vec![current.clone()]),
+        ("/recommendations?lifecycle=resolved", vec![current.clone()]),
+        (
+            "/recommendations?lifecycle=all",
+            vec![current.clone(), historical.clone()],
+        ),
+    ] {
+        let response = get(&app, uri, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let recommendations: Vec<Recommendation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recommendations, expected, "unexpected results for {uri}");
+    }
+}

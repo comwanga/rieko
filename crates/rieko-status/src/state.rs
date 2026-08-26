@@ -61,6 +61,8 @@ pub enum SourceState {
     Fixture,
     /// A live LND REST node.
     LndRest { connected: bool },
+    /// A live BTCPay Server Greenfield API.
+    BtcPayGreenfield { connected: bool },
 }
 
 impl SourceState {
@@ -69,6 +71,7 @@ impl SourceState {
         match self {
             SourceState::Fixture => true,
             SourceState::LndRest { connected } => *connected,
+            SourceState::BtcPayGreenfield { connected } => *connected,
         }
     }
 
@@ -76,6 +79,7 @@ impl SourceState {
         match self {
             SourceState::Fixture => "fixture",
             SourceState::LndRest { .. } => "lnd_rest",
+            SourceState::BtcPayGreenfield { .. } => "btcpay_greenfield",
         }
     }
 }

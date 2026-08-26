@@ -166,8 +166,10 @@ async fn live_flow() {
     std::fs::write(&key_path, format!("{api_key}\n")).unwrap();
     std::fs::write(&token_path, format!("{API_TOKEN}\n")).unwrap();
 
+    let agent_binary = std::env::var("CARGO_BIN_EXE_rieko-agent")
+        .expect("Cargo did not provide the rieko-agent integration-test binary path");
     let mut agent = ChildGuard(Some(
-        Command::new(env!("CARGO_BIN_EXE_rieko-agent"))
+        Command::new(agent_binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),

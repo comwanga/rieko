@@ -425,3 +425,29 @@ async fn status_exposes_source_data_timestamp() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["source_data_at"], source_data_at.to_rfc3339());
 }
+
+#[tokio::test]
+async fn status_exposes_btcpay_greenfield_connectivity() {
+    let mut mem = MemoryStorage::new();
+    mem.write_operational_state(&rieko_status::OperationalState {
+        source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+        ..Default::default()
+    })
+    .unwrap();
+
+    let response = RiekoApi::new(Box::new(mem))
+        .unwrap()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["source"], "btcpay-greenfield (connected)");
+}

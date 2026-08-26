@@ -12,12 +12,13 @@ repository.workspace = true
 rieko-domain.workspace = true
 rieko-graph.workspace = true
 rieko-findings.workspace = true
+rieko-status.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+serde_json.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-serde_json.workspace = true
 rieko-recommendations.workspace = true
 rieko-storage.workspace = true
 rieko-ingest-btcpay.workspace = true

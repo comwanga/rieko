@@ -8,7 +8,7 @@ pub use retention::{PruneSummary, RetentionPolicy};
 pub use sqlite::{SqliteStorage, WriterLock};
 pub use storage::{
     MemoryStorage, SimulationCounts, SimulationEvent, SimulationRecord, Storage, StorageCounts,
-    StorageError,
+    StorageError, WebhookEventRecord,
 };
 
 /// Cap for table row counts loaded by the default `counts()` fallback. Real

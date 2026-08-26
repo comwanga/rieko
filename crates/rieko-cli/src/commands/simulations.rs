@@ -5,19 +5,17 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use rieko_simulation_app::{
-    compare_simulations, create_simulation, get_simulation, list_simulations,
-    CompareSimulationsCommand, CreateSimulationCommand, SimulationComparison, SimulationView,
+    create_simulation, CompareSimulationsCommand, CreateSimulationCommand, SimulationComparison,
+    SimulationView,
 };
 use rieko_storage::SqliteStorage;
+
+use super::findings::{ApiArgs, ApiClient};
 
 #[derive(Args, Debug)]
 pub struct SimulationsArgs {
     #[command(subcommand)]
     command: SimulationCommand,
-
-    /// Durable database path. Defaults to `~/.rieko/rieko.db`.
-    #[arg(long, value_name = "FILE")]
-    db: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -26,6 +24,8 @@ enum SimulationCommand {
     Create(CreateArgs),
     /// List recent simulations.
     List {
+        #[command(flatten)]
+        api: ApiArgs,
         #[arg(long, default_value_t = 25)]
         limit: u32,
         /// Emit the complete machine-readable response.
@@ -35,6 +35,8 @@ enum SimulationCommand {
     /// Show a simulation by ID.
     Show {
         simulation_id: String,
+        #[command(flatten)]
+        api: ApiArgs,
         /// Emit the complete machine-readable response.
         #[arg(long)]
         json: bool,
@@ -43,6 +45,8 @@ enum SimulationCommand {
     Compare {
         left_simulation_id: String,
         right_simulation_id: String,
+        #[command(flatten)]
+        api: ApiArgs,
         /// Emit the complete machine-readable response.
         #[arg(long)]
         json: bool,
@@ -51,6 +55,10 @@ enum SimulationCommand {
 
 #[derive(Args, Debug)]
 struct CreateArgs {
+    /// Durable database path. Defaults to `~/.rieko/rieko.db`.
+    #[arg(long, value_name = "FILE")]
+    db: Option<PathBuf>,
+
     /// Recommendation action ID to simulate.
     #[arg(long)]
     recommendation: String,
@@ -74,21 +82,23 @@ struct CreateArgs {
 
 pub fn run(args: SimulationsArgs) -> Result<()> {
     match &args.command {
-        SimulationCommand::Create(create) => run_create(&args, create),
-        SimulationCommand::List { limit, json } => run_list(&args, *limit, *json),
+        SimulationCommand::Create(create) => run_create(create),
+        SimulationCommand::List { api, limit, json } => run_list(api, *limit, *json),
         SimulationCommand::Show {
             simulation_id,
+            api,
             json,
-        } => run_show(&args, simulation_id, *json),
+        } => run_show(api, simulation_id, *json),
         SimulationCommand::Compare {
             left_simulation_id,
             right_simulation_id,
+            api,
             json,
-        } => run_compare(&args, left_simulation_id, right_simulation_id, *json),
+        } => run_compare(api, left_simulation_id, right_simulation_id, *json),
     }
 }
 
-fn run_create(args: &SimulationsArgs, create: &CreateArgs) -> Result<()> {
+fn run_create(create: &CreateArgs) -> Result<()> {
     let source_channel = create
         .source_channel
         .as_deref()
@@ -100,7 +110,7 @@ fn run_create(args: &SimulationsArgs, create: &CreateArgs) -> Result<()> {
     let amount_sats = create
         .amount_sats
         .context("--amount-sats is required for this model")?;
-    let mut storage = open(args)?;
+    let mut storage = open(create)?;
     let outcome = create_simulation(
         &mut storage,
         CreateSimulationCommand {
@@ -123,9 +133,9 @@ fn run_create(args: &SimulationsArgs, create: &CreateArgs) -> Result<()> {
     print_simulation(&outcome.simulation)
 }
 
-fn run_list(args: &SimulationsArgs, limit: u32, json: bool) -> Result<()> {
-    let mut storage = open(args)?;
-    let simulations = list_simulations(&mut storage, limit).map_err(anyhow::Error::new)?;
+fn run_list(api: &ApiArgs, limit: u32, json: bool) -> Result<()> {
+    let runtime = client_runtime("list")?;
+    let simulations = runtime.block_on(ApiClient::new(api)?.fetch_simulations(limit))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&simulations)?);
         return Ok(());
@@ -146,11 +156,9 @@ fn run_list(args: &SimulationsArgs, limit: u32, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_show(args: &SimulationsArgs, simulation_id: &str, json: bool) -> Result<()> {
-    let mut storage = open(args)?;
-    let simulation = get_simulation(&mut storage, simulation_id)
-        .map_err(anyhow::Error::new)?
-        .with_context(|| format!("no simulation with id {simulation_id}"))?;
+fn run_show(api: &ApiArgs, simulation_id: &str, json: bool) -> Result<()> {
+    let runtime = client_runtime("show")?;
+    let simulation = runtime.block_on(ApiClient::new(api)?.fetch_simulation(simulation_id))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&simulation)?);
         Ok(())
@@ -160,20 +168,18 @@ fn run_show(args: &SimulationsArgs, simulation_id: &str, json: bool) -> Result<(
 }
 
 fn run_compare(
-    args: &SimulationsArgs,
+    api: &ApiArgs,
     left_simulation_id: &str,
     right_simulation_id: &str,
     json: bool,
 ) -> Result<()> {
-    let mut storage = open(args)?;
-    let comparison = compare_simulations(
-        &mut storage,
-        CompareSimulationsCommand {
+    let runtime = client_runtime("compare")?;
+    let comparison = runtime.block_on(ApiClient::new(api)?.compare_simulations(
+        &CompareSimulationsCommand {
             left_simulation_id: left_simulation_id.into(),
             right_simulation_id: right_simulation_id.into(),
         },
-    )
-    .map_err(anyhow::Error::new)?;
+    ))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&comparison)?);
     } else {
@@ -224,7 +230,14 @@ fn print_comparison(comparison: &SimulationComparison) {
     println!("  No action was executed.");
 }
 
-fn open(args: &SimulationsArgs) -> Result<SqliteStorage> {
+fn client_runtime(command: &str) -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .with_context(|| format!("building simulations {command} client runtime"))
+}
+
+fn open(args: &CreateArgs) -> Result<SqliteStorage> {
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
     SqliteStorage::open(&db_path).with_context(|| format!("opening db {}", db_path.display()))
 }

@@ -171,6 +171,10 @@ impl RiekoApi {
                 axum::routing::get(crate::routes::findings_for_channel),
             )
             .route(
+                "/findings/:finding_id",
+                axum::routing::get(crate::routes::finding_by_id),
+            )
+            .route(
                 "/recommendations",
                 axum::routing::get(crate::routes::recommendations),
             )

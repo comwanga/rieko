@@ -1,117 +1,177 @@
-use std::path::PathBuf;
-
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{bail, Context, Result};
 use clap::Args;
-use rieko_status::{assess, HealthPolicy, OperationalState, OperationalStateStore};
-use rieko_storage::{SqliteStorage, Storage, CURRENT_SCHEMA_VERSION};
-use tracing::info;
+use rieko_api::routes::{OperationTimes, Status};
+
+use super::findings::{ApiArgs, ApiClient};
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
-    #[arg(long, value_name = "FILE")]
-    db: Option<PathBuf>,
+    #[command(flatten)]
+    api: ApiArgs,
 }
 
 pub fn run(args: StatusArgs) -> Result<()> {
-    let db_path = args.db.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".rieko").join("rieko.db")
-    });
-    let mut storage = SqliteStorage::open(&db_path)
-        .with_context(|| format!("opening db {}", db_path.display()))?;
-
-    let schema = storage.schema_version()?;
-    let integrity_ok = storage.integrity_check().is_ok();
-    let counts = storage.counts()?;
-    let operational = storage.read_operational_state()?;
-
-    println!("Rieko status (db: {})", db_path.display());
-    println!(
-        "  schema version:  {} (current {CURRENT_SCHEMA_VERSION})",
-        schema
-    );
-    // Deterministically confirm the database is intact; refuse to claim it's
-    // healthy if integrity checks fail (D9, invariant #8).
-    match integrity_ok {
-        true => println!("  integrity:      ok"),
-        false => {
-            println!("  integrity:      FAILED");
-            anyhow::bail!("refusing to report healthy: integrity check failed");
-        }
-    }
-    println!("  findings:        {}", counts.findings);
-    println!("  recommendations: {}", counts.recommendations);
-    println!("  simulations:     {}", counts.simulations);
-    println!("  audit entries:   {}", counts.audit);
-    println!("  channel snapshots: {}", counts.channel_snapshots);
-
-    match operational.as_ref() {
-        Some(state) => {
-            let overall = assess(state, &HealthPolicy::default(), Utc::now(), integrity_ok);
-            println!("  overall:         {}", overall.as_str());
-            println!("  source:          {}", source_label(state));
-            println!("  source data at:  {}", ts(state.source_data_at));
-            println!(
-                "  last ingestion:  attempt {} / success {}",
-                ts(state.last_ingestion_attempt),
-                ts(state.last_ingestion_success)
-            );
-            println!(
-                "  last cycle:      attempt {} / success {}",
-                ts(state.last_cycle_attempt),
-                ts(state.last_cycle_success)
-            );
-            println!(
-                "  last persist:    success {}",
-                ts(state.last_persist_success)
-            );
-            println!("  llm:             {}", state.llm.as_str());
-            println!("  alert sink:      {}", state.alert_sink.as_str());
-            println!("  cleanup:         {}", state.cleanup.as_str());
-            println!(
-                "  last cleanup:    attempt {} / success {}",
-                ts(state.last_cleanup_attempt),
-                ts(state.last_cleanup_success)
-            );
-        }
-        None => {
-            let overall = assess(
-                &OperationalState::default(),
-                &HealthPolicy::default(),
-                Utc::now(),
-                integrity_ok,
-            );
-            println!("  overall:         {}", overall.as_str());
-            println!("  source:          (never ingested)");
-        }
-    }
-
-    if let Some(last) = storage.recent_audit(1)?.first() {
-        info!(last_audit = %last.timestamp.to_rfc3339(), "latest audit entry");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building status client runtime")?;
+    let client = ApiClient::new(&args.api)?;
+    let status = runtime.block_on(client.fetch_status())?;
+    print!("{}", render_status(&status, &args.api.api_url));
+    if status.integrity != "ok" {
+        bail!("refusing to report healthy: integrity check failed");
     }
     Ok(())
 }
 
-fn ts(t: Option<DateTime<Utc>>) -> String {
-    match t {
-        Some(t) => t.to_rfc3339(),
-        None => "never".to_string(),
+fn render_status(status: &Status, api_url: &str) -> String {
+    let integrity = if status.integrity == "ok" {
+        "ok"
+    } else {
+        "FAILED"
+    };
+    let mut lines = vec![
+        format!("Rieko status (api: {api_url})"),
+        format!("  schema version:  {}", status.schema_version),
+        format!("  integrity:      {integrity}"),
+        format!("  findings:        {}", status.counts.findings),
+        format!("  recommendations: {}", status.counts.recommendations),
+        format!("  simulations:     {}", status.counts.simulations),
+        format!("  audit entries:   {}", status.counts.audit),
+        format!("  channel snapshots: {}", status.counts.channel_snapshots),
+        format!("  overall:         {}", status.overall),
+    ];
+
+    match status.source.as_deref() {
+        Some(source) => {
+            lines.push(format!("  source:          {source}"));
+            lines.push(format!(
+                "  source data at:  {}",
+                text_or_never(status.source_data_at.as_deref())
+            ));
+            lines.push(format!(
+                "  last ingestion:  {}",
+                operation(status.last_ingestion.as_ref())
+            ));
+            lines.push(format!(
+                "  last cycle:      {}",
+                operation(status.last_cycle.as_ref())
+            ));
+            lines.push(format!("  llm:             {}", status.llm));
+            lines.push(format!("  alert sink:      {}", status.alert_sink));
+            lines.push(format!("  cleanup:         {}", status.cleanup));
+            lines.push(format!(
+                "  last cleanup:    {}",
+                operation(status.last_cleanup.as_ref())
+            ));
+        }
+        None => lines.push("  source:          (never ingested)".into()),
+    }
+    lines.join("\n") + "\n"
+}
+
+fn operation(times: Option<&OperationTimes>) -> String {
+    match times {
+        Some(times) => format!(
+            "attempt {} / success {}",
+            text_or_never(times.attempt.as_deref()),
+            text_or_never(times.success.as_deref())
+        ),
+        None => "attempt never / success never".into(),
     }
 }
 
-fn source_label(state: &OperationalState) -> String {
-    match state.source {
-        rieko_status::SourceState::Fixture => "fixture".to_string(),
-        rieko_status::SourceState::LndRest { connected } => {
-            format!(
-                "lnd-rest ({})",
-                if connected {
-                    "connected"
-                } else {
-                    "disconnected"
-                }
-            )
-        }
+fn text_or_never(value: Option<&str>) -> &str {
+    value.unwrap_or("never")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use rieko_api::RiekoApi;
+    use rieko_storage::MemoryStorage;
+
+    async fn start(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), server)
+    }
+
+    fn client(api_url: String, token_file: Option<std::path::PathBuf>) -> ApiClient {
+        ApiClient::new(&ApiArgs {
+            api_url,
+            token_file,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retrieves_and_renders_typed_status_without_a_local_database() {
+        let app = RiekoApi::new(Box::new(MemoryStorage::new()))
+            .unwrap()
+            .router();
+        let (api_url, server) = start(app).await;
+
+        let status = client(api_url.clone(), None).fetch_status().await.unwrap();
+        let rendered = render_status(&status, &api_url);
+
+        server.abort();
+        assert_eq!(status.engine, "rieko");
+        assert!(rendered.contains(&format!("Rieko status (api: {api_url})")));
+        assert!(rendered.contains("  schema version:"));
+        assert!(rendered.contains("  integrity:      ok"));
+        assert!(rendered.contains("  findings:        0"));
+        assert!(rendered.contains("  source:          (never ingested)"));
+        assert!(!rendered.contains("db:"));
+    }
+
+    #[tokio::test]
+    async fn reports_authentication_failure() {
+        let app = RiekoApi::new(Box::new(MemoryStorage::new()))
+            .unwrap()
+            .with_auth("correct-token")
+            .unwrap()
+            .router();
+        let (api_url, server) = start(app).await;
+        let directory = tempfile::tempdir().unwrap();
+        let token_file = directory.path().join("token");
+        std::fs::write(&token_file, "wrong-token\n").unwrap();
+
+        let error = client(api_url, Some(token_file))
+            .fetch_status()
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert!(error.to_string().contains("401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn reports_non_success_status_responses() {
+        let app = axum::Router::new().route(
+            "/status",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable") }),
+        );
+        let (api_url, server) = start(app).await;
+
+        let error = client(api_url, None).fetch_status().await.unwrap_err();
+
+        server.abort();
+        assert!(error.to_string().contains("503 Service Unavailable"));
+        assert!(error.to_string().contains("agent unavailable"));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_typed_status_responses() {
+        let app = axum::Router::new().route("/status", get(|| async { "not status json" }));
+        let (api_url, server) = start(app).await;
+
+        let error = client(api_url, None).fetch_status().await.unwrap_err();
+
+        server.abort();
+        assert!(error.to_string().contains("decoding typed status response"));
     }
 }

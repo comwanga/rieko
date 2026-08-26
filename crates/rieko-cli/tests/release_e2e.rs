@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
+use rieko_api::RiekoApi;
+use rieko_storage::SqliteStorage;
+
 fn binary() -> PathBuf {
     let status = Command::new(env!("CARGO"))
         .arg("build")
@@ -62,6 +65,21 @@ fn db_flag(db: &Path) -> String {
     format!("--db={}", db.to_str().unwrap())
 }
 
+fn status_via_api(binary: &PathBuf, db: &Path) -> std::process::Output {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let api = RiekoApi::new(Box::new(SqliteStorage::open(db).unwrap()))
+            .unwrap()
+            .router();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+        let api_url = format!("--api-url=http://{address}");
+        let output = cli(binary, &["status", &api_url]);
+        server.abort();
+        output
+    })
+}
+
 #[test]
 fn build_scan_status_no_duplicates() {
     let bin = binary();
@@ -88,7 +106,7 @@ fn build_scan_status_no_duplicates() {
     );
 
     // 2. Status reports findings and database health.
-    let status = cli(&bin, &["status", &db_flag(&db)]);
+    let status = status_via_api(&bin, &db);
     assert!(status.status.success(), "status must succeed");
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
@@ -111,7 +129,7 @@ fn build_scan_status_no_duplicates() {
             &db_flag(&db),
         ],
     );
-    let status2 = cli(&bin, &["status", &db_flag(&db)]);
+    let status2 = status_via_api(&bin, &db);
     assert!(
         status2.status.success(),
         "status after re-scan must succeed"
