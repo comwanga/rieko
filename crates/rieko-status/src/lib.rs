@@ -9,5 +9,7 @@ pub mod state;
 pub mod store;
 
 pub use health::{assess, HealthPolicy};
-pub use state::{BitcoinCoreState, ComponentState, OperationalState, OverallState, SourceState};
+pub use state::{
+    BitcoinCoreState, ComponentState, LightningState, OperationalState, OverallState, SourceState,
+};
 pub use store::{OperationalStateError, OperationalStateStore};

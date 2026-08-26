@@ -1935,8 +1935,8 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             .prepare(
                 "SELECT source, source_connected, last_ingestion_attempt,
                         last_ingestion_success, last_cycle_attempt, last_cycle_success,
-                        last_persist_success, source_data_at, bitcoin_core, llm, alert_sink,
-                        cleanup, last_cleanup_attempt, last_cleanup_success
+                        last_persist_success, source_data_at, bitcoin_core, lightning, llm,
+                        alert_sink, cleanup, last_cleanup_attempt, last_cleanup_success
                  FROM operational_state WHERE id = 'current'",
             )
             .map_err(|e| OperationalStateError::Store(e.to_string()))?;
@@ -1952,11 +1952,12 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
-                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(12)?,
                     row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })
             .map_err(|e| OperationalStateError::Store(e.to_string()))?;
@@ -1973,6 +1974,7 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             persist_success,
             data_at,
             bitcoin_core,
+            lightning,
             llm,
             alert,
             cleanup,
@@ -2012,6 +2014,13 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                 })
                 .transpose()
                 .map_err(OperationalStateError::Store)?,
+            lightning: lightning
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|error| format!("lightning state: {error}"))
+                })
+                .transpose()
+                .map_err(OperationalStateError::Store)?,
             llm: parse_component(&llm).map_err(OperationalStateError::Store)?,
             alert_sink: parse_component(&alert).map_err(OperationalStateError::Store)?,
             cleanup: parse_component(&cleanup).map_err(OperationalStateError::Store)?,
@@ -2042,14 +2051,20 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| OperationalStateError::Store(error.to_string()))?;
+        let lightning = state
+            .lightning
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| OperationalStateError::Store(error.to_string()))?;
         self.conn
             .execute(
                 "INSERT INTO operational_state
                     (id, source, source_connected, last_ingestion_attempt, last_ingestion_success,
                      last_cycle_attempt, last_cycle_success, last_persist_success, source_data_at,
-                     bitcoin_core, llm, alert_sink, cleanup, last_cleanup_attempt,
+                     bitcoin_core, lightning, llm, alert_sink, cleanup, last_cleanup_attempt,
                      last_cleanup_success)
-                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 VALUES ('current', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id) DO UPDATE SET
                     source = excluded.source,
                     source_connected = excluded.source_connected,
@@ -2060,6 +2075,7 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     last_persist_success = excluded.last_persist_success,
                     source_data_at = excluded.source_data_at,
                     bitcoin_core = excluded.bitcoin_core,
+                    lightning = excluded.lightning,
                     llm = excluded.llm,
                     alert_sink = excluded.alert_sink,
                     cleanup = excluded.cleanup,
@@ -2075,6 +2091,7 @@ impl rieko_status::OperationalStateStore for SqliteStorage {
                     state.last_persist_success.map(|t| t.to_rfc3339()),
                     state.source_data_at.map(|t| t.to_rfc3339()),
                     bitcoin_core,
+                    lightning,
                     component_str(state.llm),
                     component_str(state.alert_sink),
                     component_str(state.cleanup),
@@ -3014,6 +3031,18 @@ mod tests {
                     block_height: 250,
                     header_height: 250,
                     synchronized: true,
+                    observed_at: Utc::now(),
+                }),
+            }),
+            lightning: Some(rieko_status::LightningState {
+                connected: true,
+                last_attempt: Utc::now(),
+                last_success: Some(Utc::now()),
+                snapshot: Some(rieko_domain::LightningSnapshot {
+                    node_id: "02abcdef".into(),
+                    synced_to_chain: true,
+                    active_channels: 3,
+                    inactive_channels: 1,
                     observed_at: Utc::now(),
                 }),
             }),

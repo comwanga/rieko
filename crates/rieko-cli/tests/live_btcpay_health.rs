@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
 use rieko_findings::{Finding, FindingLifecycle, FindingLifecycleFilter};
-use rieko_status::{BitcoinCoreState, OperationalStateStore, SourceState};
+use rieko_status::{BitcoinCoreState, LightningState, OperationalStateStore, SourceState};
 use rieko_storage::{SqliteStorage, Storage};
 use sha2::{Digest, Sha256};
 use tokio::io::copy_bidirectional;
@@ -29,6 +29,60 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+struct DockerNetworkIsolation {
+    network: String,
+    container: &'static str,
+    restored: bool,
+}
+
+impl DockerNetworkIsolation {
+    fn induce(network: String, container: &'static str) -> Self {
+        let output = Command::new("docker")
+            .args(["network", "disconnect", &network, container])
+            .output()
+            .expect("disconnect LND from its Core-facing Docker network");
+        assert!(
+            output.status.success(),
+            "disconnecting {container} from {network} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            network,
+            container,
+            restored: false,
+        }
+    }
+
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        let output = Command::new("docker")
+            .args(["network", "connect", &self.network, self.container])
+            .output()
+            .expect("restore LND Core-facing Docker network");
+        assert!(
+            output.status.success(),
+            "reconnecting {} to {} failed: {}",
+            self.container,
+            self.network,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.restored = true;
+    }
+}
+
+impl Drop for DockerNetworkIsolation {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = Command::new("docker")
+                .args(["network", "connect", &self.network, self.container])
+                .status();
+            self.restored = true;
+        }
     }
 }
 
@@ -186,6 +240,63 @@ fn spawn_correlation_agent(
             "2",
             "--bitcoin-core-poll-cycles",
             "10",
+        ]);
+    ChildGuard(Some(command.spawn().expect("start rieko-agent")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_lightning_correlation_agent(
+    agent_binary: &str,
+    db_path: &Path,
+    api_address: SocketAddr,
+    token_path: &Path,
+    proxy_address: SocketAddr,
+    key_path: &Path,
+    store_id: &str,
+    core_password_path: &Path,
+    lnd_macaroon_path: &Path,
+    lnd_tls_cert_path: &Path,
+) -> ChildGuard {
+    let mut command = configured_agent_command(
+        agent_binary,
+        db_path,
+        api_address,
+        token_path,
+        proxy_address,
+        key_path,
+        store_id,
+        25,
+    );
+    command
+        .arg("--bitcoin-core-rpc-url")
+        .arg(required_env("BITCOIN_CORE_RPC_URL"))
+        .arg("--bitcoin-core-rpc-user")
+        .arg(required_env("RPC_READONLY_USER"))
+        .arg("--bitcoin-core-rpc-password-file")
+        .arg(core_password_path)
+        .args([
+            "--bitcoin-core-poll-interval",
+            "1",
+            "--bitcoin-core-poll-timeout",
+            "2",
+            "--bitcoin-core-poll-cycles",
+            "25",
+        ])
+        .arg("--lnd-rest-url")
+        .arg(required_env("LND_REST"))
+        .arg("--lnd-macaroon-file")
+        .arg(lnd_macaroon_path)
+        .arg("--lnd-tls-cert-file")
+        .arg(lnd_tls_cert_path)
+        .args([
+            "--lnd-network",
+            "regtest",
+            "--lnd-poll-interval",
+            "1",
+            "--lnd-poll-timeout",
+            "2",
+            "--lnd-poll-cycles",
+            "25",
         ]);
     ChildGuard(Some(command.spawn().expect("start rieko-agent")))
 }
@@ -405,6 +516,36 @@ async fn wait_for_initial_correlation_state(db_path: &Path) -> BitcoinCoreState 
     panic!("agent did not persist synchronized Core and reachable BTCPay state");
 }
 
+async fn wait_for_initial_lightning_correlation_state(
+    db_path: &Path,
+) -> (BitcoinCoreState, LightningState) {
+    for _ in 0..150 {
+        if let Ok(storage) = SqliteStorage::open(db_path) {
+            if let Ok(Some(state)) = storage.read_operational_state() {
+                if state.source == (SourceState::BtcPayGreenfield { connected: true }) {
+                    if let (Some(core), Some(lightning)) = (state.bitcoin_core, state.lightning) {
+                        let core_is_ready = core.connected
+                            && core
+                                .snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.synchronized);
+                        let lightning_is_ready = lightning.connected
+                            && lightning
+                                .snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.synced_to_chain);
+                        if core_is_ready && lightning_is_ready {
+                            return (core, lightning);
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent did not persist healthy BTCPay, synchronized Core, and chain-synced LND state");
+}
+
 async fn wait_for_active_core_correlation(client: &reqwest::Client, api_url: &str) -> Finding {
     for _ in 0..150 {
         if let Ok(response) = client
@@ -433,6 +574,36 @@ async fn wait_for_active_core_correlation(client: &reqwest::Client, api_url: &st
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("bounded Core polling did not persist one stable active correlation finding");
+}
+
+async fn wait_for_active_lightning_correlation(client: &reqwest::Client, api_url: &str) -> Finding {
+    for _ in 0..250 {
+        if let Ok(response) = client
+            .get(format!("{api_url}/findings?limit=50"))
+            .bearer_auth(API_TOKEN)
+            .send()
+            .await
+        {
+            if let Ok(findings) = response.json::<Vec<Finding>>().await {
+                let correlation = findings
+                    .into_iter()
+                    .filter(|finding| finding.detector == "lightning_chain_sync_correlation")
+                    .collect::<Vec<_>>();
+                if correlation.len() == 1
+                    && correlation[0].lifecycle == FindingLifecycle::Active
+                    && correlation[0]
+                        .last_seen_at
+                        .signed_duration_since(correlation[0].first_seen_at)
+                        .num_milliseconds()
+                        >= 1_500
+                {
+                    return correlation.into_iter().next().unwrap();
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("bounded polling did not persist one stable active Lightning correlation finding");
 }
 
 async fn wait_for_restarted_disconnected_source(client: &reqwest::Client, api_url: &str) {
@@ -786,6 +957,136 @@ async fn live_core_sync_correlation_flow() {
     assert_eq!(persisted[0].lifecycle, FindingLifecycle::Resolved);
 }
 
+async fn live_lightning_chain_sync_correlation_flow() {
+    let base_url = required_env("BTCPAY_GREENFIELD_URL");
+    let api_key = required_env("BTCPAY_GREENFIELD_API_KEY");
+    let store_id = required_env("BTCPAY_GREENFIELD_STORE");
+    let core_password = required_env("RPC_READONLY_PASS");
+    let lnd_macaroon = required_env("LND_MACAROON");
+    let lnd_tls_cert = required_env("LND_TLS_CERT");
+    let lnd_core_network = required_env("LND_CORE_NETWORK");
+
+    let upstream = upstream_address(&base_url).await;
+    let proxy = IsolationProxy::start(upstream).await;
+    let api_address = free_address();
+    let api_url = format!("http://{api_address}");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("rieko-lightning-correlation.db");
+    let key_path = temp.path().join("btcpay-readonly.key");
+    let core_password_path = temp.path().join("core-readonly.password");
+    let token_path = temp.path().join("rieko-api.token");
+    std::fs::write(&key_path, format!("{api_key}\n")).unwrap();
+    std::fs::write(&core_password_path, format!("{core_password}\n")).unwrap();
+    std::fs::write(&token_path, format!("{API_TOKEN}\n")).unwrap();
+
+    let agent_binary = required_env("CARGO_BIN_EXE_rieko-agent");
+    let mut agent = spawn_lightning_correlation_agent(
+        &agent_binary,
+        &db_path,
+        api_address,
+        &token_path,
+        proxy.address,
+        &key_path,
+        &store_id,
+        &core_password_path,
+        Path::new(&lnd_macaroon),
+        Path::new(&lnd_tls_cert),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let (initial_core, initial_lightning) =
+        wait_for_initial_lightning_correlation_state(&db_path).await;
+    assert!(initial_core.snapshot.unwrap().synchronized);
+    assert!(initial_lightning.snapshot.unwrap().synced_to_chain);
+
+    // LND retains its REST and BTCPay-facing service network while losing only
+    // its Bitcoin Core RPC/ZMQ network. Mining after isolation creates a real
+    // chain tip that the still-reachable LND node cannot observe.
+    let mut lnd_isolation = DockerNetworkIsolation::induce(lnd_core_network, "lnd");
+    bitcoin_cli("-rpcwallet=default", &["-generate", "1"]);
+
+    let unauthorized = client
+        .get(format!("{api_url}/findings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let finding = wait_for_active_lightning_correlation(&client, &api_url).await;
+    assert_eq!(finding.lifecycle, FindingLifecycle::Active);
+    assert_eq!(
+        finding.evidence_value("btcpay_state").unwrap()["connected"],
+        true
+    );
+    let core_evidence = finding.evidence_value("bitcoin_core_state").unwrap();
+    assert_eq!(core_evidence["connected"], true);
+    assert_eq!(core_evidence["network"], "regtest");
+    assert_eq!(
+        core_evidence["block_height"], core_evidence["header_height"],
+        "Bitcoin Core remains synchronized while LND is isolated"
+    );
+    assert_eq!(core_evidence["synchronized"], true);
+    let lightning_evidence = finding.evidence_value("lightning_state").unwrap();
+    assert_eq!(lightning_evidence["connected"], true);
+    assert_eq!(lightning_evidence["synced_to_chain"], false);
+    assert!(
+        lightning_evidence["node_id"]
+            .as_str()
+            .is_some_and(|node_id| !node_id.is_empty()),
+        "real LND identity is preserved"
+    );
+    assert!(lightning_evidence["active_channels"].is_u64());
+    assert!(lightning_evidence["inactive_channels"].is_u64());
+
+    let detail = client
+        .get(format!("{api_url}/findings/{}", finding.id))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Finding>()
+        .await
+        .unwrap();
+    assert_eq!(detail, finding);
+
+    agent.stop();
+    proxy.isolate().await;
+
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    let operational = storage.read_operational_state().unwrap().unwrap();
+    assert_eq!(
+        operational.source,
+        SourceState::BtcPayGreenfield { connected: true }
+    );
+    let persisted_core = operational.bitcoin_core.unwrap();
+    assert!(persisted_core.connected);
+    assert!(persisted_core.snapshot.unwrap().synchronized);
+    let persisted_lightning = operational.lightning.unwrap();
+    assert!(persisted_lightning.connected);
+    assert!(!persisted_lightning.snapshot.unwrap().synced_to_chain);
+
+    let persisted = storage
+        .latest_findings_by_lifecycle(50, FindingLifecycleFilter::All)
+        .unwrap()
+        .into_iter()
+        .filter(|candidate| candidate.detector == "lightning_chain_sync_correlation")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted.len(),
+        1,
+        "one stable logical finding is persisted"
+    );
+    assert_eq!(persisted[0].id, finding.id);
+    assert_eq!(persisted[0].lifecycle, FindingLifecycle::Active);
+
+    lnd_isolation.restore();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a real BTCPay regtest deployment; see docs/testing-btcpay-regtest.md"]
 async fn real_btcpay_greenfield_restart_continuity_resolves_the_same_finding() {
@@ -800,4 +1101,15 @@ async fn real_btcpay_core_sync_correlation_resolves_after_core_recovers() {
     tokio::time::timeout(Duration::from_secs(30), live_core_sync_correlation_flow())
         .await
         .expect("live BTCPay/Core correlation smoke test exceeded its 30-second bound");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the real BTCPay, Bitcoin Core, and LND regtest deployment in regtest.yml"]
+async fn real_btcpay_lightning_chain_sync_correlation_is_persisted_and_exposed() {
+    tokio::time::timeout(
+        Duration::from_secs(40),
+        live_lightning_chain_sync_correlation_flow(),
+    )
+    .await
+    .expect("live three-source correlation smoke test exceeded its 40-second bound");
 }

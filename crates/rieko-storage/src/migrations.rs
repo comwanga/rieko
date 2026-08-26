@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -85,6 +85,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 16,
         sql: V16_BITCOIN_CORE_STATE,
+    },
+    Migration {
+        version: 17,
+        sql: V17_LIGHTNING_STATE,
     },
 ];
 
@@ -453,6 +457,13 @@ const V16_BITCOIN_CORE_STATE: &str = r#"
 ALTER TABLE operational_state ADD COLUMN bitcoin_core TEXT;
 "#;
 
+/// v17: one constant-size normalized Lightning observation embedded in the
+/// existing operational-state boundary. NULL means LND observation is not
+/// configured.
+const V17_LIGHTNING_STATE: &str = r#"
+ALTER TABLE operational_state ADD COLUMN lightning TEXT;
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -512,9 +523,9 @@ fn apply(tx: &rusqlite::Transaction, step: &Migration) -> Result<(), StorageErro
         .map_err(|e| StorageError::Backend(format!("checking operational_state table: {e}")))
     };
     // Some supported legacy test/minimal databases contain only one v9-v11
-    // subsystem table. Preserve that migration behavior while adding the Core
-    // column to every normal database that has the v4 operational-state table.
-    if step.version != 16 || operational_state_exists()? {
+    // subsystem table. Preserve that migration behavior while adding direct
+    // observation columns to every normal database with operational state.
+    if !matches!(step.version, 16 | 17) || operational_state_exists()? {
         tx.execute_batch(step.sql).map_err(|e| {
             StorageError::Backend(format!("migration to v{} failed: {e}", step.version))
         })?;
@@ -565,6 +576,48 @@ mod tests {
         migrate(&mut conn).unwrap();
         // Applying migrations again is a no-op that must not error or bump higher.
         migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v16_operational_state_adds_lightning_without_losing_existing_state() {
+        let mut conn = bare_conn();
+        conn.execute_batch(
+            "CREATE TABLE operational_state (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, source_connected INTEGER,
+                last_ingestion_attempt TEXT, last_ingestion_success TEXT,
+                last_cycle_attempt TEXT, last_cycle_success TEXT,
+                last_persist_success TEXT, source_data_at TEXT,
+                llm TEXT NOT NULL, alert_sink TEXT NOT NULL,
+                cleanup TEXT NOT NULL, last_cleanup_attempt TEXT,
+                last_cleanup_success TEXT, bitcoin_core TEXT
+             );
+             INSERT INTO operational_state
+                (id, source, llm, alert_sink, cleanup, bitcoin_core)
+             VALUES ('current', 'fixture', 'not_configured', 'not_configured',
+                     'not_configured', '{\"connected\":true}');
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let preserved: String = conn
+            .query_row(
+                "SELECT bitcoin_core FROM operational_state WHERE id = 'current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let lightning: Option<String> = conn
+            .query_row(
+                "SELECT lightning FROM operational_state WHERE id = 'current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "{\"connected\":true}");
+        assert_eq!(lightning, None);
         assert_eq!(schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
     }
 

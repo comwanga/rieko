@@ -3,8 +3,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use rieko_domain::{
-    AdapterHealth, BitcoinNetwork, BoxEventStream, ChannelSnapshot, IngestionError, NodeId,
-    NodeIngestionAdapter, NodeSnapshot,
+    AdapterHealth, BitcoinNetwork, BoxEventStream, ChannelSnapshot, IngestionError,
+    LightningSnapshot, NodeId, NodeIngestionAdapter, NodeSnapshot,
 };
 use tracing::warn;
 
@@ -110,6 +110,26 @@ impl LndAdapter {
         );
 
         Ok(snapshot)
+    }
+
+    fn fetch_operational_snapshot_blocking(&self) -> Result<LightningSnapshot, IngestionError> {
+        let info = self
+            .client
+            .get_info()
+            .map_err(|e| IngestionError::Connection(format!("GetInfo failed: {e}")))?;
+        Ok(Normalizer::lightning_snapshot(&info, Utc::now()))
+    }
+
+    /// Fetch the minimal normalized Lightning state used by `rieko-agent`.
+    pub async fn fetch_operational_snapshot(&self) -> Result<LightningSnapshot, IngestionError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || this.fetch_operational_snapshot_blocking())
+                .await
+                .map_err(|e| IngestionError::Connection(format!("spawn_blocking error: {e}")))?
+        } else {
+            self.fetch_operational_snapshot_blocking()
+        }
     }
 
     fn health_check_blocking(&self) -> Result<AdapterHealth, IngestionError> {

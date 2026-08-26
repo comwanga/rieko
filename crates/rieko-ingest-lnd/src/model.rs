@@ -110,6 +110,12 @@ pub struct LndGetInfoResponse {
     /// Chains this node is synced to (one entry per chain).
     #[serde(default)]
     pub chains: Vec<LndChainInfo>,
+    /// Whether LND reports that its chain backend is synchronized.
+    pub synced_to_chain: bool,
+    /// Number of channels currently active according to LND.
+    pub num_active_channels: u32,
+    /// Number of channels currently inactive according to LND.
+    pub num_inactive_channels: u32,
 }
 
 impl LndGetInfoResponse {

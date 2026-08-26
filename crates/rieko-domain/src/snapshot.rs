@@ -14,6 +14,17 @@ pub struct BitcoinCoreSnapshot {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Minimal normalized Lightning node state used for persisted observation and
+/// future cross-source correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightningSnapshot {
+    pub node_id: String,
+    pub synced_to_chain: bool,
+    pub active_channels: u32,
+    pub inactive_channels: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
 /// A point-in-time view of a channel's liquidity and state. Persisted over
 /// cycles so the engine can reason about trends (drift, deterioration) and,
 /// later, run what-if simulations.
