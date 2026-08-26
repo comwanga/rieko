@@ -265,7 +265,7 @@ fn spawn_lightning_correlation_agent(
         proxy_address,
         key_path,
         store_id,
-        25,
+        35,
     );
     command
         .arg("--bitcoin-core-rpc-url")
@@ -280,7 +280,7 @@ fn spawn_lightning_correlation_agent(
             "--bitcoin-core-poll-timeout",
             "2",
             "--bitcoin-core-poll-cycles",
-            "25",
+            "35",
         ])
         .arg("--lnd-rest-url")
         .arg(required_env("LND_REST"))
@@ -296,7 +296,7 @@ fn spawn_lightning_correlation_agent(
             "--lnd-poll-timeout",
             "2",
             "--lnd-poll-cycles",
-            "25",
+            "35",
         ]);
     ChildGuard(Some(command.spawn().expect("start rieko-agent")))
 }
@@ -516,9 +516,7 @@ async fn wait_for_initial_correlation_state(db_path: &Path) -> BitcoinCoreState 
     panic!("agent did not persist synchronized Core and reachable BTCPay state");
 }
 
-async fn wait_for_initial_lightning_correlation_state(
-    db_path: &Path,
-) -> (BitcoinCoreState, LightningState) {
+async fn wait_for_healthy_three_source_state(db_path: &Path) -> (BitcoinCoreState, LightningState) {
     for _ in 0..150 {
         if let Ok(storage) = SqliteStorage::open(db_path) {
             if let Ok(Some(state)) = storage.read_operational_state() {
@@ -997,8 +995,7 @@ async fn live_lightning_chain_sync_correlation_flow() {
         .build()
         .unwrap();
 
-    let (initial_core, initial_lightning) =
-        wait_for_initial_lightning_correlation_state(&db_path).await;
+    let (initial_core, initial_lightning) = wait_for_healthy_three_source_state(&db_path).await;
     assert!(initial_core.snapshot.unwrap().synchronized);
     assert!(initial_lightning.snapshot.unwrap().synced_to_chain);
 
@@ -1054,6 +1051,41 @@ async fn live_lightning_chain_sync_correlation_flow() {
         .unwrap();
     assert_eq!(detail, finding);
 
+    // Restore only the original LND-to-Core notification network. The running
+    // agent keeps its existing configuration and observes LND catching up
+    // through its normal bounded polling cycle.
+    lnd_isolation.restore();
+    let (recovered_core, recovered_lightning) = wait_for_healthy_three_source_state(&db_path).await;
+    assert!(recovered_core.snapshot.unwrap().synchronized);
+    assert!(recovered_lightning.snapshot.unwrap().synced_to_chain);
+
+    let resolved = wait_for_resolved_finding(&client, &api_url, &finding.id).await;
+    assert_eq!(
+        resolved.id, finding.id,
+        "recovery preserves logical identity"
+    );
+    assert_eq!(resolved.detector, "lightning_chain_sync_correlation");
+    assert_eq!(resolved.lifecycle, FindingLifecycle::Resolved);
+
+    let active_after_recovery = client
+        .get(format!("{api_url}/findings?limit=50"))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<Finding>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|candidate| candidate.detector == "lightning_chain_sync_correlation")
+        .collect::<Vec<_>>();
+    assert!(
+        active_after_recovery.is_empty(),
+        "resolved Lightning correlation is absent from the active collection"
+    );
+
     agent.stop();
     proxy.isolate().await;
 
@@ -1068,7 +1100,7 @@ async fn live_lightning_chain_sync_correlation_flow() {
     assert!(persisted_core.snapshot.unwrap().synchronized);
     let persisted_lightning = operational.lightning.unwrap();
     assert!(persisted_lightning.connected);
-    assert!(!persisted_lightning.snapshot.unwrap().synced_to_chain);
+    assert!(persisted_lightning.snapshot.unwrap().synced_to_chain);
 
     let persisted = storage
         .latest_findings_by_lifecycle(50, FindingLifecycleFilter::All)
@@ -1082,9 +1114,7 @@ async fn live_lightning_chain_sync_correlation_flow() {
         "one stable logical finding is persisted"
     );
     assert_eq!(persisted[0].id, finding.id);
-    assert_eq!(persisted[0].lifecycle, FindingLifecycle::Active);
-
-    lnd_isolation.restore();
+    assert_eq!(persisted[0].lifecycle, FindingLifecycle::Resolved);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1105,11 +1135,11 @@ async fn real_btcpay_core_sync_correlation_resolves_after_core_recovers() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the real BTCPay, Bitcoin Core, and LND regtest deployment in regtest.yml"]
-async fn real_btcpay_lightning_chain_sync_correlation_is_persisted_and_exposed() {
+async fn real_btcpay_lightning_chain_sync_correlation_resolves_after_lnd_recovers() {
     tokio::time::timeout(
-        Duration::from_secs(40),
+        Duration::from_secs(50),
         live_lightning_chain_sync_correlation_flow(),
     )
     .await
-    .expect("live three-source correlation smoke test exceeded its 40-second bound");
+    .expect("live three-source recovery smoke test exceeded its 50-second bound");
 }
