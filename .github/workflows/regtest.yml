@@ -71,7 +71,7 @@ jobs:
           docker run -d \
             --name bitcoind \
             --network regtest-net \
-            -p 127.0.0.1:18443:18443 \
+            -p 18443:18443 \
             -p 127.0.0.1:28332:28332 \
             -p 127.0.0.1:28333:28333 \
             ${{ env.BITCOIND_IMAGE }} \
@@ -143,13 +143,14 @@ jobs:
           docker run -d \
             --name lnd \
             --network regtest-net \
+            --add-host=host.docker.internal:host-gateway \
             -p 127.0.0.1:8080:8080 \
             -p 127.0.0.1:10009:10009 \
             -v "${RUNNER_TEMP}/lnd:/root/.lnd" \
             ${{ env.LND_IMAGE }} \
             --bitcoin.regtest \
             --bitcoin.node=bitcoind \
-            --bitcoind.rpchost=bitcoind:18443 \
+            --bitcoind.rpchost=host.docker.internal:18443 \
             --bitcoind.rpcuser=${{ env.RPC_USER }} \
             --bitcoind.rpcpass=${{ env.RPC_PASS }} \
             --bitcoind.zmqpubrawblock=tcp://bitcoind:28332 \

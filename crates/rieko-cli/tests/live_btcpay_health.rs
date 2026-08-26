@@ -1002,9 +1002,9 @@ async fn live_lightning_chain_sync_correlation_flow() {
     assert!(initial_core.snapshot.unwrap().synchronized);
     assert!(initial_lightning.snapshot.unwrap().synced_to_chain);
 
-    // LND retains its REST and BTCPay-facing service network while losing only
-    // its Bitcoin Core RPC/ZMQ network. Mining after isolation creates a real
-    // chain tip that the still-reachable LND node cannot observe.
+    // LND retains REST, BTCPay, and read-only Core RPC connectivity through
+    // the service network while losing its Core ZMQ notification route.
+    // Mining after isolation creates a real chain tip its wallet cannot ingest.
     let mut lnd_isolation = DockerNetworkIsolation::induce(lnd_core_network, "lnd");
     bitcoin_cli("-rpcwallet=default", &["-generate", "1"]);
 
