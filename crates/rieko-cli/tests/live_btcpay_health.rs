@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -87,6 +88,44 @@ fn free_address() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
+fn spawn_agent(
+    agent_binary: &str,
+    db_path: &Path,
+    api_address: SocketAddr,
+    token_path: &Path,
+    proxy_address: SocketAddr,
+    key_path: &Path,
+    store_id: &str,
+) -> ChildGuard {
+    let mut command = Command::new(agent_binary);
+    command
+        .arg("--db")
+        .arg(db_path)
+        .arg("--addr")
+        .arg(api_address.to_string())
+        .arg("--token-file")
+        .arg(token_path)
+        .arg("--btcpay-greenfield-url")
+        .arg(format!("http://{proxy_address}"))
+        .arg("--btcpay-greenfield-api-key-file")
+        .arg(key_path)
+        .arg("--btcpay-greenfield-store")
+        .arg(store_id)
+        .args([
+            "--btcpay-greenfield-network",
+            "regtest",
+            "--btcpay-poll-interval",
+            "1",
+            "--btcpay-poll-timeout",
+            "2",
+            "--btcpay-poll-cycles",
+            "4",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    ChildGuard(Some(command.spawn().expect("start rieko-agent")))
+}
+
 async fn upstream_address(base_url: &str) -> SocketAddr {
     let url = Url::parse(base_url).expect("BTCPAY_GREENFIELD_URL must be a URL");
     assert_eq!(
@@ -125,6 +164,25 @@ async fn wait_for_healthy_source(client: &reqwest::Client, api_url: &str) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("rieko-agent never persisted a healthy BTCPay Greenfield state");
+}
+
+async fn wait_for_restarted_disconnected_source(client: &reqwest::Client, api_url: &str) {
+    for _ in 0..100 {
+        if let Ok(response) = client
+            .get(format!("{api_url}/status"))
+            .bearer_auth(API_TOKEN)
+            .send()
+            .await
+        {
+            if let Ok(status) = response.json::<serde_json::Value>().await {
+                if status["source"] == "btcpay-greenfield (disconnected)" {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("restarted rieko-agent did not reopen the disconnected operational state");
 }
 
 async fn wait_for_three_degraded_cycles(client: &reqwest::Client, api_url: &str) -> Vec<Finding> {
@@ -201,35 +259,15 @@ async fn live_flow() {
 
     let agent_binary = std::env::var("CARGO_BIN_EXE_rieko-agent")
         .expect("Cargo did not provide the rieko-agent integration-test binary path");
-    let mut agent = ChildGuard(Some(
-        Command::new(agent_binary)
-            .args([
-                "--db",
-                db_path.to_str().unwrap(),
-                "--addr",
-                &api_address.to_string(),
-                "--token-file",
-                token_path.to_str().unwrap(),
-                "--btcpay-greenfield-url",
-                &format!("http://{}", proxy.address),
-                "--btcpay-greenfield-api-key-file",
-                key_path.to_str().unwrap(),
-                "--btcpay-greenfield-store",
-                &store_id,
-                "--btcpay-greenfield-network",
-                "regtest",
-                "--btcpay-poll-interval",
-                "1",
-                "--btcpay-poll-timeout",
-                "2",
-                "--btcpay-poll-cycles",
-                "7",
-            ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start rieko-agent"),
-    ));
+    let mut agent = spawn_agent(
+        &agent_binary,
+        &db_path,
+        api_address,
+        &token_path,
+        proxy_address,
+        &key_path,
+        &store_id,
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -270,9 +308,37 @@ async fn live_flow() {
     );
     let active_id = health[0].id.clone();
 
+    agent.stop();
+    agent = spawn_agent(
+        &agent_binary,
+        &db_path,
+        api_address,
+        &token_path,
+        proxy_address,
+        &key_path,
+        &store_id,
+    );
+    wait_for_restarted_disconnected_source(&client, &api_url).await;
+
+    let active_after_restart = client
+        .get(format!("{api_url}/findings?limit=50"))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<Finding>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|finding| finding.detector == "btcpay_backend_health")
+        .collect::<Vec<_>>();
+    assert_eq!(active_after_restart.len(), 1);
+    assert_eq!(active_after_restart[0].id, active_id);
+    assert_eq!(active_after_restart[0].lifecycle, FindingLifecycle::Active);
+
     // Rebind the same proxy address to the unchanged real BTCPay upstream.
-    // The agent keeps its original Greenfield URL and observes recovery without
-    // being restarted or reconfigured.
+    // The restarted agent keeps the original Greenfield URL and recovers the
+    // finding loaded from the same SQLite database.
     let restored_proxy = IsolationProxy::restore(proxy_address, upstream).await;
     let resolved = wait_for_resolved_finding(&client, &api_url, &active_id).await;
     assert_eq!(
@@ -320,7 +386,7 @@ async fn live_flow() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a real BTCPay regtest deployment; see docs/testing-btcpay-regtest.md"]
-async fn real_btcpay_greenfield_failure_and_recovery_reaches_authenticated_findings_api() {
+async fn real_btcpay_greenfield_restart_continuity_resolves_the_same_finding() {
     tokio::time::timeout(Duration::from_secs(30), live_flow())
         .await
         .expect("live BTCPay health smoke test exceeded its 30-second bound");

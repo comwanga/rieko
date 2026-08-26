@@ -21,15 +21,17 @@ export BTCPAY_GREENFIELD_API_KEY=<scoped-read-only-key>
 cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture
 ```
 
-The test starts `rieko-agent` with seven one-second polling cycles. A local TCP
-proxy initially forwards to the real BTCPay endpoint. After `/status` proves a
-healthy persisted Greenfield observation, the test closes the proxy and its
-active connections. Three subsequent polling cycles therefore observe a real
-connectivity failure without reconfiguring or stopping BTCPay. It then restores
-the same proxy address and waits for the existing three-cycle resolution
-hysteresis. The test verifies the original finding becomes resolved through the
-authenticated API, stops the agent, and confirms the connected operational
-state and single resolved finding after reopening the test database.
+The test uses two identically configured, four-cycle `rieko-agent` processes. A
+local TCP proxy initially forwards to the real BTCPay endpoint. After `/status`
+proves a healthy persisted Greenfield observation, the test closes the proxy and
+its active connections. Three subsequent polling cycles therefore observe a
+real connectivity failure without reconfiguring or stopping BTCPay. The test
+stops the agent with one active health finding, restarts it against the same
+SQLite database, and proves the finding and disconnected operational state were
+reopened. It then restores the same proxy address and waits for the existing
+three-cycle resolution hysteresis. Finally, it verifies the original finding ID
+becomes resolved through the authenticated API and confirms the connected
+operational state and single resolved finding after reopening the database.
 
 The existing `regtest.yml` workflow provisions this path on every run. It pins
 BTCPay Server 1.13.7, NBXplorer 2.5.12, and PostgreSQL 13.13, attaches them to
