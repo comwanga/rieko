@@ -17,6 +17,28 @@ fn compute_sig(secret: &[u8], payload: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn webhook_fails_closed_when_integration_is_not_configured() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let app = rieko_api::RiekoApi::new(Box::new(storage))
+        .unwrap()
+        .router();
+    let payload = br#"{"deliveryId":"d","webhookId":"w","type":"InvoiceExpired","timestamp":1,"storeId":"s","invoiceId":"i"}"#;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/integrations/btcpay/webhook")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["code"], "integration_not_configured");
+}
+
+#[tokio::test]
 async fn webhook_accepts_valid_signature_and_dispatches_event() {
     let (tx, mut rx) = mpsc::channel(16);
     let secret = "test-webhook-secret-123";
@@ -319,7 +341,7 @@ async fn webhook_idempotency_does_not_trust_unauthenticated_requests() {
 }
 
 #[tokio::test]
-async fn webhook_queue_saturation_returns_503_and_allows_retry() {
+async fn webhook_queue_saturation_preserves_the_durable_event() {
     // Channel with capacity 1
     let (tx, _rx) = mpsc::channel(1);
     let secret = "test-webhook-secret-123";
@@ -340,7 +362,7 @@ async fn webhook_queue_saturation_returns_503_and_allows_retry() {
     });
     tx.send(dummy_event).await.unwrap();
 
-    // Send webhook with 0 capacity remaining (will timeout and return 503)
+    // The wake-up channel is full, but durable storage remains authoritative.
     let payload = br#"{
         "deliveryId": "del-sat-1",
         "webhookId": "wh-1",
@@ -361,23 +383,23 @@ async fn webhook_queue_saturation_returns_503_and_allows_retry() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::OK);
     let val: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(val["error"]["code"], "queue_saturated");
+    assert_eq!(val["status"], "accepted");
 
-    // Verify delivery was NOT recorded in storage, so retry is allowed
-    let (tx_retry, mut rx_retry) = mpsc::channel(16);
-    let storage_ref = api.state.storage.clone();
-    let storage_box = storage_ref.lock().await;
-    // Drain slot or send on new channel
-    drop(storage_box);
+    let pending = api
+        .state
+        .storage
+        .lock()
+        .await
+        .pending_webhook_events(10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].delivery_id, "del-sat-1");
+    assert!(matches!(pending[0].event, NodeEvent::InvoiceSettled(_)));
 
-    let api_retry = rieko_api::RiekoApi::new(Box::new(SqliteStorage::in_memory().unwrap()))
-        .unwrap()
-        .with_btcpay_webhook(secret, tx_retry);
-    let app_retry = api_retry.router();
-
+    // A BTCPay retry is idempotent even while agent processing is pending.
     let req_retry = Request::builder()
         .method("POST")
         .uri("/api/v1/integrations/btcpay/webhook")
@@ -386,9 +408,12 @@ async fn webhook_queue_saturation_returns_503_and_allows_retry() {
         .body(Body::from(payload.to_vec()))
         .unwrap();
 
-    let resp_retry = app_retry.oneshot(req_retry).await.unwrap();
+    let resp_retry = app.oneshot(req_retry).await.unwrap();
     assert_eq!(resp_retry.status(), StatusCode::OK);
-    assert!(rx_retry.recv().await.is_some());
+    let value: serde_json::Value =
+        serde_json::from_slice(&resp_retry.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(value["status"], "already_processed");
 }
 
 #[tokio::test]

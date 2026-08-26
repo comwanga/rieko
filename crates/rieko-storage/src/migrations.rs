@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -77,6 +77,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 14,
         sql: V14_RECOMMENDATION_LIFECYCLE,
+    },
+    Migration {
+        version: 15,
+        sql: V15_DURABLE_WEBHOOK_EVENTS,
     },
 ];
 
@@ -423,6 +427,19 @@ CREATE TABLE IF NOT EXISTS recommendations (
 );
 ALTER TABLE recommendations ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
 CREATE INDEX IF NOT EXISTS idx_recommendations_lifecycle ON recommendations (lifecycle);
+"#;
+
+/// v15: durable normalized webhook events. Delivery identity remains in the
+/// v13 ledger while this table tracks the processing handoff to the agent.
+const V15_DURABLE_WEBHOOK_EVENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS webhook_events (
+    delivery_id  TEXT PRIMARY KEY REFERENCES webhook_deliveries(delivery_id),
+    event_json   TEXT NOT NULL,
+    accepted_at  TEXT NOT NULL,
+    processed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_pending
+    ON webhook_events (processed_at, accepted_at, delivery_id);
 "#;
 
 /// Read the persisted schema version (`PRAGMA user_version`).

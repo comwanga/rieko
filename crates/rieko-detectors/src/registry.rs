@@ -65,19 +65,26 @@ pub trait Detector {
     fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding>;
     fn is_complete(&self, view: &dyn GraphView, ctx: &DetectorContext) -> bool;
 
+    /// Network partition used for finding identity and lifecycle reconciliation.
+    /// Most detectors are chain-scoped; service-level detectors can opt out.
+    fn network_scope(&self, ctx: &DetectorContext) -> Option<BitcoinNetwork> {
+        Some(ctx.network)
+    }
+
     fn evaluate(
         &self,
         view: &dyn GraphView,
         ctx: &DetectorContext,
     ) -> Result<DetectorCycle, DetectorError> {
         let node = ctx.node.ok_or(DetectorError::MissingNodeScope)?;
+        let network = self.network_scope(ctx);
         let findings = self.run(view, ctx);
         let mut ids = HashSet::new();
         for finding in &findings {
             let expected_id = finding_identity(
                 self.id(),
                 self.version(),
-                Some(ctx.network),
+                network,
                 finding.node.as_deref(),
                 finding.channel.as_deref(),
             );
@@ -102,7 +109,7 @@ pub trait Detector {
         Ok(DetectorCycle {
             scope: FindingCycleScope {
                 detector: self.id().to_string(),
-                network: Some(ctx.network),
+                network,
                 node: Some(node.to_string()),
                 complete: self.is_complete(view, ctx),
             },

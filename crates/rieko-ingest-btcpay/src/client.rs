@@ -26,6 +26,15 @@ impl BtcPayGreenfieldClient {
         base_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Result<Self, BtcPayError> {
+        Self::new_with_timeout(base_url, api_key, Duration::from_secs(10))
+    }
+
+    /// Creates a Greenfield client with a bounded per-request timeout.
+    pub fn new_with_timeout(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, BtcPayError> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let api_key = api_key.into().trim().to_string();
 
@@ -39,6 +48,11 @@ impl BtcPayGreenfieldClient {
                 "BTCPay Server API key cannot be empty".into(),
             ));
         }
+        if timeout.is_zero() {
+            return Err(BtcPayError::Config(
+                "BTCPay Server request timeout must be greater than zero".into(),
+            ));
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -49,8 +63,8 @@ impl BtcPayGreenfieldClient {
 
         let http = Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
+            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(5)))
             .build()
             .map_err(BtcPayError::Http)?;
 

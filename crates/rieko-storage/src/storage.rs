@@ -223,15 +223,46 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::PruneSummary, StorageError>;
 
-    /// Check whether a webhook delivery has already been successfully processed.
+    /// Check whether a webhook delivery has already been durably accepted.
     fn is_webhook_delivery_processed(&mut self, delivery_id: &str) -> Result<bool, StorageError>;
 
-    /// Record a webhook delivery as successfully processed.
+    /// Legacy delivery-ledger insertion retained for compatibility. New webhook
+    /// ingestion should use [`Storage::enqueue_webhook_event`].
     fn record_webhook_delivery(
         &mut self,
         delivery_id: &str,
         webhook_id: Option<&str>,
         event_type: Option<&str>,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError>;
+
+    /// Atomically records delivery identity and its normalized event before an
+    /// HTTP acknowledgement is returned.
+    fn enqueue_webhook_event(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        event: &rieko_domain::NodeEvent,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError>;
+
+    /// Oldest accepted normalized events not yet committed to a detector cycle.
+    fn pending_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError>;
+
+    /// Most recently accepted processed events, returned in acceptance order.
+    fn recent_processed_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError>;
+
+    /// Marks one normalized event processed inside the detector-cycle transaction.
+    fn mark_webhook_event_processed(
+        &mut self,
+        delivery_id: &str,
         processed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StorageError>;
 
@@ -283,6 +314,14 @@ pub struct WebhookDeliveryRecord {
     pub processed_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebhookEventRecord {
+    pub delivery_id: String,
+    pub event: rieko_domain::NodeEvent,
+    pub accepted_at: chrono::DateTime<chrono::Utc>,
+    pub processed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// In-memory implementation for tests and fixtures.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
@@ -298,6 +337,7 @@ pub struct MemoryStorage {
     transaction_snapshot: Option<MemoryStorageState>,
     finding_absent: HashMap<String, u32>,
     webhook_deliveries: HashMap<String, WebhookDeliveryRecord>,
+    webhook_events: HashMap<String, WebhookEventRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +352,7 @@ struct MemoryStorageState {
     alert_state: HashMap<String, AlertState>,
     operational_state: Option<rieko_status::OperationalState>,
     webhook_deliveries: HashMap<String, WebhookDeliveryRecord>,
+    webhook_events: HashMap<String, WebhookEventRecord>,
 }
 
 impl MemoryStorage {
@@ -354,6 +395,7 @@ impl Storage for MemoryStorage {
             alert_state: self.alert_state.clone(),
             operational_state: self.operational_state.clone(),
             webhook_deliveries: self.webhook_deliveries.clone(),
+            webhook_events: self.webhook_events.clone(),
         });
         Ok(())
     }
@@ -382,6 +424,7 @@ impl Storage for MemoryStorage {
         self.alert_state = snapshot.alert_state;
         self.operational_state = snapshot.operational_state;
         self.webhook_deliveries = snapshot.webhook_deliveries;
+        self.webhook_events = snapshot.webhook_events;
         Ok(())
     }
 
@@ -950,6 +993,86 @@ impl Storage for MemoryStorage {
                 processed_at,
             },
         );
+        Ok(())
+    }
+
+    fn enqueue_webhook_event(
+        &mut self,
+        delivery_id: &str,
+        webhook_id: Option<&str>,
+        event_type: Option<&str>,
+        event: &rieko_domain::NodeEvent,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        self.webhook_deliveries
+            .entry(delivery_id.to_string())
+            .or_insert_with(|| WebhookDeliveryRecord {
+                webhook_id: webhook_id.map(ToString::to_string),
+                event_type: event_type.map(ToString::to_string),
+                processed_at: accepted_at,
+            });
+        self.webhook_events
+            .entry(delivery_id.to_string())
+            .or_insert_with(|| WebhookEventRecord {
+                delivery_id: delivery_id.to_string(),
+                event: event.clone(),
+                accepted_at,
+                processed_at: None,
+            });
+        Ok(())
+    }
+
+    fn pending_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let mut events = self
+            .webhook_events
+            .values()
+            .filter(|record| record.processed_at.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|a, b| {
+            a.accepted_at
+                .cmp(&b.accepted_at)
+                .then_with(|| a.delivery_id.cmp(&b.delivery_id))
+        });
+        events.truncate(limit.clamp(1, 1_000) as usize);
+        Ok(events)
+    }
+
+    fn recent_processed_webhook_events(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let limit = limit.clamp(1, 1_000) as usize;
+        let mut events = self
+            .webhook_events
+            .values()
+            .filter(|record| record.processed_at.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|a, b| {
+            a.accepted_at
+                .cmp(&b.accepted_at)
+                .then_with(|| a.delivery_id.cmp(&b.delivery_id))
+        });
+        if events.len() > limit {
+            events.drain(..events.len() - limit);
+        }
+        Ok(events)
+    }
+
+    fn mark_webhook_event_processed(
+        &mut self,
+        delivery_id: &str,
+        processed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        let record = self
+            .webhook_events
+            .get_mut(delivery_id)
+            .ok_or_else(|| StorageError::Backend(format!("unknown webhook event {delivery_id}")))?;
+        record.processed_at = Some(processed_at);
         Ok(())
     }
 }

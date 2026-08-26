@@ -25,7 +25,13 @@ enum Command {
     /// Approve or execute recommended actions (human-gated).
     #[cfg(feature = "execute")]
     Actions(commands::actions::ActionsArgs),
-    /// Show what's stored in the durable database.
+    /// Return one exact persisted finding from the running agent.
+    Explain(commands::explain::ExplainArgs),
+    /// List typed findings and structured evidence from the running agent.
+    Findings(commands::findings::FindingsArgs),
+    /// Stream newly observed findings and lifecycle changes from the running agent.
+    Watch(commands::watch::WatchArgs),
+    /// Show operational status reported by the running agent.
     Status(commands::status::StatusArgs),
     /// Run the read-only HTTP API.
     Serve(commands::serve::ServeArgs),
@@ -46,6 +52,9 @@ fn main() -> anyhow::Result<()> {
         Command::Simulations(args) => commands::simulations::run(args),
         #[cfg(feature = "execute")]
         Command::Actions(args) => commands::actions::run(args),
+        Command::Explain(args) => commands::explain::run(args),
+        Command::Findings(args) => commands::findings::run(args),
+        Command::Watch(args) => commands::watch::run(args),
         Command::Status(args) => commands::status::run(args),
         Command::Serve(args) => commands::serve::run(args),
     }
@@ -69,9 +78,20 @@ mod tests {
             );
         }
         #[cfg(feature = "simulate")]
-        let required = ["scan", "monitor", "simulations", "status", "serve"];
+        let required = [
+            "scan",
+            "monitor",
+            "simulations",
+            "explain",
+            "findings",
+            "watch",
+            "status",
+            "serve",
+        ];
         #[cfg(not(feature = "simulate"))]
-        let required = ["scan", "monitor", "status", "serve"];
+        let required = [
+            "scan", "monitor", "explain", "findings", "watch", "status", "serve",
+        ];
         for required in required {
             assert!(
                 help.to_lowercase().contains(required),
@@ -89,20 +109,36 @@ mod tests {
             .map(|s| s.get_name().to_string())
             .collect::<Vec<_>>();
         #[cfg(all(not(feature = "execute"), feature = "simulate"))]
-        let expected: &[&str] = &["scan", "monitor", "simulations", "status", "serve"];
+        let expected: &[&str] = &[
+            "scan",
+            "monitor",
+            "simulations",
+            "explain",
+            "findings",
+            "watch",
+            "status",
+            "serve",
+        ];
         #[cfg(all(feature = "execute", feature = "simulate"))]
         let expected: &[&str] = &[
             "scan",
             "monitor",
             "simulations",
             "actions",
+            "explain",
+            "findings",
+            "watch",
             "status",
             "serve",
         ];
         #[cfg(all(feature = "execute", not(feature = "simulate")))]
-        let expected: &[&str] = &["scan", "monitor", "actions", "status", "serve"];
+        let expected: &[&str] = &[
+            "scan", "monitor", "actions", "explain", "findings", "watch", "status", "serve",
+        ];
         #[cfg(all(not(feature = "execute"), not(feature = "simulate")))]
-        let expected: &[&str] = &["scan", "monitor", "status", "serve"];
+        let expected: &[&str] = &[
+            "scan", "monitor", "explain", "findings", "watch", "status", "serve",
+        ];
         assert_eq!(got, expected, "got {got:?}");
     }
 
@@ -123,5 +159,145 @@ mod tests {
             ])
             .is_ok());
         }
+    }
+
+    #[test]
+    fn watch_polling_configuration_is_bounded() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from(["rieko", "watch", "--cycles", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["rieko", "watch", "--interval", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rieko", "watch", "--limit", "501"]).is_err());
+    }
+
+    #[test]
+    fn status_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(
+            Cli::try_parse_from(["rieko", "status", "--api-url", "http://127.0.0.1:9000"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["rieko", "status", "--db", "local.db"]).is_err());
+    }
+
+    #[cfg(feature = "simulate")]
+    #[test]
+    fn simulation_reads_use_api_configuration_and_reject_database_flags() {
+        use super::Cli;
+        use clap::Parser;
+
+        for args in [
+            vec!["rieko", "simulations", "list"],
+            vec!["rieko", "simulations", "show", "simulation-1"],
+            vec![
+                "rieko",
+                "simulations",
+                "compare",
+                "simulation-1",
+                "simulation-2",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+
+        for args in [
+            vec!["rieko", "simulations", "list", "--db", "local.db"],
+            vec![
+                "rieko",
+                "simulations",
+                "show",
+                "simulation-1",
+                "--db",
+                "local.db",
+            ],
+            vec![
+                "rieko",
+                "simulations",
+                "compare",
+                "simulation-1",
+                "simulation-2",
+                "--db",
+                "local.db",
+            ],
+            vec!["rieko", "simulations", "--db", "local.db", "list"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "simulations",
+            "list",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+        ])
+        .is_ok());
+    }
+
+    #[cfg(feature = "simulate")]
+    #[test]
+    fn simulation_create_remains_storage_backed() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "simulations",
+            "create",
+            "--db",
+            "local.db",
+            "--recommendation",
+            "recommendation-1",
+            "--source-channel",
+            "source",
+            "--destination-channel",
+            "destination",
+            "--amount-sats",
+            "42",
+        ])
+        .is_ok());
+    }
+
+    #[cfg(feature = "execute")]
+    #[test]
+    fn actions_list_uses_api_configuration_and_rejects_database_flags() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from(["rieko", "actions", "list"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "actions",
+            "list",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["rieko", "actions", "list", "--db", "local.db"]).is_err());
+        assert!(Cli::try_parse_from(["rieko", "actions", "--db", "local.db", "list"]).is_err());
+    }
+
+    #[cfg(feature = "execute")]
+    #[test]
+    fn action_transition_commands_remain_storage_backed() {
+        use super::Cli;
+        use clap::Parser;
+
+        for command in ["approve", "reject"] {
+            assert!(Cli::try_parse_from([
+                "rieko", "actions", command, "action-1", "--actor", "operator", "--db", "local.db",
+            ])
+            .is_ok());
+        }
+        assert!(Cli::try_parse_from([
+            "rieko", "actions", "execute", "action-1", "--actor", "operator",
+        ])
+        .is_ok());
     }
 }

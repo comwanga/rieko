@@ -7,6 +7,16 @@ use rieko_ingest_btcpay::{BtcPayAdapter, BtcPayAdapterConfig, BtcPayGreenfieldCl
 use serde_json::json;
 use tokio::net::TcpListener;
 
+#[test]
+fn greenfield_client_rejects_an_unbounded_zero_timeout() {
+    assert!(BtcPayGreenfieldClient::new_with_timeout(
+        "https://btcpay.example",
+        "scoped-key",
+        std::time::Duration::ZERO,
+    )
+    .is_err());
+}
+
 async fn mock_server_info() -> impl IntoResponse {
     Json(json!({
         "version": "2.0.0",

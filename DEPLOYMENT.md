@@ -85,6 +85,7 @@ Migrations run automatically on startup. Back up the database before upgrading.
 |---|---|
 | V13 | Webhook delivery deduplication table |
 | V14 | `recommendations.lifecycle` column for resolved-finding cascades |
+| V15 | Durable normalized BTCPay webhook event queue and processing state |
 
 ---
 

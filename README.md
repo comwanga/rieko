@@ -93,6 +93,34 @@ cargo run -- serve
 # Non-loopback (requires token)
 cargo run -- serve --addr 0.0.0.0:8080 --allow-external \
   --token-file /run/secrets/rieko-token
+
+# Run the long-lived agent with authenticated BTCPay webhook ingestion
+cargo run --bin rieko-agent -- \
+  --btcpay-webhook-secret-file /run/secrets/btcpay-webhook-secret \
+  --btcpay-network mainnet \
+  --btcpay-node <your-node-pubkey>
+
+# `rieko serve` remains a compatibility alias for the same agent runtime
+cargo run --bin rieko -- serve \
+  --btcpay-webhook-secret-file /run/secrets/btcpay-webhook-secret \
+  --btcpay-network mainnet \
+  --btcpay-node <your-node-pubkey>
+
+# Read active findings from the running local agent as typed JSON
+cargo run --bin rieko -- findings
+
+# Read operational status from the same authenticated local API
+cargo run --bin rieko -- status
+
+# Include resolved findings when the API requires authentication
+cargo run --bin rieko -- findings --lifecycle all \
+  --token-file /run/secrets/rieko-token
+
+# Stream current findings, then only new findings or lifecycle transitions
+cargo run --bin rieko -- watch --interval 5
+
+# Return one exact persisted finding, including explanation and evidence
+cargo run --bin rieko -- explain <finding-id>
 ```
 
 ## API endpoints
@@ -102,6 +130,7 @@ cargo run -- serve --addr 0.0.0.0:8080 --allow-external \
 | `GET /` | Embedded UI |
 | `GET /status` | Health, counts, simulation breakdown |
 | `GET /findings?limit=N&lifecycle=active` | Findings (active, resolved, or all) |
+| `GET /findings/:id` | One exact persisted finding |
 | `GET /findings/channel/:id` | Findings for a channel |
 | `GET /recommendations?limit=N` | Recommendations |
 | `GET /audit?limit=N` | Audit trail |
@@ -124,6 +153,7 @@ to 5 requests per second.
 
 Rieko supports ingestion from BTCPay Server Greenfield:
 - **Webhook Ingestion**: Real-time event streaming (`InvoiceSettled`, `InvoiceExpired`, `InvoicePaymentReceived`) via `POST /api/v1/integrations/btcpay/webhook` with constant-time HMAC-SHA256 signature verification (`BTCPay-Sig`).
+- **Finding Pipeline**: `rieko-agent` owns the long-running webhook, detector, persistence, and local API runtime. `rieko serve` delegates to that same implementation for compatibility. When configured with the webhook secret, network, and node scope, normalized invoice events feed the deterministic settlement-reliability detector and findings are persisted for `GET /findings` and the API-backed `rieko findings` command. The endpoint fails closed when this integration is not configured.
 - **REST Client**: Asynchronous polling of Lightning info, channels, balances, on-chain wallets, and invoices.
 - **Normalized Ingestion Adapter**: Pluggable `NodeIngestionAdapter` yielding an asynchronous stream of normalized domain `NodeEvent` and `NodeSnapshot` objects.
 
@@ -216,7 +246,7 @@ zero duplicates.
 | `rieko-simulation-app` | Application | Simulation orchestration and views |
 | `rieko-execution` | Future | LND mutator behind `--features execute` |
 | `rieko-api` | Interface | axum HTTP API + embedded UI |
-| `rieko-cli` | Interface | CLI entrypoint |
+| `rieko-cli` | Interface/runtime | `rieko` operator CLI, `rieko-agent` daemon, and their shared agent runtime |
 
 ## Database
 
@@ -232,6 +262,7 @@ sqlite3 ~/.rieko/rieko.db ".backup 'backup.db'"
 - One authoritative monitor writer at a time; concurrent readers via WAL
 - WAL mode with `synchronous=NORMAL`, foreign keys enforced, finite busy timeout
 - Second monitor rejected up front via writer lock
+- Normalized BTCPay webhook events are committed before acknowledgement and replayed after agent restart until their detector cycle commits
 - Each detector cycle committed in one atomic transaction
 - Audit log is append-only via trigger-level enforcement
 - Status queries are O(1) — no full table scans

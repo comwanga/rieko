@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 
-use crate::state::{ComponentState, OperationalState, OverallState, SourceState};
+use crate::state::{ComponentState, OperationalState, OverallState};
 
 /// Policy knobs that turn raw operational state into an overall verdict.
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub fn assess(
     let Some(last_success) = state.last_ingestion_success else {
         // Never ingested anything. A configured live source that has also
         // never connected is not operating at all, rather than not-yet-used.
-        if matches!(state.source, SourceState::LndRest { connected: false }) {
+        if !state.source.connected() {
             return OverallState::Unhealthy;
         }
         return OverallState::NotInitialized;
@@ -68,7 +68,7 @@ pub fn assess(
 
     // A live source that worked before is temporarily unavailable. A source
     // that has never connected is handled as Unhealthy above.
-    if matches!(state.source, SourceState::LndRest { connected: false }) {
+    if !state.source.connected() {
         degraded = true;
     }
 
@@ -242,6 +242,25 @@ mod tests {
         s.last_ingestion_success = Some(now - Duration::minutes(1));
         s.source_data_at = Some(now - Duration::minutes(1));
         assert_eq!(assess(&s, &policy, now, true), OverallState::Degraded);
+    }
+
+    #[test]
+    fn disconnected_btcpay_source_uses_live_source_health_semantics() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut never_connected = base();
+        never_connected.source = SourceState::BtcPayGreenfield { connected: false };
+        assert_eq!(
+            assess(&never_connected, &policy, now, true),
+            OverallState::Unhealthy
+        );
+
+        never_connected.last_ingestion_success = Some(now - Duration::minutes(1));
+        never_connected.source_data_at = Some(now - Duration::minutes(1));
+        assert_eq!(
+            assess(&never_connected, &policy, now, true),
+            OverallState::Degraded
+        );
     }
 
     #[test]

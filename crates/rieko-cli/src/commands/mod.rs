@@ -1,9 +1,12 @@
 #[cfg(feature = "execute")]
 pub mod actions;
 pub mod common;
+pub mod explain;
+pub mod findings;
 pub mod monitor;
 pub mod scan;
 pub mod serve;
 #[cfg(feature = "simulate")]
 pub mod simulations;
 pub mod status;
+pub mod watch;

@@ -90,11 +90,19 @@ impl Detector for SettlementReliabilityDetector {
         // 1. Analyze BTCPay temporal invoice events
         let mut expired_count: usize = 0;
         let mut settled_count: usize = 0;
+        let mut invoice_ids = Vec::new();
+        let mut store_ids = Vec::new();
+        let mut observed_at = Vec::new();
 
         for event in events {
             match event {
-                NodeEvent::InvoiceExpired(_)
-                | NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
+                NodeEvent::InvoiceExpired(invoice) => {
+                    expired_count += 1;
+                    invoice_ids.push(invoice.id.clone());
+                    store_ids.extend(invoice.store_id.iter().cloned());
+                    observed_at.push(invoice.timestamp);
+                }
+                NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
                     status: PaymentStatus::Failed,
                     ..
                 })
@@ -104,9 +112,19 @@ impl Detector for SettlementReliabilityDetector {
                 }) => {
                     expired_count += 1;
                 }
-                NodeEvent::InvoiceSettled(_)
-                | NodeEvent::InvoicePaymentReceived(_)
-                | NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
+                NodeEvent::InvoiceSettled(invoice) => {
+                    settled_count += 1;
+                    invoice_ids.push(invoice.id.clone());
+                    store_ids.extend(invoice.store_id.iter().cloned());
+                    observed_at.push(invoice.timestamp);
+                }
+                NodeEvent::InvoicePaymentReceived(invoice) => {
+                    settled_count += 1;
+                    invoice_ids.push(invoice.id.clone());
+                    store_ids.extend(invoice.store_id.iter().cloned());
+                    observed_at.push(invoice.timestamp);
+                }
+                NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
                     status: PaymentStatus::Succeeded,
                     ..
                 })
@@ -163,7 +181,9 @@ impl Detector for SettlementReliabilityDetector {
         let target_channel_id = primary_bottleneck.map(|c| c.id.to_string());
 
         // 3. Evaluate Bitcoin Core synchronization health
-        let chain_synchronized = ctx.chain_synchronized.unwrap_or(true);
+        let chain_synchronized = ctx.chain_synchronized;
+        let lightning_degradation_observed =
+            !drained_channels.is_empty() || !inactive_channels.is_empty();
 
         // 4. Determine severity
         let severity = if failure_rate >= self.thresholds.critical_failure_rate
@@ -185,25 +205,61 @@ impl Detector for SettlementReliabilityDetector {
             Evidence::number("inactive_channels_count", inactive_channels.len() as f64),
             Evidence::string(
                 "chain_synchronized",
-                if chain_synchronized { "true" } else { "false" },
+                match chain_synchronized {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "unknown",
+                },
             ),
             Evidence::string(
                 "diagnosis",
-                if chain_synchronized {
-                    "lightning_settlement_degraded"
-                } else {
-                    "chain_sync_lag"
+                match (chain_synchronized, lightning_degradation_observed) {
+                    (Some(false), _) => "chain_sync_lag",
+                    (Some(true), true) => "lightning_settlement_degraded",
+                    _ => "invoice_settlement_degraded",
                 },
             ),
             Evidence::string(
                 "root_cause",
-                if chain_synchronized {
-                    "lightning_operational_degradation"
-                } else {
-                    "bitcoin_core_desynchronized"
+                match (chain_synchronized, lightning_degradation_observed) {
+                    (Some(false), _) => "bitcoin_core_desynchronized",
+                    (Some(true), true) => "lightning_operational_degradation",
+                    _ => "undetermined",
                 },
             ),
         ];
+
+        invoice_ids.sort();
+        invoice_ids.dedup();
+        store_ids.sort();
+        store_ids.dedup();
+        observed_at.sort();
+        evidence.extend([
+            Evidence {
+                key: "invoice_ids".into(),
+                value: serde_json::Value::Array(
+                    invoice_ids
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            },
+            Evidence {
+                key: "store_ids".into(),
+                value: serde_json::Value::Array(
+                    store_ids
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            },
+        ]);
+        if let (Some(first), Some(last)) = (observed_at.first(), observed_at.last()) {
+            evidence.extend([
+                Evidence::string("window_started_at", first.to_rfc3339()),
+                Evidence::string("window_ended_at", last.to_rfc3339()),
+            ]);
+        }
 
         if let Some(ref ch_id) = target_channel_id {
             evidence.push(Evidence::string("bottleneck_channel", ch_id.clone()));
@@ -255,8 +311,8 @@ impl Detector for SettlementReliabilityDetector {
             }
         });
 
-        let explanation = if chain_synchronized {
-            format!(
+        let explanation = match (chain_synchronized, lightning_degradation_observed) {
+            (Some(true), true) => format!(
                 "Lightning settlement reliability degraded: {} of {} invoices failed or expired ({:.1}% failure rate). \
                  Bitcoin Core is synchronized, confirming root cause is Lightning channel liquidity exhaustion ({} drained, {} inactive).",
                 expired_count,
@@ -264,12 +320,17 @@ impl Detector for SettlementReliabilityDetector {
                 failure_rate * 100.0,
                 drained_channels.len(),
                 inactive_channels.len()
-            )
-        } else {
-            format!(
+            ),
+            (Some(false), _) => format!(
                 "Invoice settlements failing due to Bitcoin Core synchronization lag ({} expired invoices).",
                 expired_count
-            )
+            ),
+            _ => format!(
+                "Invoice settlement reliability degraded: {} of {} invoices failed or expired ({:.1}% failure rate). Direct Bitcoin and Lightning evidence is not yet available, so the root cause is undetermined.",
+                expired_count,
+                total_invoices,
+                failure_rate * 100.0,
+            ),
         };
 
         vec![Finding {
