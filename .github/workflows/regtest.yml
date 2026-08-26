@@ -14,6 +14,9 @@ env:
   CARGO_TERM_COLOR: always
   BITCOIND_IMAGE: ruimarinho/bitcoin-core:28
   LND_IMAGE: lightninglabs/lnd:v0.18.5-beta
+  BTCPAY_IMAGE: btcpayserver/btcpayserver:1.13.7
+  NBXPLORER_IMAGE: nicolasdorier/nbxplorer:2.5.12
+  POSTGRES_IMAGE: btcpayserver/postgres:13.13
   RPC_USER: rieko
   RPC_PASS: riekopass
 
@@ -72,6 +75,9 @@ jobs:
             -rpcbind=0.0.0.0 \
             -rpcallowip=0.0.0.0/0 \
             -rpcport=18443 \
+            -port=18444 \
+            -bind=0.0.0.0:18444 \
+            -whitelist=0.0.0.0/0 \
             -zmqpubrawblock=tcp://0.0.0.0:28332 \
             -zmqpubrawtx=tcp://0.0.0.0:28333 \
             -txindex=1 \
@@ -185,7 +191,206 @@ jobs:
           fi
 
       # ---------------------------------------------------------
-      # 4. Live LND Integration Tests
+      # 4. BTCPay Server Regtest Setup & Provisioning
+      # ---------------------------------------------------------
+      - name: Start pinned BTCPay Server regtest services
+        run: |
+          mkdir -p "${RUNNER_TEMP}/nbxplorer"
+
+          docker run -d \
+            --name postgres \
+            --network regtest-net \
+            --shm-size=256m \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "${POSTGRES_IMAGE}" \
+            -c random_page_cost=1.0 \
+            -c shared_preload_libraries=pg_stat_statements
+
+          POSTGRES_READY=0
+          for i in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres > /dev/null 2>&1; then
+              echo "PostgreSQL is ready after ${i}s."
+              POSTGRES_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$POSTGRES_READY" -ne 1 ]; then
+            echo "ERROR: PostgreSQL failed to start within 30 seconds."
+            docker logs postgres --tail 100
+            exit 1
+          fi
+
+          docker run -d \
+            --name nbxplorer \
+            --network regtest-net \
+            -v "${RUNNER_TEMP}/nbxplorer:/datadir" \
+            -e NBXPLORER_NETWORK=regtest \
+            -e NBXPLORER_BIND=0.0.0.0:32838 \
+            -e NBXPLORER_CHAINS=btc \
+            -e NBXPLORER_SIGNALFILESDIR=/datadir \
+            -e NBXPLORER_BTCRPCURL=http://bitcoind:18443/ \
+            -e NBXPLORER_BTCRPCUSER="${RPC_USER}" \
+            -e NBXPLORER_BTCRPCPASSWORD="${RPC_PASS}" \
+            -e NBXPLORER_BTCNODEENDPOINT=bitcoind:18444 \
+            -e 'NBXPLORER_POSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=nbxplorer;MaxPoolSize=20;Database=nbxplorerregtest' \
+            "${NBXPLORER_IMAGE}"
+
+          NBXPLORER_READY=0
+          for i in $(seq 1 60); do
+            if [ -s "${RUNNER_TEMP}/nbxplorer/RegTest/.cookie" ]; then
+              echo "NBXplorer authentication cookie is ready after ${i}s."
+              NBXPLORER_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$NBXPLORER_READY" -ne 1 ]; then
+            echo "ERROR: NBXplorer failed to create its auth cookie within 60 seconds."
+            docker logs nbxplorer --tail 100
+            exit 1
+          fi
+
+          docker run -d \
+            --name btcpayserver \
+            --network regtest-net \
+            -p 127.0.0.1:23000:49392 \
+            -v "${RUNNER_TEMP}/lnd:/etc/lnd:ro" \
+            -v "${RUNNER_TEMP}/nbxplorer:/root/.nbxplorer:ro" \
+            -e 'BTCPAY_POSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=btcpayserver;Database=btcpayserverregtest' \
+            -e 'BTCPAY_EXPLORERPOSTGRES=User ID=postgres;Host=postgres;Port=5432;Application Name=btcpayserver;MaxPoolSize=80;Database=nbxplorerregtest' \
+            -e BTCPAY_NETWORK=regtest \
+            -e BTCPAY_BIND=0.0.0.0:49392 \
+            -e BTCPAY_CHAINS=btc \
+            -e BTCPAY_BTCEXPLORERURL=http://nbxplorer:32838/ \
+            -e 'BTCPAY_BTCLIGHTNING=type=lnd-rest;server=https://lnd:8080/;macaroonfilepath=/etc/lnd/data/chain/bitcoin/regtest/admin.macaroon;allowinsecure=true' \
+            "${BTCPAY_IMAGE}"
+
+          BTCPAY_READY=0
+          for i in $(seq 1 120); do
+            if curl --fail --silent http://127.0.0.1:23000/api/v1/health > /dev/null; then
+              echo "BTCPay Server is ready after ${i}s."
+              BTCPAY_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$BTCPAY_READY" -ne 1 ]; then
+            echo "ERROR: BTCPay Server failed to start within 120 seconds."
+            docker logs nbxplorer --tail 100
+            docker logs btcpayserver --tail 100
+            exit 1
+          fi
+
+      - name: Provision BTCPay store and scoped read-only Greenfield key
+        env:
+          BTCPAY_URL: http://127.0.0.1:23000
+          BTCPAY_CI_USER: rieko-regtest@example.invalid
+          BTCPAY_CI_PASSWORD: Rieko-Regtest-Only-2026!
+        run: |
+          curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -X POST \
+            -d "$(jq -n --arg email "$BTCPAY_CI_USER" --arg password "$BTCPAY_CI_PASSWORD" '{email:$email,password:$password,isAdministrator:true}')" \
+            "${BTCPAY_URL}/api/v1/users" > /dev/null
+
+          echo "Creating temporary BTCPay bootstrap API key..."
+          BOOTSTRAP_KEY_FILE="${RUNNER_TEMP}/btcpay-bootstrap-key.json"
+          BOOTSTRAP_KEY_STATUS=$(curl --silent --show-error \
+            --output "$BOOTSTRAP_KEY_FILE" \
+            --write-out '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            --user "${BTCPAY_CI_USER}:${BTCPAY_CI_PASSWORD}" \
+            -X POST \
+            -d '{"label":"rieko-regtest-bootstrap","permissions":["unrestricted"]}' \
+            "${BTCPAY_URL}/api/v1/api-keys")
+          if [ "$BOOTSTRAP_KEY_STATUS" != "200" ]; then
+            echo "ERROR: bootstrap API key creation returned HTTP ${BOOTSTRAP_KEY_STATUS}."
+            cat "$BOOTSTRAP_KEY_FILE"
+            exit 1
+          fi
+          BOOTSTRAP_KEY_JSON=$(< "$BOOTSTRAP_KEY_FILE")
+          BOOTSTRAP_API_KEY=$(jq -er '.apiKey' <<< "$BOOTSTRAP_KEY_JSON")
+          echo "::add-mask::${BOOTSTRAP_API_KEY}"
+
+          echo "Creating BTCPay regtest store..."
+          STORE_FILE="${RUNNER_TEMP}/btcpay-store.json"
+          STORE_STATUS=$(curl --silent --show-error \
+            --output "$STORE_FILE" \
+            --write-out '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
+            -X POST \
+            -d '{"name":"Rieko regtest health smoke"}' \
+            "${BTCPAY_URL}/api/v1/stores")
+          if [ "$STORE_STATUS" != "200" ]; then
+            echo "ERROR: store creation returned HTTP ${STORE_STATUS}."
+            cat "$STORE_FILE"
+            exit 1
+          fi
+          STORE_JSON=$(< "$STORE_FILE")
+          STORE_ID=$(jq -er '.id' <<< "$STORE_JSON")
+
+          LIGHTNING_FILE="${RUNNER_TEMP}/btcpay-lightning.json"
+          LIGHTNING_STATUS=$(curl --silent --show-error \
+            --output "$LIGHTNING_FILE" \
+            --write-out '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
+            -X PUT \
+            -d '{"enabled":true,"connectionString":"Internal Node"}' \
+            "${BTCPAY_URL}/api/v1/stores/${STORE_ID}/payment-methods/LightningNetwork/BTC")
+          if [ "$LIGHTNING_STATUS" != "200" ]; then
+            echo "ERROR: Lightning payment method configuration returned HTTP ${LIGHTNING_STATUS}."
+            cat "$LIGHTNING_FILE"
+            exit 1
+          fi
+
+          KEY_BODY=$(jq -n \
+            --arg label 'rieko-regtest-read-only' \
+            --arg lightning "btcpay.store.canuselightningnode:${STORE_ID}" \
+            --arg invoices "btcpay.store.canviewinvoices:${STORE_ID}" \
+            --arg settings "btcpay.store.canviewstoresettings:${STORE_ID}" \
+            '{label:$label,permissions:[$lightning,$invoices,$settings]}')
+          KEY_FILE="${RUNNER_TEMP}/btcpay-read-only-key.json"
+          KEY_STATUS=$(curl --silent --show-error \
+            --output "$KEY_FILE" \
+            --write-out '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
+            -X POST \
+            -d "$KEY_BODY" \
+            "${BTCPAY_URL}/api/v1/api-keys")
+          if [ "$KEY_STATUS" != "200" ]; then
+            echo "ERROR: scoped API key creation returned HTTP ${KEY_STATUS}."
+            cat "$KEY_FILE"
+            exit 1
+          fi
+          KEY_JSON=$(< "$KEY_FILE")
+          API_KEY=$(jq -er '.apiKey' <<< "$KEY_JSON")
+
+          echo "::add-mask::${API_KEY}"
+          echo "BTCPAY_GREENFIELD_URL=${BTCPAY_URL}" >> "$GITHUB_ENV"
+          echo "BTCPAY_GREENFIELD_STORE=${STORE_ID}" >> "$GITHUB_ENV"
+          echo "BTCPAY_GREENFIELD_API_KEY=${API_KEY}" >> "$GITHUB_ENV"
+
+          curl --fail-with-body --silent --show-error \
+            -H "Authorization: token ${API_KEY}" \
+            "${BTCPAY_URL}/api/v1/stores/${STORE_ID}/lightning/BTC/info" \
+            | jq -e '.blockHeight >= 0' > /dev/null
+
+          curl --fail-with-body --silent --show-error \
+            -H "Authorization: token ${API_KEY}" \
+            "${BTCPAY_URL}/api/v1/stores/${STORE_ID}/lightning/BTC/channels" \
+            | jq -e 'type == "array"' > /dev/null
+
+          curl --fail-with-body --silent --show-error \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
+            -X DELETE \
+            "${BTCPAY_URL}/api/v1/api-keys/current" > /dev/null
+
+      # ---------------------------------------------------------
+      # 5. Live Integration Tests
       # ---------------------------------------------------------
       - name: Run live LND adapter integration test
         env:
@@ -208,15 +413,12 @@ jobs:
             --verbose
 
       - name: Run real BTCPay Greenfield health smoke test
-        if: ${{ vars.BTCPAY_REGTEST_SMOKE_ENABLED == 'true' }}
         env:
-          BTCPAY_GREENFIELD_URL: ${{ vars.BTCPAY_REGTEST_URL }}
-          BTCPAY_GREENFIELD_STORE: ${{ vars.BTCPAY_REGTEST_STORE }}
-          BTCPAY_GREENFIELD_API_KEY: ${{ secrets.BTCPAY_REGTEST_API_KEY }}
+          BTCPAY_REGTEST_SMOKE_ENABLED: "true"
         run: cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture
 
       # ---------------------------------------------------------
-      # 5. Diagnostics & Teardown
+      # 6. Diagnostics & Teardown
       # ---------------------------------------------------------
       - name: Collect diagnostics on failure
         if: failure()
@@ -227,11 +429,17 @@ jobs:
           docker logs bitcoind --tail 50 2>/dev/null || true
           echo "=== LND Logs (tail 50) ==="
           docker logs lnd --tail 50 2>/dev/null || true
+          echo "=== NBXplorer Logs (tail 100) ==="
+          docker logs nbxplorer --tail 100 2>/dev/null || true
+          echo "=== BTCPay Server Logs (tail 100) ==="
+          docker logs btcpayserver --tail 100 2>/dev/null || true
+          echo "=== PostgreSQL Logs (tail 100) ==="
+          docker logs postgres --tail 100 2>/dev/null || true
 
       - name: Teardown infrastructure
         if: always()
         run: |
-          docker stop lnd bitcoind 2>/dev/null || true
-          docker rm lnd bitcoind 2>/dev/null || true
+          docker stop btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
+          docker rm btcpayserver nbxplorer postgres lnd bitcoind 2>/dev/null || true
           docker network rm regtest-net 2>/dev/null || true
-          rm -rf "${RUNNER_TEMP}/lnd" "${RUNNER_TEMP}/rieko_live.db" "${RUNNER_TEMP}/rieko_fixture.db" 2>/dev/null || true
+          rm -rf "${RUNNER_TEMP}/lnd" "${RUNNER_TEMP}/nbxplorer" "${RUNNER_TEMP}/rieko_live.db" "${RUNNER_TEMP}/rieko_fixture.db" 2>/dev/null || true
