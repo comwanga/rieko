@@ -38,9 +38,9 @@ ephemeral store through Greenfield. The store uses the existing LND node as its
 internal Lightning node.
 
 The workflow then creates an ephemeral store-scoped API key with only the
-read-only permissions used by Rieko: Lightning node access, wallet viewing,
-invoice viewing, and store-settings viewing. The key is masked before it is
-passed to the test and is destroyed with the containers at teardown. No GitHub
+read-only permissions used by Rieko and supported by the pinned BTCPay release:
+Lightning node access, invoice viewing, and store-settings viewing. The key is
+masked before it is passed to the test and is destroyed with the containers at teardown. No GitHub
 repository secret or production credential is required. The
 `BTCPAY_REGTEST_SMOKE_ENABLED=true` marker is scoped only to the smoke-test
 step.

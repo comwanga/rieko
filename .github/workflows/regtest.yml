@@ -349,16 +349,24 @@ jobs:
           KEY_BODY=$(jq -n \
             --arg label 'rieko-regtest-read-only' \
             --arg lightning "btcpay.store.canuselightningnode:${STORE_ID}" \
-            --arg wallet "btcpay.store.canviewwallet:${STORE_ID}" \
             --arg invoices "btcpay.store.canviewinvoices:${STORE_ID}" \
             --arg settings "btcpay.store.canviewstoresettings:${STORE_ID}" \
-            '{label:$label,permissions:[$lightning,$wallet,$invoices,$settings]}')
-          KEY_JSON=$(curl --fail-with-body --silent --show-error \
+            '{label:$label,permissions:[$lightning,$invoices,$settings]}')
+          KEY_FILE="${RUNNER_TEMP}/btcpay-read-only-key.json"
+          KEY_STATUS=$(curl --silent --show-error \
+            --output "$KEY_FILE" \
+            --write-out '%{http_code}' \
             -H 'Content-Type: application/json' \
             -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
             -X POST \
             -d "$KEY_BODY" \
             "${BTCPAY_URL}/api/v1/api-keys")
+          if [ "$KEY_STATUS" != "200" ]; then
+            echo "ERROR: scoped API key creation returned HTTP ${KEY_STATUS}."
+            cat "$KEY_FILE"
+            exit 1
+          fi
+          KEY_JSON=$(< "$KEY_FILE")
           API_KEY=$(jq -er '.apiKey' <<< "$KEY_JSON")
 
           echo "::add-mask::${API_KEY}"
