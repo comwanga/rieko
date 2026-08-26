@@ -294,9 +294,18 @@ jobs:
             -d "$(jq -n --arg email "$BTCPAY_CI_USER" --arg password "$BTCPAY_CI_PASSWORD" '{email:$email,password:$password,isAdministrator:true}')" \
             "${BTCPAY_URL}/api/v1/users" > /dev/null
 
-          STORE_JSON=$(curl --fail-with-body --silent --show-error \
+          BOOTSTRAP_KEY_JSON=$(curl --fail-with-body --silent --show-error \
             -H 'Content-Type: application/json' \
             --user "${BTCPAY_CI_USER}:${BTCPAY_CI_PASSWORD}" \
+            -X POST \
+            -d '{"label":"rieko-regtest-bootstrap","permissions":["unrestricted"]}' \
+            "${BTCPAY_URL}/api/v1/api-keys")
+          BOOTSTRAP_API_KEY=$(jq -er '.apiKey' <<< "$BOOTSTRAP_KEY_JSON")
+          echo "::add-mask::${BOOTSTRAP_API_KEY}"
+
+          STORE_JSON=$(curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
             -X POST \
             -d '{"name":"Rieko regtest health smoke"}' \
             "${BTCPAY_URL}/api/v1/stores")
@@ -304,7 +313,7 @@ jobs:
 
           curl --fail-with-body --silent --show-error \
             -H 'Content-Type: application/json' \
-            --user "${BTCPAY_CI_USER}:${BTCPAY_CI_PASSWORD}" \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
             -X PUT \
             -d '{"enabled":true,"connectionString":"Internal Node"}' \
             "${BTCPAY_URL}/api/v1/stores/${STORE_ID}/payment-methods/LightningNetwork/BTC" > /dev/null
@@ -318,7 +327,7 @@ jobs:
             '{label:$label,permissions:[$lightning,$wallet,$invoices,$settings]}')
           KEY_JSON=$(curl --fail-with-body --silent --show-error \
             -H 'Content-Type: application/json' \
-            --user "${BTCPAY_CI_USER}:${BTCPAY_CI_PASSWORD}" \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
             -X POST \
             -d "$KEY_BODY" \
             "${BTCPAY_URL}/api/v1/api-keys")
@@ -338,6 +347,11 @@ jobs:
             -H "Authorization: token ${API_KEY}" \
             "${BTCPAY_URL}/api/v1/stores/${STORE_ID}/lightning/BTC/channels" \
             | jq -e 'type == "array"' > /dev/null
+
+          curl --fail-with-body --silent --show-error \
+            -H "Authorization: token ${BOOTSTRAP_API_KEY}" \
+            -X DELETE \
+            "${BTCPAY_URL}/api/v1/api-keys/current" > /dev/null
 
       # ---------------------------------------------------------
       # 5. Live Integration Tests
