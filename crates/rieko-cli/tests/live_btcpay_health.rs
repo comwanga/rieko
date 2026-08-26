@@ -253,7 +253,7 @@ impl CoreHeaderGap {
 
     fn restore(&mut self) {
         if !self.restored {
-            bitcoin_cli("-generate", &["2"]);
+            bitcoin_cli("-rpcwallet=default", &["-generate", "2"]);
             self.restored = true;
         }
     }
@@ -262,7 +262,7 @@ impl CoreHeaderGap {
 impl Drop for CoreHeaderGap {
     fn drop(&mut self) {
         if !self.restored {
-            let _ = bitcoin_cli_result("-generate", &["2"]);
+            let _ = bitcoin_cli_result("-rpcwallet=default", &["-generate", "2"]);
             self.restored = true;
         }
     }
