@@ -31,8 +31,16 @@ requires authentication on `/findings`, verifies one typed health finding and
 its evidence, stops the agent, and verifies the same finding directly in the
 test database.
 
-The existing `regtest.yml` workflow exposes this path when the repository
-variable `BTCPAY_REGTEST_SMOKE_ENABLED` is `true`. Configure
-`BTCPAY_REGTEST_URL` and `BTCPAY_REGTEST_STORE` as repository variables and
-`BTCPAY_REGTEST_API_KEY` as a repository secret. The URL must resolve from the
-GitHub runner to the pre-provisioned regtest deployment.
+The existing `regtest.yml` workflow provisions this path on every run. It pins
+BTCPay Server 1.13.7, NBXplorer 2.5.12, and PostgreSQL 13.13, attaches them to
+the workflow's existing Bitcoin Core and LND regtest network, and creates one
+ephemeral store through Greenfield. The store uses the existing LND node as its
+internal Lightning node.
+
+The workflow then creates an ephemeral store-scoped API key with only the
+read-only permissions used by Rieko: Lightning node access, wallet viewing,
+invoice viewing, and store-settings viewing. The key is masked before it is
+passed to the test and is destroyed with the containers at teardown. No GitHub
+repository secret or production credential is required. The
+`BTCPAY_REGTEST_SMOKE_ENABLED=true` marker is scoped only to the smoke-test
+step.
