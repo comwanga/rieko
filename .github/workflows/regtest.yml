@@ -19,6 +19,9 @@ env:
   POSTGRES_IMAGE: btcpayserver/postgres:13.13
   RPC_USER: rieko
   RPC_PASS: riekopass
+  RPC_READONLY_USER: rieko_readonly
+  RPC_READONLY_PASS: rieko-readonly-regtest-pass
+  BITCOIN_CORE_RPC_URL: http://127.0.0.1:18443
 
 jobs:
   regtest-integration:
@@ -61,6 +64,9 @@ jobs:
         run: |
           docker network create regtest-net
 
+          RPC_READONLY_SALT=rieko-regtest-readonly
+          RPC_READONLY_HASH=$(printf '%s' "${RPC_READONLY_PASS}" | openssl dgst -sha256 -hmac "${RPC_READONLY_SALT}" | awk '{print $NF}')
+
           docker run -d \
             --name bitcoind \
             --network regtest-net \
@@ -72,6 +78,9 @@ jobs:
             -server=1 \
             -rpcuser=${{ env.RPC_USER }} \
             -rpcpassword=${{ env.RPC_PASS }} \
+            -rpcauth=${RPC_READONLY_USER}:${RPC_READONLY_SALT}\$${RPC_READONLY_HASH} \
+            -rpcwhitelist=${RPC_READONLY_USER}:getblockchaininfo \
+            -rpcwhitelistdefault=0 \
             -rpcbind=0.0.0.0 \
             -rpcallowip=0.0.0.0/0 \
             -rpcport=18443 \
@@ -415,7 +424,7 @@ jobs:
       - name: Run real BTCPay Greenfield health smoke test
         env:
           BTCPAY_REGTEST_SMOKE_ENABLED: "true"
-        run: cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture
+        run: cargo test -p rieko-cli --test live_btcpay_health -- --ignored --nocapture --test-threads=1
 
       # ---------------------------------------------------------
       # 6. Diagnostics & Teardown

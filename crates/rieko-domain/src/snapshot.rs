@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BitcoinNetwork, Channel, ChannelId, ChannelStatus};
 
+/// Minimal normalized Bitcoin Core chain state used for persisted observation
+/// and future cross-source correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitcoinCoreSnapshot {
+    pub network: BitcoinNetwork,
+    pub block_height: u64,
+    pub header_height: u64,
+    pub synchronized: bool,
+    pub observed_at: DateTime<Utc>,
+}
+
 /// A point-in-time view of a channel's liquidity and state. Persisted over
 /// cycles so the engine can reason about trends (drift, deterioration) and,
 /// later, run what-if simulations.

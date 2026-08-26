@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -81,6 +81,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 15,
         sql: V15_DURABLE_WEBHOOK_EVENTS,
+    },
+    Migration {
+        version: 16,
+        sql: V16_BITCOIN_CORE_STATE,
     },
 ];
 
@@ -442,6 +446,13 @@ CREATE INDEX IF NOT EXISTS idx_webhook_events_pending
     ON webhook_events (processed_at, accepted_at, delivery_id);
 "#;
 
+/// v16: one constant-size normalized Bitcoin Core observation embedded in the
+/// existing operational-state boundary. The JSON is typed by `rieko-status`;
+/// NULL means direct Core RPC observation is not configured.
+const V16_BITCOIN_CORE_STATE: &str = r#"
+ALTER TABLE operational_state ADD COLUMN bitcoin_core TEXT;
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -492,9 +503,22 @@ pub fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
 }
 
 fn apply(tx: &rusqlite::Transaction, step: &Migration) -> Result<(), StorageError> {
-    tx.execute_batch(step.sql).map_err(|e| {
-        StorageError::Backend(format!("migration to v{} failed: {e}", step.version))
-    })?;
+    let operational_state_exists = || {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'operational_state')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|e| StorageError::Backend(format!("checking operational_state table: {e}")))
+    };
+    // Some supported legacy test/minimal databases contain only one v9-v11
+    // subsystem table. Preserve that migration behavior while adding the Core
+    // column to every normal database that has the v4 operational-state table.
+    if step.version != 16 || operational_state_exists()? {
+        tx.execute_batch(step.sql).map_err(|e| {
+            StorageError::Backend(format!("migration to v{} failed: {e}", step.version))
+        })?;
+    }
     tx.pragma_update(None, "user_version", step.version)
         .map_err(|e| StorageError::Backend(format!("recording schema version: {e}")))?;
     Ok(())

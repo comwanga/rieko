@@ -9,18 +9,21 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use rieko_api::RiekoApi;
 use rieko_detectors::{
-    BtcPayBackendHealthDetector, Detector, DetectorContext, SettlementReliabilityDetector,
+    BitcoinCoreSyncCorrelationDetector, BtcPayBackendHealthDetector, Detector, DetectorContext,
+    SettlementReliabilityDetector,
 };
 use rieko_domain::{BitcoinNetwork, NodeEvent, NodeIngestionAdapter, NodeSnapshot};
 use rieko_findings::channel_snapshot_state_digest;
 use rieko_graph::InMemoryGraph;
 use rieko_ingest_btcpay::{BtcPayAdapter, BtcPayAdapterConfig, BtcPayGreenfieldClient};
+use rieko_ingest_core::BitcoinCoreRpcClient;
 use rieko_storage::{SqliteStorage, Storage, WebhookEventRecord};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
 
 const BTCPAY_EVENT_BUFFER: usize = 1024;
 const BTCPAY_DETECTOR_WINDOW: usize = 100;
+const BTCPAY_CORE_CORRELATION_NODE: &str = "btcpay-greenfield";
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Startup configuration shared by the `rieko-agent` executable and the
@@ -110,12 +113,47 @@ pub struct AgentArgs {
     /// Stop polling after this many attempts; zero polls until agent shutdown.
     #[arg(long, default_value_t = 0)]
     btcpay_poll_cycles: u64,
+
+    /// Bitcoin Core JSON-RPC URL for bounded read-only chain observation.
+    #[arg(
+        long,
+        value_name = "URL",
+        requires_all = ["bitcoin_core_rpc_user", "bitcoin_core_rpc_password_file"]
+    )]
+    bitcoin_core_rpc_url: Option<String>,
+
+    /// Bitcoin Core RPC user. Configure this user with a read-only RPC whitelist.
+    #[arg(long, value_name = "USER", requires = "bitcoin_core_rpc_url")]
+    bitcoin_core_rpc_user: Option<String>,
+
+    /// File containing the Bitcoin Core RPC password.
+    #[arg(long, value_name = "FILE", requires = "bitcoin_core_rpc_url")]
+    bitcoin_core_rpc_password_file: Option<PathBuf>,
+
+    /// Seconds between Bitcoin Core observation cycles.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    bitcoin_core_poll_interval: u64,
+
+    /// Maximum seconds for one Bitcoin Core RPC observation.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    bitcoin_core_poll_timeout: u64,
+
+    /// Stop Bitcoin Core polling after this many attempts; zero polls until shutdown.
+    #[arg(long, default_value_t = 0)]
+    bitcoin_core_poll_cycles: u64,
 }
 
 struct GreenfieldPollConfig {
     adapter: BtcPayAdapter,
     network: BitcoinNetwork,
     detector_node: String,
+    interval: Duration,
+    timeout: Duration,
+    cycles: u64,
+}
+
+struct BitcoinCorePollConfig {
+    client: BitcoinCoreRpcClient,
     interval: Duration,
     timeout: Duration,
     cycles: u64,
@@ -147,10 +185,14 @@ async fn run_until(
         None => None,
     };
     let greenfield_config = build_greenfield_poll_config(&args)?;
+    let bitcoin_core_config = build_bitcoin_core_poll_config(&args)?;
 
     let storage = SqliteStorage::open(&db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
-    let _writer = if btcpay_config.is_some() || greenfield_config.is_some() {
+    let _writer = if btcpay_config.is_some()
+        || greenfield_config.is_some()
+        || bitcoin_core_config.is_some()
+    {
         Some(
             storage
                 .writer_lock(&db_path)
@@ -173,6 +215,7 @@ async fn run_until(
         (receiver, api.state.storage.clone(), network, node)
     });
     let greenfield_storage = api.state.storage.clone();
+    let bitcoin_core_storage = api.state.storage.clone();
 
     let app = api.router();
     drop(api);
@@ -181,6 +224,7 @@ async fn run_until(
         tokio::spawn(run_btcpay_finding_loop(receiver, storage, network, node))
     });
     let (poll_shutdown_tx, poll_shutdown_rx) = watch::channel(false);
+    let bitcoin_core_shutdown_rx = poll_shutdown_tx.subscribe();
     let mut greenfield_worker = greenfield_config.map(|config| {
         info!(
             interval_seconds = config.interval.as_secs(),
@@ -192,6 +236,19 @@ async fn run_until(
             config,
             greenfield_storage,
             poll_shutdown_rx,
+        ))
+    });
+    let mut bitcoin_core_worker = bitcoin_core_config.map(|config| {
+        info!(
+            interval_seconds = config.interval.as_secs(),
+            timeout_seconds = config.timeout.as_secs(),
+            cycle_limit = config.cycles,
+            "Bitcoin Core RPC polling enabled"
+        );
+        tokio::spawn(run_bitcoin_core_poll_loop(
+            config,
+            bitcoin_core_storage,
+            bitcoin_core_shutdown_rx,
         ))
     });
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
@@ -217,7 +274,32 @@ async fn run_until(
     info!("rieko-agent shutdown requested");
     stop_worker(&mut webhook_worker, "BTCPay finding").await;
     stop_worker(&mut greenfield_worker, "BTCPay Greenfield polling").await;
+    stop_worker(&mut bitcoin_core_worker, "Bitcoin Core RPC polling").await;
     result
+}
+
+fn build_bitcoin_core_poll_config(args: &AgentArgs) -> Result<Option<BitcoinCorePollConfig>> {
+    let Some(endpoint) = args.bitcoin_core_rpc_url.as_deref() else {
+        return Ok(None);
+    };
+    let username = args
+        .bitcoin_core_rpc_user
+        .clone()
+        .context("--bitcoin-core-rpc-user is required with --bitcoin-core-rpc-url")?;
+    let password_file = args
+        .bitcoin_core_rpc_password_file
+        .as_deref()
+        .context("--bitcoin-core-rpc-password-file is required with --bitcoin-core-rpc-url")?;
+    let password = load_secret(password_file, "Bitcoin Core RPC password")?;
+    let timeout = Duration::from_secs(args.bitcoin_core_poll_timeout);
+    let client = BitcoinCoreRpcClient::new_with_timeout(endpoint, username, password, timeout)
+        .context("building Bitcoin Core RPC client")?;
+    Ok(Some(BitcoinCorePollConfig {
+        client,
+        interval: Duration::from_secs(args.bitcoin_core_poll_interval),
+        timeout,
+        cycles: args.bitcoin_core_poll_cycles,
+    }))
 }
 
 fn build_greenfield_poll_config(args: &AgentArgs) -> Result<Option<GreenfieldPollConfig>> {
@@ -335,6 +417,69 @@ async fn run_greenfield_poll_loop(
     }
 }
 
+async fn run_bitcoin_core_poll_loop(
+    config: BitcoinCorePollConfig,
+    storage: Arc<Mutex<Box<dyn Storage + Send>>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(config.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut attempts = 0_u64;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                attempts += 1;
+                if let Err(error) = record_bitcoin_core_attempt(&storage).await {
+                    warn!(%error, "failed to persist Bitcoin Core polling attempt");
+                }
+                match tokio::time::timeout(config.timeout, config.client.get_blockchain_snapshot()).await {
+                    Ok(Ok(snapshot)) => {
+                        let network = snapshot.network;
+                        let block_height = snapshot.block_height;
+                        let header_height = snapshot.header_height;
+                        let synchronized = snapshot.synchronized;
+                        match record_bitcoin_core_success(&storage, snapshot).await {
+                            Ok(()) => {
+                                info!(
+                                    attempt = attempts,
+                                    %network,
+                                    block_height,
+                                    header_height,
+                                    synchronized,
+                                    "Bitcoin Core state persisted"
+                                );
+                                run_bitcoin_core_sync_correlation_detector(&storage).await;
+                            }
+                            Err(error) => warn!(attempt = attempts, %error, "Bitcoin Core state persistence failed"),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        warn!(attempt = attempts, %error, "Bitcoin Core RPC polling failed");
+                        if let Err(state_error) = record_bitcoin_core_failure(&storage).await {
+                            warn!(%state_error, "failed to persist Bitcoin Core failure state");
+                        }
+                    }
+                    Err(_) => {
+                        warn!(attempt = attempts, timeout_seconds = config.timeout.as_secs(), "Bitcoin Core RPC polling timed out");
+                        if let Err(error) = record_bitcoin_core_failure(&storage).await {
+                            warn!(%error, "failed to persist Bitcoin Core timeout state");
+                        }
+                    }
+                }
+
+                if config.cycles > 0 && attempts >= config.cycles {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn run_btcpay_health_detector(
     storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
     network: BitcoinNetwork,
@@ -342,6 +487,80 @@ async fn run_btcpay_health_detector(
 ) {
     if let Err(error) = evaluate_persisted_btcpay_health(storage, network, node).await {
         warn!(%error, "BTCPay backend-health detector cycle failed");
+    }
+}
+
+async fn run_bitcoin_core_sync_correlation_detector(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) {
+    if let Err(error) = evaluate_persisted_bitcoin_core_sync_correlation(storage).await {
+        warn!(%error, "Bitcoin Core sync correlation detector cycle failed");
+    }
+}
+
+async fn evaluate_persisted_bitcoin_core_sync_correlation(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut storage = storage.blocking_lock();
+        let state = storage
+            .read_operational_state()
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?
+            .unwrap_or_default();
+        let network = state
+            .bitcoin_core
+            .as_ref()
+            .and_then(|core| core.snapshot.as_ref())
+            .map_or(BitcoinNetwork::Mainnet, |snapshot| snapshot.network);
+        let detector = BitcoinCoreSyncCorrelationDetector::new(state);
+        let graph = InMemoryGraph::new();
+        let context = DetectorContext {
+            node: Some(BTCPAY_CORE_CORRELATION_NODE),
+            ..DetectorContext::no_context(network)
+        };
+        let cycle = detector
+            .evaluate(&graph, &context)
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
+
+        persist_operational_detector_cycle(&mut **storage, &cycle)
+    })
+    .await
+    .context("joining Bitcoin Core sync correlation detector persistence")??;
+    Ok(())
+}
+
+fn persist_operational_detector_cycle(
+    storage: &mut dyn Storage,
+    cycle: &rieko_detectors::DetectorCycle,
+) -> Result<usize, rieko_storage::StorageError> {
+    storage.begin_transaction()?;
+    let result = (|| {
+        storage.resolve_findings_for_scope(&cycle.scope)?;
+        storage.sync_recommendation_lifecycles()?;
+        for finding in &cycle.findings {
+            storage.save_finding(finding)?;
+        }
+        let completed_at = chrono::Utc::now();
+        storage
+            .update_operational_state(&|state| {
+                state.last_cycle_attempt = Some(completed_at);
+                state.last_cycle_success = Some(completed_at);
+                state.last_persist_success = Some(completed_at);
+            })
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
+        Ok::<_, rieko_storage::StorageError>(cycle.findings.len())
+    })();
+    match result {
+        Ok(findings) => {
+            if let Err(error) = storage.commit_transaction() {
+                let _ = storage.rollback_transaction();
+                return Err(error);
+            }
+            Ok(findings)
+        }
+        Err(error) => {
+            let _ = storage.rollback_transaction();
+            Err(error)
+        }
     }
 }
 
@@ -368,36 +587,7 @@ async fn evaluate_persisted_btcpay_health(
             .evaluate(&graph, &context)
             .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
 
-        storage.begin_transaction()?;
-        let result = (|| {
-            storage.resolve_findings_for_scope(&cycle.scope)?;
-            storage.sync_recommendation_lifecycles()?;
-            for finding in &cycle.findings {
-                storage.save_finding(finding)?;
-            }
-            let completed_at = chrono::Utc::now();
-            storage
-                .update_operational_state(&|state| {
-                    state.last_cycle_attempt = Some(completed_at);
-                    state.last_cycle_success = Some(completed_at);
-                    state.last_persist_success = Some(completed_at);
-                })
-                .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
-            Ok::<_, rieko_storage::StorageError>(cycle.findings.len())
-        })();
-        match result {
-            Ok(findings) => {
-                if let Err(error) = storage.commit_transaction() {
-                    let _ = storage.rollback_transaction();
-                    return Err(error);
-                }
-                Ok(findings)
-            }
-            Err(error) => {
-                let _ = storage.rollback_transaction();
-                Err(error)
-            }
-        }
+        persist_operational_detector_cycle(&mut **storage, &cycle)
     })
     .await
     .context("joining BTCPay backend-health detector persistence")??;
@@ -418,6 +608,78 @@ async fn record_greenfield_attempt(storage: &Arc<Mutex<Box<dyn Storage + Send>>>
     })
     .await
     .context("joining BTCPay Greenfield attempt persistence")??;
+    Ok(())
+}
+
+async fn record_bitcoin_core_attempt(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let attempted_at = chrono::Utc::now();
+            match state.bitcoin_core.as_mut() {
+                Some(core) => core.last_attempt = attempted_at,
+                None => {
+                    state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
+                        connected: false,
+                        last_attempt: attempted_at,
+                        last_success: None,
+                        snapshot: None,
+                    });
+                }
+            }
+        })
+    })
+    .await
+    .context("joining Bitcoin Core attempt persistence")??;
+    Ok(())
+}
+
+async fn record_bitcoin_core_success(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    snapshot: rieko_domain::BitcoinCoreSnapshot,
+) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let completed_at = chrono::Utc::now();
+            let last_attempt = state
+                .bitcoin_core
+                .as_ref()
+                .map_or(completed_at, |core| core.last_attempt);
+            state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
+                connected: true,
+                last_attempt,
+                last_success: Some(completed_at),
+                snapshot: Some(snapshot.clone()),
+            });
+            state.last_persist_success = Some(completed_at);
+        })
+    })
+    .await
+    .context("joining Bitcoin Core success persistence")??;
+    Ok(())
+}
+
+async fn record_bitcoin_core_failure(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        storage.blocking_lock().update_operational_state(&|state| {
+            let failed_at = chrono::Utc::now();
+            match state.bitcoin_core.as_mut() {
+                Some(core) => core.connected = false,
+                None => {
+                    state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
+                        connected: false,
+                        last_attempt: failed_at,
+                        last_success: None,
+                        snapshot: None,
+                    });
+                }
+            }
+        })
+    })
+    .await
+    .context("joining Bitcoin Core failure persistence")??;
     Ok(())
 }
 
@@ -719,7 +981,7 @@ mod tests {
     use axum::extract::Path as AxumPath;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::Json;
     use chrono::{TimeZone, Utc};
     use rieko_domain::InvoiceExpiredEvent;
@@ -841,6 +1103,283 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         run_greenfield_poll_loop(config, storage.clone(), shutdown_rx).await;
         storage
+    }
+
+    fn bitcoin_core_response() -> serde_json::Value {
+        json!({
+            "result": {
+                "chain": "regtest",
+                "blocks": 250,
+                "headers": 250,
+                "initialblockdownload": false
+            },
+            "error": null,
+            "id": "rieko-core-observation"
+        })
+    }
+
+    fn bitcoin_core_poll_config(
+        endpoint: &str,
+        interval: Duration,
+        timeout: Duration,
+        cycles: u64,
+    ) -> BitcoinCorePollConfig {
+        BitcoinCorePollConfig {
+            client: BitcoinCoreRpcClient::new_with_timeout(endpoint, "rieko", "readonly", timeout)
+                .unwrap(),
+            interval,
+            timeout,
+            cycles,
+        }
+    }
+
+    async fn run_finite_bitcoin_core_poll(
+        config: BitcoinCorePollConfig,
+    ) -> Arc<Mutex<Box<dyn Storage + Send>>> {
+        let storage = memory_storage();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_bitcoin_core_poll_loop(config, storage.clone(), shutdown_rx).await;
+        storage
+    }
+
+    #[tokio::test]
+    async fn successful_bitcoin_core_poll_persists_normalized_state_without_findings() {
+        let saw_read_only_auth = Arc::new(AtomicBool::new(false));
+        let observed_auth = saw_read_only_auth.clone();
+        let app = axum::Router::new().route(
+            "/",
+            post(move |headers: HeaderMap| {
+                let observed_auth = observed_auth.clone();
+                async move {
+                    observed_auth.store(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Basic cmlla286cmVhZG9ubHk="),
+                        Ordering::SeqCst,
+                    );
+                    Json(bitcoin_core_response())
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = run_finite_bitcoin_core_poll(bitcoin_core_poll_config(
+            &endpoint,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            1,
+        ))
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        let state = storage.read_operational_state().unwrap().unwrap();
+        let core = state.bitcoin_core.unwrap();
+        let snapshot = core.snapshot.unwrap();
+        assert!(saw_read_only_auth.load(Ordering::SeqCst));
+        assert_eq!(state.source, rieko_status::SourceState::Fixture);
+        assert!(core.connected);
+        assert!(core.last_success.is_some());
+        assert_eq!(snapshot.network, BitcoinNetwork::Regtest);
+        assert_eq!(snapshot.block_height, 250);
+        assert_eq!(snapshot.header_height, 250);
+        assert!(snapshot.synchronized);
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsynchronized_core_poll_runs_the_persisted_correlation_detector() {
+        let response = json!({
+            "result": {
+                "chain": "regtest",
+                "blocks": 240,
+                "headers": 250,
+                "initialblockdownload": false
+            },
+            "error": null,
+            "id": "rieko-core-observation"
+        });
+        let app = axum::Router::new().route(
+            "/",
+            post(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = memory_storage();
+        storage
+            .lock()
+            .await
+            .write_operational_state(&rieko_status::OperationalState {
+                source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+                last_ingestion_attempt: Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+                last_ingestion_success: Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_bitcoin_core_poll_loop(
+            bitcoin_core_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                1,
+            ),
+            storage.clone(),
+            shutdown_rx,
+        )
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        let findings = storage.latest_findings(10).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector, "bitcoin_core_sync_correlation");
+        assert_eq!(
+            findings[0]
+                .evidence_value("bitcoin_core_state")
+                .and_then(|evidence| evidence.get("synchronized")),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    async fn assert_failed_bitcoin_core_poll(app: axum::Router) {
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = run_finite_bitcoin_core_poll(bitcoin_core_poll_config(
+            &endpoint,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            1,
+        ))
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        let core = storage
+            .read_operational_state()
+            .unwrap()
+            .unwrap()
+            .bitcoin_core
+            .unwrap();
+        assert!(!core.connected);
+        assert_eq!(core.last_success, None);
+        assert_eq!(core.snapshot, None);
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bitcoin_core_http_error_is_recorded_without_crashing() {
+        let app = axum::Router::new().route(
+            "/",
+            post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "warming up") }),
+        );
+        assert_failed_bitcoin_core_poll(app).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_bitcoin_core_response_is_recorded_without_crashing() {
+        let app = axum::Router::new().route("/", post(|| async { "not rpc json" }));
+        assert_failed_bitcoin_core_poll(app).await;
+    }
+
+    #[tokio::test]
+    async fn bitcoin_core_timeout_is_recorded_without_crashing() {
+        let app = axum::Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Json(bitcoin_core_response())
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let storage = run_finite_bitcoin_core_poll(bitcoin_core_poll_config(
+            &endpoint,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            1,
+        ))
+        .await;
+        server.abort();
+
+        let mut storage = storage.lock().await;
+        assert!(
+            !storage
+                .read_operational_state()
+                .unwrap()
+                .unwrap()
+                .bitcoin_core
+                .unwrap()
+                .connected
+        );
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_bitcoin_core_is_recorded_without_crashing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let storage = run_finite_bitcoin_core_poll(bitcoin_core_poll_config(
+            &endpoint,
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+            1,
+        ))
+        .await;
+        let mut storage = storage.lock().await;
+        assert!(
+            !storage
+                .read_operational_state()
+                .unwrap()
+                .unwrap()
+                .bitcoin_core
+                .unwrap()
+                .connected
+        );
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transient_bitcoin_core_failure_recovers_within_bounded_cycles() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let app = axum::Router::new().route(
+            "/",
+            post(move || {
+                let request_count = request_count.clone();
+                async move {
+                    if request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "warming up").into_response()
+                    } else {
+                        Json(bitcoin_core_response()).into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let started = std::time::Instant::now();
+        let storage = run_finite_bitcoin_core_poll(bitcoin_core_poll_config(
+            &endpoint,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            2,
+        ))
+        .await;
+        server.abort();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        let mut storage = storage.lock().await;
+        let core = storage
+            .read_operational_state()
+            .unwrap()
+            .unwrap()
+            .bitcoin_core
+            .unwrap();
+        assert!(core.connected);
+        assert_eq!(core.snapshot.unwrap().block_height, 250);
+        assert!(storage.latest_findings(10).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1061,6 +1600,84 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn persisted_core_correlation_deduplicates_and_resolves_through_existing_hysteresis() {
+        let backends: Vec<Arc<Mutex<Box<dyn Storage + Send>>>> = vec![
+            memory_storage(),
+            Arc::new(Mutex::new(Box::new(SqliteStorage::in_memory().unwrap()))),
+        ];
+        for storage in backends {
+            let observed_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+            storage
+                .lock()
+                .await
+                .write_operational_state(&rieko_status::OperationalState {
+                    source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
+                    last_ingestion_attempt: Some(observed_at),
+                    last_ingestion_success: Some(observed_at),
+                    bitcoin_core: Some(rieko_status::BitcoinCoreState {
+                        connected: true,
+                        last_attempt: observed_at,
+                        last_success: Some(observed_at),
+                        snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
+                            network: BitcoinNetwork::Regtest,
+                            block_height: 240,
+                            header_height: 250,
+                            synchronized: false,
+                            observed_at,
+                        }),
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            evaluate_persisted_bitcoin_core_sync_correlation(&storage)
+                .await
+                .unwrap();
+            let first_id = storage.lock().await.latest_findings(10).unwrap()[0]
+                .id
+                .clone();
+            evaluate_persisted_bitcoin_core_sync_correlation(&storage)
+                .await
+                .unwrap();
+            {
+                let mut storage = storage.lock().await;
+                let findings = storage.latest_findings(10).unwrap();
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].id, first_id);
+                assert_eq!(
+                    findings[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Active
+                );
+                storage
+                    .update_operational_state(&|state| {
+                        state
+                            .bitcoin_core
+                            .as_mut()
+                            .and_then(|core| core.snapshot.as_mut())
+                            .unwrap()
+                            .synchronized = true;
+                    })
+                    .unwrap();
+            }
+
+            for _ in 0..3 {
+                evaluate_persisted_bitcoin_core_sync_correlation(&storage)
+                    .await
+                    .unwrap();
+            }
+
+            let mut storage = storage.lock().await;
+            let findings = storage.latest_findings(10).unwrap();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].id, first_id);
+            assert_eq!(
+                findings[0].lifecycle,
+                rieko_findings::FindingLifecycle::Resolved
+            );
+        }
+    }
+
     #[derive(clap::Parser)]
     struct TestAgentCli {
         #[command(flatten)]
@@ -1098,6 +1715,43 @@ mod tests {
             ["--btcpay-poll-interval", "86401"],
             ["--btcpay-poll-timeout", "0"],
             ["--btcpay-poll-timeout", "301"],
+        ] {
+            let mut invalid = vec!["rieko-agent"];
+            invalid.extend(required);
+            invalid.extend(invalid_tail);
+            assert!(TestAgentCli::try_parse_from(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn bitcoin_core_polling_configuration_is_bounded() {
+        use clap::Parser;
+
+        let required = [
+            "--bitcoin-core-rpc-url",
+            "http://127.0.0.1:18443",
+            "--bitcoin-core-rpc-user",
+            "rieko",
+            "--bitcoin-core-rpc-password-file",
+            "rpc-password",
+        ];
+        let mut valid = vec!["rieko-agent"];
+        valid.extend(required);
+        valid.extend([
+            "--bitcoin-core-poll-interval",
+            "1",
+            "--bitcoin-core-poll-timeout",
+            "300",
+            "--bitcoin-core-poll-cycles",
+            "2",
+        ]);
+        assert!(TestAgentCli::try_parse_from(valid).is_ok());
+
+        for invalid_tail in [
+            ["--bitcoin-core-poll-interval", "0"],
+            ["--bitcoin-core-poll-interval", "86401"],
+            ["--bitcoin-core-poll-timeout", "0"],
+            ["--bitcoin-core-poll-timeout", "301"],
         ] {
             let mut invalid = vec!["rieko-agent"];
             invalid.extend(required);
@@ -1365,6 +2019,12 @@ mod tests {
             btcpay_poll_interval: 60,
             btcpay_poll_timeout: 10,
             btcpay_poll_cycles: 0,
+            bitcoin_core_rpc_url: None,
+            bitcoin_core_rpc_user: None,
+            bitcoin_core_rpc_password_file: None,
+            bitcoin_core_poll_interval: 60,
+            bitcoin_core_poll_timeout: 10,
+            bitcoin_core_poll_cycles: 0,
         };
 
         let task = tokio::spawn(run_until(args, async {

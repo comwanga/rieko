@@ -46,3 +46,16 @@ masked before it is passed to the test and is destroyed with the containers at t
 repository secret or production credential is required. The
 `BTCPAY_REGTEST_SMOKE_ENABLED=true` marker is scoped only to the smoke-test
 step.
+
+The same ignored test target also exercises the first Bitcoin Core correlation
+path. The workflow gives `rieko-agent` a separate RPC user whitelisted only for
+`getblockchaininfo`; the existing full-access regtest credential remains test
+orchestration-only. The test waits until real BTCPay and Core observations are
+both healthy, invalidates the current regtest tip while keeping Core RPC
+reachable, and confirms `blocks < headers` before polling continues. It then
+waits for repeated unsynchronized observations, verifies exactly one active
+`bitcoin_core_sync_correlation` finding through authenticated `/findings` and
+`/findings/:id`, stops the agent, and reopens SQLite to compare the persisted
+finding and Core state. A cleanup guard restores the invalidated tip with
+`reconsiderblock`, including when an assertion fails. Both live tests run
+serially and each has a 30-second bound.

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
 use rieko_findings::{Finding, FindingLifecycle, FindingLifecycleFilter};
-use rieko_status::{OperationalStateStore, SourceState};
+use rieko_status::{BitcoinCoreState, OperationalStateStore, SourceState};
 use rieko_storage::{SqliteStorage, Storage};
 use tokio::io::copy_bidirectional;
 use tokio::net::{lookup_host, TcpListener, TcpStream};
@@ -97,6 +97,30 @@ fn spawn_agent(
     key_path: &Path,
     store_id: &str,
 ) -> ChildGuard {
+    let mut command = configured_agent_command(
+        agent_binary,
+        db_path,
+        api_address,
+        token_path,
+        proxy_address,
+        key_path,
+        store_id,
+        4,
+    );
+    ChildGuard(Some(command.spawn().expect("start rieko-agent")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configured_agent_command(
+    agent_binary: &str,
+    db_path: &Path,
+    api_address: SocketAddr,
+    token_path: &Path,
+    proxy_address: SocketAddr,
+    key_path: &Path,
+    store_id: &str,
+    cycles: u64,
+) -> Command {
     let mut command = Command::new(agent_binary);
     command
         .arg("--db")
@@ -119,11 +143,132 @@ fn spawn_agent(
             "--btcpay-poll-timeout",
             "2",
             "--btcpay-poll-cycles",
-            "4",
+            &cycles.to_string(),
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    command
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_correlation_agent(
+    agent_binary: &str,
+    db_path: &Path,
+    api_address: SocketAddr,
+    token_path: &Path,
+    proxy_address: SocketAddr,
+    key_path: &Path,
+    store_id: &str,
+    core_password_path: &Path,
+) -> ChildGuard {
+    let mut command = configured_agent_command(
+        agent_binary,
+        db_path,
+        api_address,
+        token_path,
+        proxy_address,
+        key_path,
+        store_id,
+        10,
+    );
+    command
+        .arg("--bitcoin-core-rpc-url")
+        .arg(required_env("BITCOIN_CORE_RPC_URL"))
+        .arg("--bitcoin-core-rpc-user")
+        .arg(required_env("RPC_READONLY_USER"))
+        .arg("--bitcoin-core-rpc-password-file")
+        .arg(core_password_path)
+        .args([
+            "--bitcoin-core-poll-interval",
+            "1",
+            "--bitcoin-core-poll-timeout",
+            "2",
+            "--bitcoin-core-poll-cycles",
+            "10",
+        ]);
     ChildGuard(Some(command.spawn().expect("start rieko-agent")))
+}
+
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} must be configured by regtest.yml"))
+}
+
+fn bitcoin_cli_result(method: &str, arguments: &[&str]) -> Result<String, String> {
+    let rpc_user = required_env("RPC_USER");
+    let rpc_password = required_env("RPC_PASS");
+    let output = Command::new("docker")
+        .args(["exec", "bitcoind", "bitcoin-cli", "-regtest"])
+        .arg(format!("-rpcuser={rpc_user}"))
+        .arg(format!("-rpcpassword={rpc_password}"))
+        .arg(method)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("run bitcoin-cli: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "bitcoin-cli {method} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|output| output.trim().to_string())
+        .map_err(|error| format!("bitcoin-cli output is not UTF-8: {error}"))
+}
+
+fn bitcoin_cli(method: &str, arguments: &[&str]) -> String {
+    bitcoin_cli_result(method, arguments).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn blockchain_info() -> serde_json::Value {
+    serde_json::from_str(&bitcoin_cli("getblockchaininfo", &[]))
+        .expect("getblockchaininfo returns JSON")
+}
+
+struct InvalidatedCoreTip {
+    block_hash: String,
+    restored: bool,
+}
+
+impl InvalidatedCoreTip {
+    fn induce() -> (Self, u64, u64) {
+        let before = blockchain_info();
+        assert_eq!(before["chain"], "regtest");
+        assert_eq!(before["blocks"], before["headers"]);
+        assert_eq!(before["initialblockdownload"], false);
+
+        let block_hash = bitcoin_cli("getbestblockhash", &[]);
+        bitcoin_cli("invalidateblock", &[&block_hash]);
+        let guard = Self {
+            block_hash,
+            restored: false,
+        };
+        let degraded = blockchain_info();
+        let blocks = degraded["blocks"].as_u64().expect("numeric block height");
+        let headers = degraded["headers"].as_u64().expect("numeric header height");
+        assert!(
+            blocks < headers,
+            "invalidating the regtest tip must retain a higher known header"
+        );
+        assert_eq!(degraded["initialblockdownload"], false);
+
+        (guard, blocks, headers)
+    }
+
+    fn restore(&mut self) {
+        if !self.restored {
+            bitcoin_cli("reconsiderblock", &[&self.block_hash]);
+            self.restored = true;
+        }
+    }
+}
+
+impl Drop for InvalidatedCoreTip {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = bitcoin_cli_result("reconsiderblock", &[&self.block_hash]);
+            self.restored = true;
+        }
+    }
 }
 
 async fn upstream_address(base_url: &str) -> SocketAddr {
@@ -164,6 +309,59 @@ async fn wait_for_healthy_source(client: &reqwest::Client, api_url: &str) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("rieko-agent never persisted a healthy BTCPay Greenfield state");
+}
+
+async fn wait_for_initial_correlation_state(db_path: &Path) -> BitcoinCoreState {
+    for _ in 0..100 {
+        if let Ok(storage) = SqliteStorage::open(db_path) {
+            if let Ok(Some(state)) = storage.read_operational_state() {
+                if state.source == (SourceState::BtcPayGreenfield { connected: true }) {
+                    if let Some(core) = state.bitcoin_core {
+                        if core.connected
+                            && core
+                                .snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.synchronized)
+                        {
+                            return core;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent did not persist synchronized Core and reachable BTCPay state");
+}
+
+async fn wait_for_active_core_correlation(client: &reqwest::Client, api_url: &str) -> Finding {
+    for _ in 0..150 {
+        if let Ok(response) = client
+            .get(format!("{api_url}/findings?limit=50"))
+            .bearer_auth(API_TOKEN)
+            .send()
+            .await
+        {
+            if let Ok(findings) = response.json::<Vec<Finding>>().await {
+                let correlation = findings
+                    .into_iter()
+                    .filter(|finding| finding.detector == "bitcoin_core_sync_correlation")
+                    .collect::<Vec<_>>();
+                if correlation.len() == 1
+                    && correlation[0].lifecycle == FindingLifecycle::Active
+                    && correlation[0]
+                        .last_seen_at
+                        .signed_duration_since(correlation[0].first_seen_at)
+                        .num_milliseconds()
+                        >= 1_500
+                {
+                    return correlation.into_iter().next().unwrap();
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("bounded Core polling did not persist one stable active correlation finding");
 }
 
 async fn wait_for_restarted_disconnected_source(client: &reqwest::Client, api_url: &str) {
@@ -384,10 +582,121 @@ async fn live_flow() {
     assert_eq!(persisted[0].lifecycle, FindingLifecycle::Resolved);
 }
 
+async fn live_core_sync_correlation_flow() {
+    let base_url = required_env("BTCPAY_GREENFIELD_URL");
+    let api_key = required_env("BTCPAY_GREENFIELD_API_KEY");
+    let store_id = required_env("BTCPAY_GREENFIELD_STORE");
+    let core_password = required_env("RPC_READONLY_PASS");
+
+    let upstream = upstream_address(&base_url).await;
+    let proxy = IsolationProxy::start(upstream).await;
+    let api_address = free_address();
+    let api_url = format!("http://{api_address}");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("rieko-correlation.db");
+    let key_path = temp.path().join("btcpay-readonly.key");
+    let core_password_path = temp.path().join("core-readonly.password");
+    let token_path = temp.path().join("rieko-api.token");
+    std::fs::write(&key_path, format!("{api_key}\n")).unwrap();
+    std::fs::write(&core_password_path, format!("{core_password}\n")).unwrap();
+    std::fs::write(&token_path, format!("{API_TOKEN}\n")).unwrap();
+
+    let agent_binary = required_env("CARGO_BIN_EXE_rieko-agent");
+    let mut agent = spawn_correlation_agent(
+        &agent_binary,
+        &db_path,
+        api_address,
+        &token_path,
+        proxy.address,
+        &key_path,
+        &store_id,
+        &core_password_path,
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let initial_core = wait_for_initial_correlation_state(&db_path).await;
+    assert!(initial_core.connected);
+    assert!(initial_core.snapshot.unwrap().synchronized);
+
+    let (mut invalidated_tip, expected_blocks, expected_headers) = InvalidatedCoreTip::induce();
+
+    let unauthorized = client
+        .get(format!("{api_url}/findings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let finding = wait_for_active_core_correlation(&client, &api_url).await;
+    assert_eq!(finding.lifecycle, FindingLifecycle::Active);
+    assert_eq!(
+        finding.evidence_value("btcpay_state").unwrap()["connected"],
+        true
+    );
+    let core_evidence = finding.evidence_value("bitcoin_core_state").unwrap();
+    assert_eq!(core_evidence["connected"], true);
+    assert_eq!(core_evidence["network"], "regtest");
+    assert_eq!(core_evidence["block_height"], expected_blocks);
+    assert_eq!(core_evidence["header_height"], expected_headers);
+    assert_eq!(core_evidence["synchronized"], false);
+
+    let detail = client
+        .get(format!("{api_url}/findings/{}", finding.id))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Finding>()
+        .await
+        .unwrap();
+    assert_eq!(detail, finding);
+
+    agent.stop();
+    proxy.isolate().await;
+
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    let operational = storage.read_operational_state().unwrap().unwrap();
+    assert_eq!(
+        operational.source,
+        SourceState::BtcPayGreenfield { connected: true }
+    );
+    let persisted_core = operational.bitcoin_core.unwrap();
+    assert!(persisted_core.connected);
+    let persisted_snapshot = persisted_core.snapshot.unwrap();
+    assert_eq!(persisted_snapshot.network.to_string(), "regtest");
+    assert_eq!(persisted_snapshot.block_height, expected_blocks);
+    assert_eq!(persisted_snapshot.header_height, expected_headers);
+    assert!(!persisted_snapshot.synchronized);
+
+    let persisted = storage
+        .latest_findings_by_lifecycle(50, FindingLifecycleFilter::All)
+        .unwrap()
+        .into_iter()
+        .filter(|candidate| candidate.detector == "bitcoin_core_sync_correlation")
+        .collect::<Vec<_>>();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0], finding);
+
+    invalidated_tip.restore();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a real BTCPay regtest deployment; see docs/testing-btcpay-regtest.md"]
 async fn real_btcpay_greenfield_restart_continuity_resolves_the_same_finding() {
     tokio::time::timeout(Duration::from_secs(30), live_flow())
         .await
         .expect("live BTCPay health smoke test exceeded its 30-second bound");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the real BTCPay and Bitcoin Core regtest deployment in regtest.yml"]
+async fn real_btcpay_and_unsynchronized_core_emit_persisted_correlation_finding() {
+    tokio::time::timeout(Duration::from_secs(30), live_core_sync_correlation_flow())
+        .await
+        .expect("live BTCPay/Core correlation smoke test exceeded its 30-second bound");
 }

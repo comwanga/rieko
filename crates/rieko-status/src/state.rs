@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use rieko_domain::BitcoinCoreSnapshot;
 use serde::{Deserialize, Serialize};
 
 /// The durable operational state Rieko persists so `/status` and the CLI
@@ -21,6 +22,10 @@ pub struct OperationalState {
     pub last_persist_success: Option<DateTime<Utc>>,
     /// Newest source data timestamp observed, when available.
     pub source_data_at: Option<DateTime<Utc>>,
+    /// Independently observed Bitcoin Core RPC state. This remains separate
+    /// from `source` so Core polling cannot overwrite BTCPay/LND connectivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitcoin_core: Option<BitcoinCoreState>,
     /// LLM capability state, without any secrets.
     pub llm: ComponentState,
     /// Alert sink capability state, without any secrets.
@@ -44,6 +49,7 @@ impl Default for OperationalState {
             last_cycle_success: None,
             last_persist_success: None,
             source_data_at: None,
+            bitcoin_core: None,
             llm: ComponentState::NotConfigured,
             alert_sink: ComponentState::NotConfigured,
             cleanup: ComponentState::NotConfigured,
@@ -51,6 +57,15 @@ impl Default for OperationalState {
             last_cleanup_success: None,
         }
     }
+}
+
+/// Constant-size operational record for direct Bitcoin Core observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitcoinCoreState {
+    pub connected: bool,
+    pub last_attempt: DateTime<Utc>,
+    pub last_success: Option<DateTime<Utc>>,
+    pub snapshot: Option<BitcoinCoreSnapshot>,
 }
 
 /// What kind of source feeds the pipeline and whether it is reachable.
