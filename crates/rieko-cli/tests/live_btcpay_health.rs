@@ -727,6 +727,31 @@ async fn live_core_sync_correlation_flow() {
         .unwrap();
     assert_eq!(detail, finding);
 
+    header_gap.restore();
+    let recovered_info = blockchain_info();
+    assert_eq!(recovered_info["blocks"], recovered_info["headers"]);
+    assert_eq!(recovered_info["initialblockdownload"], false);
+
+    let resolved = wait_for_resolved_finding(&client, &api_url, &finding.id).await;
+    assert_eq!(resolved.id, finding.id);
+    assert_eq!(resolved.lifecycle, FindingLifecycle::Resolved);
+
+    let active_after_recovery = client
+        .get(format!("{api_url}/findings?limit=50"))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<Finding>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|candidate| candidate.detector == "bitcoin_core_sync_correlation")
+        .collect::<Vec<_>>();
+    assert!(active_after_recovery.is_empty());
+
     agent.stop();
     proxy.isolate().await;
 
@@ -740,9 +765,15 @@ async fn live_core_sync_correlation_flow() {
     assert!(persisted_core.connected);
     let persisted_snapshot = persisted_core.snapshot.unwrap();
     assert_eq!(persisted_snapshot.network.to_string(), "regtest");
-    assert_eq!(persisted_snapshot.block_height, expected_blocks);
-    assert_eq!(persisted_snapshot.header_height, expected_headers);
-    assert!(!persisted_snapshot.synchronized);
+    assert_eq!(
+        persisted_snapshot.block_height,
+        recovered_info["blocks"].as_u64().unwrap()
+    );
+    assert_eq!(
+        persisted_snapshot.header_height,
+        recovered_info["headers"].as_u64().unwrap()
+    );
+    assert!(persisted_snapshot.synchronized);
 
     let persisted = storage
         .latest_findings_by_lifecycle(50, FindingLifecycleFilter::All)
@@ -751,9 +782,8 @@ async fn live_core_sync_correlation_flow() {
         .filter(|candidate| candidate.detector == "bitcoin_core_sync_correlation")
         .collect::<Vec<_>>();
     assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0], finding);
-
-    header_gap.restore();
+    assert_eq!(persisted[0].id, finding.id);
+    assert_eq!(persisted[0].lifecycle, FindingLifecycle::Resolved);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -766,7 +796,7 @@ async fn real_btcpay_greenfield_restart_continuity_resolves_the_same_finding() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the real BTCPay and Bitcoin Core regtest deployment in regtest.yml"]
-async fn real_btcpay_and_unsynchronized_core_emit_persisted_correlation_finding() {
+async fn real_btcpay_core_sync_correlation_resolves_after_core_recovers() {
     tokio::time::timeout(Duration::from_secs(30), live_core_sync_correlation_flow())
         .await
         .expect("live BTCPay/Core correlation smoke test exceeded its 30-second bound");

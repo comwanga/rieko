@@ -53,9 +53,11 @@ path. The workflow gives `rieko-agent` a separate RPC user whitelisted only for
 orchestration-only. The test waits until real BTCPay and Core observations are
 both healthy, submits one valid regtest header without its block while keeping
 Core RPC reachable, and confirms `blocks < headers` before polling continues. It then
-waits for repeated unsynchronized observations, verifies exactly one active
+waits for repeated unsynchronized observations and verifies exactly one active
 `bitcoin_core_sync_correlation` finding through authenticated `/findings` and
-`/findings/:id`, stops the agent, and reopens SQLite to compare the persisted
-finding and Core state. A cleanup guard mines past the header-only branch,
-including when an assertion fails. Both live tests run
-serially and each has a 30-second bound.
+`/findings/:id`. It then mines past the header-only branch and waits for exactly
+the existing three-cycle recovery hysteresis. The original finding ID must
+become resolved, with no replacement finding. Finally, the test stops the agent
+and reopens SQLite to compare the synchronized Core state and single resolved
+finding. A cleanup guard still restores the chain if an earlier assertion
+fails. Both live tests run serially and each has a 30-second bound.
