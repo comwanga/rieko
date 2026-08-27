@@ -31,6 +31,10 @@ const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// backwards-compatible `rieko serve` command.
 #[derive(Args, Debug)]
 pub struct AgentArgs {
+    /// Optional non-secret connection configuration written by `rieko attach`.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[arg(long, value_name = "FILE")]
     db: Option<PathBuf>,
 
@@ -210,9 +214,10 @@ pub fn run(args: AgentArgs) -> Result<()> {
 }
 
 async fn run_until(
-    args: AgentArgs,
+    mut args: AgentArgs,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    apply_connection_config(&mut args)?;
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
     let mut token = load_token(args.token_file.as_deref())?;
     enforce_binding_policy(args.addr, args.allow_external, token.as_deref())?;
@@ -334,6 +339,31 @@ async fn run_until(
     stop_worker(&mut bitcoin_core_worker, "Bitcoin Core RPC polling").await;
     stop_worker(&mut lnd_worker, "LND REST polling").await;
     result
+}
+
+fn apply_connection_config(args: &mut AgentArgs) -> Result<()> {
+    let Some(path) = args.config.as_deref() else {
+        return Ok(());
+    };
+    let Some(btcpay) = crate::config::load(path)?.btcpay else {
+        return Ok(());
+    };
+    if args.btcpay_greenfield_url.is_none() {
+        args.btcpay_greenfield_url = Some(btcpay.greenfield_base_url);
+    }
+    if args.btcpay_greenfield_api_key_file.is_none() {
+        args.btcpay_greenfield_api_key_file = Some(btcpay.api_key_file);
+    }
+    if args.btcpay_greenfield_store.is_none() {
+        args.btcpay_greenfield_store = Some(btcpay.store_id);
+    }
+    if args.btcpay_greenfield_network.is_none() {
+        args.btcpay_greenfield_network = Some(btcpay.network);
+    }
+    if args.btcpay_greenfield_node.is_none() {
+        args.btcpay_greenfield_node = btcpay.node;
+    }
+    Ok(())
 }
 
 async fn build_lnd_poll_config(args: &AgentArgs) -> Result<Option<LndPollConfig>> {
@@ -2314,6 +2344,98 @@ mod tests {
     }
 
     #[test]
+    fn agent_consumes_attached_btcpay_config_and_explicit_flags_keep_precedence() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("rieko.json");
+        let configured_key = directory.path().join("configured.key");
+        crate::config::write(
+            &config_path,
+            &crate::config::RiekoConfig {
+                version: crate::config::CONFIG_VERSION,
+                btcpay: Some(crate::config::BtcPayConnectionConfig {
+                    greenfield_base_url: "https://configured.example".into(),
+                    store_id: "configured-store".into(),
+                    api_key_file: configured_key.clone(),
+                    network: BitcoinNetwork::Regtest,
+                    node: Some("configured-node".into()),
+                }),
+            },
+        )
+        .unwrap();
+
+        let mut configured = TestAgentCli::try_parse_from([
+            "rieko-agent",
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        apply_connection_config(&mut configured).unwrap();
+        assert_eq!(
+            configured.btcpay_greenfield_url.as_deref(),
+            Some("https://configured.example")
+        );
+        assert_eq!(
+            configured.btcpay_greenfield_api_key_file.as_ref(),
+            Some(&configured_key)
+        );
+        assert_eq!(
+            configured.btcpay_greenfield_store.as_deref(),
+            Some("configured-store")
+        );
+        assert_eq!(
+            configured.btcpay_greenfield_network,
+            Some(BitcoinNetwork::Regtest)
+        );
+        assert_eq!(
+            configured.btcpay_greenfield_node.as_deref(),
+            Some("configured-node")
+        );
+
+        let explicit_key = directory.path().join("explicit.key");
+        let mut explicit = TestAgentCli::try_parse_from([
+            "rieko-agent",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--btcpay-greenfield-url",
+            "https://explicit.example",
+            "--btcpay-greenfield-api-key-file",
+            explicit_key.to_str().unwrap(),
+            "--btcpay-greenfield-store",
+            "explicit-store",
+            "--btcpay-greenfield-network",
+            "signet",
+            "--btcpay-greenfield-node",
+            "explicit-node",
+        ])
+        .unwrap()
+        .args;
+        apply_connection_config(&mut explicit).unwrap();
+        assert_eq!(
+            explicit.btcpay_greenfield_url.as_deref(),
+            Some("https://explicit.example")
+        );
+        assert_eq!(
+            explicit.btcpay_greenfield_api_key_file.as_ref(),
+            Some(&explicit_key)
+        );
+        assert_eq!(
+            explicit.btcpay_greenfield_store.as_deref(),
+            Some("explicit-store")
+        );
+        assert_eq!(
+            explicit.btcpay_greenfield_network,
+            Some(BitcoinNetwork::Signet)
+        );
+        assert_eq!(
+            explicit.btcpay_greenfield_node.as_deref(),
+            Some("explicit-node")
+        );
+    }
+
+    #[test]
     fn greenfield_polling_configuration_is_bounded() {
         use clap::Parser;
 
@@ -2676,6 +2798,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let args = AgentArgs {
+            config: None,
             db: Some(dir.path().join("agent.db")),
             addr: addr("127.0.0.1:0"),
             static_dir: None,

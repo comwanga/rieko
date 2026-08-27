@@ -57,6 +57,78 @@ pub struct StatusCounts {
     pub simulation_stale: usize,
 }
 
+/// Read-only projection of the latest persisted Lightning observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightningInspection {
+    pub state: Option<rieko_status::LightningState>,
+}
+
+/// Read-only projection of the latest persisted Bitcoin Core observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitcoinInspection {
+    pub state: Option<rieko_status::BitcoinCoreState>,
+}
+
+/// Read-only projection of the persisted BTCPay operational fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtcPayInspection {
+    pub state: Option<BtcPayInspectionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtcPayInspectionState {
+    pub source: rieko_status::SourceState,
+    pub last_attempt: Option<chrono::DateTime<Utc>>,
+    pub last_success: Option<chrono::DateTime<Utc>>,
+    pub source_data_at: Option<chrono::DateTime<Utc>>,
+}
+
+pub async fn inspect_btcpay(
+    State(api): State<RiekoApi>,
+) -> Result<Json<BtcPayInspection>, (StatusCode, String)> {
+    let state = block_storage(api.state.storage.clone(), |storage| {
+        storage
+            .read_operational_state()
+            .map(|state| {
+                state.map(|state| BtcPayInspectionState {
+                    source: state.source,
+                    last_attempt: state.last_ingestion_attempt,
+                    last_success: state.last_ingestion_success,
+                    source_data_at: state.source_data_at,
+                })
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    Ok(Json(BtcPayInspection { state }))
+}
+
+pub async fn inspect_bitcoin(
+    State(api): State<RiekoApi>,
+) -> Result<Json<BitcoinInspection>, (StatusCode, String)> {
+    let state = block_storage(api.state.storage.clone(), |storage| {
+        storage
+            .read_operational_state()
+            .map(|state| state.and_then(|state| state.bitcoin_core))
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    Ok(Json(BitcoinInspection { state }))
+}
+
+pub async fn inspect_lightning(
+    State(api): State<RiekoApi>,
+) -> Result<Json<LightningInspection>, (StatusCode, String)> {
+    let state = block_storage(api.state.storage.clone(), |storage| {
+        storage
+            .read_operational_state()
+            .map(|state| state.and_then(|state| state.lightning))
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    Ok(Json(LightningInspection { state }))
+}
+
 pub async fn status(State(api): State<RiekoApi>) -> Result<Json<Status>, (StatusCode, String)> {
     // All SQLite reads run on the blocking pool, never on the Tokio executor,
     // so a large table cannot stall the runtime (RIEKO-AUDIT-014). Queries are

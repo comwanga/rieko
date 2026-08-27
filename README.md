@@ -123,6 +123,9 @@ cargo run --bin rieko -- watch --interval 5
 cargo run --bin rieko -- explain <finding-id>
 ```
 
+For a dedicated non-root Linux service with explicit configuration, database,
+and secret-file permissions, see [the systemd deployment example](docs/deploy-systemd.md).
+
 ## API endpoints
 
 | Endpoint | Description |

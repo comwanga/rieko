@@ -19,6 +19,8 @@ enum Command {
     Scan(commands::scan::ScanArgs),
     /// Run the same pipeline continuously, tracking channel state over time.
     Monitor(commands::monitor::MonitorArgs),
+    /// Configure external infrastructure connections without contacting them.
+    Attach(commands::attach::AttachArgs),
     /// Create and inspect deterministic what-if projections (v2).
     #[cfg(feature = "simulate")]
     Simulations(commands::simulations::SimulationsArgs),
@@ -33,6 +35,10 @@ enum Command {
     Watch(commands::watch::WatchArgs),
     /// Show operational status reported by the running agent.
     Status(commands::status::StatusArgs),
+    /// Summarize persisted operational state and active findings.
+    Doctor(commands::doctor::DoctorArgs),
+    /// Inspect detailed normalized state reported by the running agent.
+    Inspect(commands::inspect::InspectArgs),
     /// Run the read-only HTTP API.
     Serve(Box<commands::serve::ServeArgs>),
 }
@@ -48,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Scan(args) => commands::scan::run(args),
         Command::Monitor(args) => commands::monitor::run(args),
+        Command::Attach(args) => commands::attach::run(args),
         #[cfg(feature = "simulate")]
         Command::Simulations(args) => commands::simulations::run(args),
         #[cfg(feature = "execute")]
@@ -56,6 +63,8 @@ fn main() -> anyhow::Result<()> {
         Command::Findings(args) => commands::findings::run(args),
         Command::Watch(args) => commands::watch::run(args),
         Command::Status(args) => commands::status::run(args),
+        Command::Doctor(args) => commands::doctor::run(args),
+        Command::Inspect(args) => commands::inspect::run(args),
         Command::Serve(args) => commands::serve::run(*args),
     }
 }
@@ -81,16 +90,20 @@ mod tests {
         let required = [
             "scan",
             "monitor",
+            "attach",
             "simulations",
             "explain",
             "findings",
             "watch",
             "status",
+            "doctor",
+            "inspect",
             "serve",
         ];
         #[cfg(not(feature = "simulate"))]
         let required = [
-            "scan", "monitor", "explain", "findings", "watch", "status", "serve",
+            "scan", "monitor", "attach", "explain", "findings", "watch", "status", "doctor",
+            "inspect", "serve",
         ];
         for required in required {
             assert!(
@@ -112,32 +125,40 @@ mod tests {
         let expected: &[&str] = &[
             "scan",
             "monitor",
+            "attach",
             "simulations",
             "explain",
             "findings",
             "watch",
             "status",
+            "doctor",
+            "inspect",
             "serve",
         ];
         #[cfg(all(feature = "execute", feature = "simulate"))]
         let expected: &[&str] = &[
             "scan",
             "monitor",
+            "attach",
             "simulations",
             "actions",
             "explain",
             "findings",
             "watch",
             "status",
+            "doctor",
+            "inspect",
             "serve",
         ];
         #[cfg(all(feature = "execute", not(feature = "simulate")))]
         let expected: &[&str] = &[
-            "scan", "monitor", "actions", "explain", "findings", "watch", "status", "serve",
+            "scan", "monitor", "attach", "actions", "explain", "findings", "watch", "status",
+            "doctor", "inspect", "serve",
         ];
         #[cfg(all(not(feature = "execute"), not(feature = "simulate")))]
         let expected: &[&str] = &[
-            "scan", "monitor", "explain", "findings", "watch", "status", "serve",
+            "scan", "monitor", "attach", "explain", "findings", "watch", "status", "doctor",
+            "inspect", "serve",
         ];
         assert_eq!(got, expected, "got {got:?}");
     }
@@ -180,6 +201,155 @@ mod tests {
             Cli::try_parse_from(["rieko", "status", "--api-url", "http://127.0.0.1:9000"]).is_ok()
         );
         assert!(Cli::try_parse_from(["rieko", "status", "--db", "local.db"]).is_err());
+    }
+
+    #[test]
+    fn attach_btcpay_requires_connection_fields_and_rejects_database_flags() {
+        use super::Cli;
+        use clap::Parser;
+
+        let valid = [
+            "rieko",
+            "attach",
+            "btcpay",
+            "--config",
+            "rieko.json",
+            "--greenfield-url",
+            "https://btcpay.example.com",
+            "--store",
+            "store-1",
+            "--api-key-file",
+            "greenfield.key",
+            "--network",
+            "regtest",
+            "--node",
+            "node-1",
+        ];
+        assert!(Cli::try_parse_from(valid).is_ok());
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "attach",
+            "btcpay",
+            "--config",
+            "rieko.json",
+            "--greenfield-url",
+            "https://btcpay.example.com",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "attach",
+            "btcpay",
+            "--config",
+            "rieko.json",
+            "--greenfield-url",
+            "https://btcpay.example.com",
+            "--store",
+            "store-1",
+            "--api-key-file",
+            "greenfield.key",
+            "--network",
+            "regtest",
+            "--db",
+            "rieko.db",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn doctor_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "doctor",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+            "--json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["rieko", "doctor", "--db", "local.db"]).is_err());
+    }
+
+    #[test]
+    fn inspect_lightning_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "inspect",
+            "lightning",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+            "--json",
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["rieko", "inspect", "lightning", "--db", "local.db"]).is_err()
+        );
+    }
+
+    #[test]
+    fn inspect_bitcoin_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "inspect",
+            "bitcoin",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+            "--json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["rieko", "inspect", "bitcoin", "--db", "local.db"]).is_err());
+    }
+
+    #[test]
+    fn inspect_btcpay_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "inspect",
+            "btcpay",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+            "--json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["rieko", "inspect", "btcpay", "--db", "local.db"]).is_err());
+    }
+
+    #[test]
+    fn inspect_all_uses_api_configuration_and_has_no_database_flag() {
+        use super::Cli;
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "rieko",
+            "inspect",
+            "all",
+            "--api-url",
+            "http://127.0.0.1:9000",
+            "--token-file",
+            "token",
+            "--json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["rieko", "inspect", "all", "--db", "local.db"]).is_err());
     }
 
     #[cfg(feature = "simulate")]
