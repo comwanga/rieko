@@ -1,0 +1,159 @@
+name: Docker Compose sidecar smoke
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-compose-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sidecar-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create temporary configuration and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          api_token="$(openssl rand -hex 32)"
+          btcpay_key="$(openssl rand -hex 32)"
+          echo "::add-mask::${api_token}"
+          echo "::add-mask::${btcpay_key}"
+
+          mkdir -p deploy/docker/config deploy/docker/secrets
+          printf '%s\n' "${api_token}" > deploy/docker/secrets/api-token
+          printf '%s\n' "${btcpay_key}" > deploy/docker/secrets/btcpay-greenfield.key
+          cat > deploy/docker/config/rieko.json <<'JSON'
+          {
+            "version": 1,
+            "btcpay": {
+              "greenfield_base_url": "http://127.0.0.1:9",
+              "store_id": "ci-smoke-store",
+              "api_key_file": "/run/secrets/btcpay-greenfield.key",
+              "network": "regtest"
+            }
+          }
+          JSON
+
+          sudo chown -R 10001:10001 deploy/docker/config deploy/docker/secrets
+          sudo chmod 0750 deploy/docker/config deploy/docker/secrets
+          sudo chmod 0400 \
+            deploy/docker/config/rieko.json \
+            deploy/docker/secrets/api-token \
+            deploy/docker/secrets/btcpay-greenfield.key
+
+      - name: Build rieko-agent image
+        run: docker compose -f deploy/docker/docker-compose.yml build rieko-agent
+
+      - name: Start rieko-agent sidecar
+        run: docker compose -f deploy/docker/docker-compose.yml up -d rieko-agent
+
+      - name: Verify authentication and SQLite persistence across recreation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          compose=(docker compose -f deploy/docker/docker-compose.yml)
+          status_url="http://127.0.0.1:8080/status"
+          API_TOKEN="$(sudo cat deploy/docker/secrets/api-token)"
+
+          wait_for_status() {
+            local response_file="$1"
+            for attempt in $(seq 1 60); do
+              if curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 2 \
+                --header "Authorization: Bearer ${API_TOKEN}" \
+                --output "${response_file}" \
+                "${status_url}"; then
+                return 0
+              fi
+              sleep 2
+            done
+
+            echo "rieko-agent did not become ready within 120 seconds" >&2
+            return 1
+          }
+
+          wait_for_status /tmp/status-before.json
+
+          unauthenticated_code="$(curl \
+            --silent \
+            --show-error \
+            --max-time 2 \
+            --output /tmp/status-unauthenticated.json \
+            --write-out '%{http_code}' \
+            "${status_url}")"
+          test "${unauthenticated_code}" = "401"
+
+          jq -e '.engine == "rieko" and .integrity == "ok"' \
+            /tmp/status-before.json >/dev/null
+          schema_before="$(jq -r '.schema_version' /tmp/status-before.json)"
+          test "${schema_before}" != "null"
+
+          "${compose[@]}" exec -T rieko-agent \
+            test -s /var/lib/rieko/rieko.db
+          database_before="$("${compose[@]}" exec -T rieko-agent \
+            stat -c '%d:%i' /var/lib/rieko/rieko.db | tr -d '\r')"
+          container_before="$("${compose[@]}" ps -q rieko-agent)"
+          volume_before="$(docker inspect --format \
+            '{{range .Mounts}}{{if eq .Destination "/var/lib/rieko"}}{{.Name}}{{end}}{{end}}' \
+            "${container_before}")"
+          test -n "${volume_before}"
+          docker volume inspect "${volume_before}" >/dev/null
+
+          "${compose[@]}" up -d --force-recreate --no-build rieko-agent
+          wait_for_status /tmp/status-after.json
+
+          container_after="$("${compose[@]}" ps -q rieko-agent)"
+          test "${container_after}" != "${container_before}"
+          volume_after="$(docker inspect --format \
+            '{{range .Mounts}}{{if eq .Destination "/var/lib/rieko"}}{{.Name}}{{end}}{{end}}' \
+            "${container_after}")"
+          "${compose[@]}" exec -T rieko-agent \
+            test -s /var/lib/rieko/rieko.db
+          database_after="$("${compose[@]}" exec -T rieko-agent \
+            stat -c '%d:%i' /var/lib/rieko/rieko.db | tr -d '\r')"
+          schema_after="$(jq -r '.schema_version' /tmp/status-after.json)"
+
+          test "${volume_after}" = "${volume_before}"
+          test "${database_after}" = "${database_before}"
+          test "${schema_after}" = "${schema_before}"
+          jq -e '.engine == "rieko" and .integrity == "ok"' \
+            /tmp/status-after.json >/dev/null
+
+          echo "Authenticated /status succeeded before and after recreation."
+          echo "SQLite file identity persisted: ${database_after}"
+          echo "SQLite schema version persisted: ${schema_after}"
+
+      - name: Show Compose logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker/docker-compose.yml logs --no-color || true
+
+      - name: Tear down Compose resources
+        if: always()
+        shell: bash
+        run: |
+          docker compose -f deploy/docker/docker-compose.yml \
+            down --volumes --remove-orphans || true
+          sudo rm -f \
+            deploy/docker/config/rieko.json \
+            deploy/docker/secrets/api-token \
+            deploy/docker/secrets/btcpay-greenfield.key
+          sudo rmdir deploy/docker/secrets 2>/dev/null || true

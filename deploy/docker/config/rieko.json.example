@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "btcpay": {
+    "greenfield_base_url": "https://btcpay.example.com",
+    "store_id": "your-store-id",
+    "api_key_file": "/run/secrets/btcpay-greenfield.key",
+    "network": "mainnet",
+    "node": "optional-stable-node-scope"
+  }
+}

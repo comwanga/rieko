@@ -3,6 +3,8 @@
 *.db-wal
 *.db-shm
 .rieko/
+/deploy/docker/config/rieko.json
+/deploy/docker/secrets/
 
 # Internal planning and audit documents: never pushed to the repository.
 RIEKO_AUDIT_REPORT.md
