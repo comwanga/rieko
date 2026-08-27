@@ -125,6 +125,8 @@ cargo run --bin rieko -- explain <finding-id>
 
 For a dedicated non-root Linux service with explicit configuration, database,
 and secret-file permissions, see [the systemd deployment example](docs/deploy-systemd.md).
+For a container sidecar using the same configuration and secret-file semantics,
+see [the Docker Compose deployment example](docs/deploy-docker-compose.md).
 
 ## API endpoints
 

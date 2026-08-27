@@ -1,0 +1,41 @@
+services:
+  rieko-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: rieko-agent:local
+    user: "10001:10001"
+    command:
+      - --config
+      - /etc/rieko/rieko.json
+      - --db
+      - /var/lib/rieko/rieko.db
+      - --token-file
+      - /run/secrets/rieko-api-token
+      - --addr
+      - 0.0.0.0:8080
+      - --allow-external
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config/rieko.json:/etc/rieko/rieko.json:ro
+      - ./secrets/api-token:/run/secrets/rieko-api-token:ro
+      - ./secrets/btcpay-greenfield.key:/run/secrets/btcpay-greenfield.key:ro
+      - rieko-data:/var/lib/rieko
+    environment:
+      RUST_LOG: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  rieko-data:

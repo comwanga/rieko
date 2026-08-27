@@ -1,0 +1,12 @@
+.git
+.github
+.rieko
+target
+frontend/node_modules
+frontend/dist
+*.db
+*.db-shm
+*.db-wal
+redesign.md
+deploy/docker/config/rieko.json
+deploy/docker/secrets
