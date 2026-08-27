@@ -1,8 +1,11 @@
 #[cfg(feature = "execute")]
 pub mod actions;
+pub mod attach;
 pub mod common;
+pub mod doctor;
 pub mod explain;
 pub mod findings;
+pub mod inspect;
 pub mod monitor;
 pub mod scan;
 pub mod serve;

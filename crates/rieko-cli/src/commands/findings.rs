@@ -131,6 +131,51 @@ impl ApiClient {
         .await
     }
 
+    pub(super) async fn fetch_lightning_inspection(
+        &self,
+    ) -> Result<rieko_api::routes::LightningInspection> {
+        let mut url = self.api_url.clone();
+        url.set_path("/inspect/lightning");
+        url.set_query(None);
+        self.get(
+            url,
+            "requesting Lightning inspection",
+            "Lightning inspection API",
+            "decoding typed Lightning inspection response",
+        )
+        .await
+    }
+
+    pub(super) async fn fetch_bitcoin_inspection(
+        &self,
+    ) -> Result<rieko_api::routes::BitcoinInspection> {
+        let mut url = self.api_url.clone();
+        url.set_path("/inspect/bitcoin");
+        url.set_query(None);
+        self.get(
+            url,
+            "requesting Bitcoin inspection",
+            "Bitcoin inspection API",
+            "decoding typed Bitcoin inspection response",
+        )
+        .await
+    }
+
+    pub(super) async fn fetch_btcpay_inspection(
+        &self,
+    ) -> Result<rieko_api::routes::BtcPayInspection> {
+        let mut url = self.api_url.clone();
+        url.set_path("/inspect/btcpay");
+        url.set_query(None);
+        self.get(
+            url,
+            "requesting BTCPay inspection",
+            "BTCPay inspection API",
+            "decoding typed BTCPay inspection response",
+        )
+        .await
+    }
+
     #[cfg(feature = "execute")]
     pub(super) async fn fetch_recommendations(
         &self,

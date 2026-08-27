@@ -165,6 +165,18 @@ impl RiekoApi {
     fn router_with_state(&self, state: RiekoApi) -> axum::Router {
         let router = axum::Router::new()
             .route("/status", axum::routing::get(crate::routes::status))
+            .route(
+                "/inspect/lightning",
+                axum::routing::get(crate::routes::inspect_lightning),
+            )
+            .route(
+                "/inspect/bitcoin",
+                axum::routing::get(crate::routes::inspect_bitcoin),
+            )
+            .route(
+                "/inspect/btcpay",
+                axum::routing::get(crate::routes::inspect_btcpay),
+            )
             .route("/findings", axum::routing::get(crate::routes::findings))
             .route(
                 "/findings/channel/:channel_id",
