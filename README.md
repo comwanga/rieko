@@ -180,6 +180,22 @@ docker run --rm --name rieko-agent \
 The mounted files and database directory must be readable or writable as
 appropriate by container UID/GID `10001:10001`.
 
+Each tagged image also has keyless GitHub build-provenance and SPDX 2.3 JSON
+SBOM attestations bound to its immutable image digest. After authenticating to
+GHCR, verify the provenance and the registry-hosted SBOM attestation with:
+
+```sh
+docker login ghcr.io
+gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+  --repo comwanga/rieko --bundle-from-oci
+gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+  --repo comwanga/rieko --bundle-from-oci \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
+The signing identity comes from GitHub Actions OIDC; no repository signing key
+is required.
+
 ## API endpoints
 
 | Endpoint | Description |
