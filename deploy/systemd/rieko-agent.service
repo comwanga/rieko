@@ -1,0 +1,26 @@
+[Unit]
+Description=Rieko Bitcoin infrastructure observability agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rieko
+Group=rieko
+UMask=0077
+ExecStart=/usr/local/bin/rieko-agent --config /etc/rieko/rieko.json --db /var/lib/rieko/rieko.db --token-file /etc/rieko/secrets/api-token --addr 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5s
+
+# rieko-agent currently handles SIGINT as its graceful shutdown signal.
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rieko
+
+[Install]
+WantedBy=multi-user.target
