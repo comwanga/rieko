@@ -82,7 +82,7 @@ impl WatchState {
             let meaningful_change = self
                 .observed
                 .get(&finding.id)
-                .map_or(true, |lifecycle| *lifecycle != finding.lifecycle);
+                .is_none_or(|lifecycle| *lifecycle != finding.lifecycle);
             next.insert(finding.id.clone(), finding.lifecycle);
             if meaningful_change {
                 changed.push(finding);

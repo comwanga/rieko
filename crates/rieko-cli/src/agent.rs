@@ -1249,7 +1249,7 @@ fn enforce_binding_policy(
              (external exposure also requires a bearer token)"
         );
     }
-    if !token.is_some_and(|value| !value.trim().is_empty()) {
+    if token.is_none_or(|value| value.trim().is_empty()) {
         bail!(
             "refusing to bind {addr}: external exposure requires a bearer token \
              (set --token-file or RIEKO_API_TOKEN)"

@@ -76,7 +76,7 @@ pub fn assess(
     if let Some(attempt) = state.last_cycle_attempt {
         if state
             .last_cycle_success
-            .map_or(true, |success| attempt > success)
+            .is_none_or(|success| attempt > success)
         {
             degraded = true;
         }

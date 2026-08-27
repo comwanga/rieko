@@ -13,12 +13,17 @@ all without ever mutating node state in the default build.
 cd frontend && npm ci && npm run build && cd ..
 cargo run --release -- serve
 
-# Or scan a fixture to populate the database first
+# In another terminal, query the running API
+cargo run -- status
+
+# Or stop the agent, scan a fixture, then start it again to expose the result
 cargo run -- scan --network regtest --fixture fixtures/channels.json
+cargo run -- serve
+# In another terminal:
 cargo run -- status
 ```
 
-Open `http://localhost:3000` for the UI. The scan runs the pipeline: ingest →
+Open `http://localhost:8080` for the UI. The scan runs the pipeline: ingest →
 detect → recommend → explain → alert → persist. Findings are written to
 `~/.rieko/rieko.db` by default (override with `--db`).
 
@@ -26,7 +31,7 @@ detect → recommend → explain → alert → persist. Findings are written to
 
 ### Prerequisites
 
-- **Rust** 1.80+
+- **Rust** 1.86+
 - **Node.js** 22+ (for building the frontend)
 - **LND** 0.17+ (optional — only for live-node observation)
 
@@ -47,6 +52,8 @@ the frontend.
 
 ```sh
 cargo run -- scan --network regtest --fixture fixtures/channels.json
+cargo run -- serve
+# In another terminal:
 cargo run -- status
 ```
 
@@ -121,12 +128,73 @@ cargo run --bin rieko -- watch --interval 5
 
 # Return one exact persisted finding, including explanation and evidence
 cargo run --bin rieko -- explain <finding-id>
+
+# Inspect exact persisted operational state (add --json for typed JSON)
+cargo run --bin rieko -- inspect btcpay
+cargo run --bin rieko -- inspect bitcoin
+cargo run --bin rieko -- inspect lightning
+cargo run --bin rieko -- inspect all
+
+# Summarize status, persisted source state, and active findings
+cargo run --bin rieko -- doctor
 ```
+
+Save a non-secret BTCPay connection configuration without contacting BTCPay,
+then start the agent with it:
+
+```sh
+rieko attach btcpay \
+  --config /etc/rieko/rieko.json \
+  --greenfield-url https://btcpay.example.com \
+  --store <store-id> \
+  --api-key-file /run/secrets/btcpay-greenfield.key \
+  --network mainnet
+
+rieko-agent --config /etc/rieko/rieko.json
+```
+
+The configuration stores only the API-key file reference, never the key value.
 
 For a dedicated non-root Linux service with explicit configuration, database,
 and secret-file permissions, see [the systemd deployment example](docs/deploy-systemd.md).
 For a container sidecar using the same configuration and secret-file semantics,
 see [the Docker Compose deployment example](docs/deploy-docker-compose.md).
+
+Tagged releases publish the non-root agent image as
+`ghcr.io/comwanga/rieko:<version>`. For example:
+
+```sh
+docker pull ghcr.io/comwanga/rieko:v1.2.3
+docker run --rm --name rieko-agent \
+  -p 127.0.0.1:8080:8080 \
+  -v /etc/rieko:/etc/rieko:ro \
+  -v /run/secrets:/run/secrets:ro \
+  -v /var/lib/rieko:/var/lib/rieko \
+  ghcr.io/comwanga/rieko:v1.2.3 \
+  --config /etc/rieko/rieko.json \
+  --db /var/lib/rieko/rieko.db \
+  --token-file /run/secrets/rieko-api-token \
+  --addr 0.0.0.0:8080 --allow-external
+```
+
+The mounted files and database directory must be readable or writable as
+appropriate by container UID/GID `10001:10001`.
+
+Each tagged image also has keyless GitHub build-provenance and SPDX 2.3 JSON
+SBOM attestations bound to its immutable image digest. After authenticating to
+GHCR, verify the provenance and the registry-hosted SBOM attestation with:
+
+```sh
+docker login ghcr.io
+gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+  --repo comwanga/rieko --bundle-from-oci
+gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+  --repo comwanga/rieko --bundle-from-oci \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
+The signing identity comes from GitHub Actions OIDC; no repository signing key
+is required.
 
 ## API endpoints
 
@@ -134,6 +202,9 @@ see [the Docker Compose deployment example](docs/deploy-docker-compose.md).
 |----------|-------------|
 | `GET /` | Embedded UI |
 | `GET /status` | Health, counts, simulation breakdown |
+| `GET /inspect/btcpay` | Exact persisted BTCPay operational state |
+| `GET /inspect/bitcoin` | Exact persisted Bitcoin Core operational state |
+| `GET /inspect/lightning` | Exact persisted Lightning operational state |
 | `GET /findings?limit=N&lifecycle=active` | Findings (active, resolved, or all) |
 | `GET /findings/:id` | One exact persisted finding |
 | `GET /findings/channel/:id` | Findings for a channel |
@@ -227,8 +298,12 @@ LND / BTCPay / Core ──▶ Ingestion Adapters ──▶ Normalized Domain Eve
 |----------|----|----------------|
 | Liquidity | `channel_liquidity` | Channels imbalanced below threshold (outbound/inbound/severely drained) |
 | Drift | `liquidity_trend` | Channels trending toward drain over multiple snapshots |
+| Settlement reliability | `settlement_reliability` | Repeated BTCPay invoice settlement failures in the bounded event window |
+| BTCPay backend health | `btcpay_backend_health` | Persisted Greenfield connectivity is degraded |
+| Bitcoin Core sync correlation | `bitcoin_core_sync_correlation` | BTCPay and Core are reachable, but persisted Core state is unsynchronized |
+| Lightning chain sync correlation | `lightning_chain_sync_correlation` | BTCPay and synchronized Core are reachable, but persisted LND state is not synced to chain |
 
-Both produce deterministic findings with stable identities. Replay produces
+They produce deterministic findings with stable identities. Replay produces
 zero duplicates.
 
 ### Crates
@@ -242,7 +317,7 @@ zero duplicates.
 | `rieko-ingest-btcpay` | Ingest | BTCPay Server Greenfield client, webhook verifier, and adapter |
 | `rieko-ingest-lnd` | Ingest | LND REST client and normalizer |
 | `rieko-ingest-core` | Ingest | Bitcoin Core normalizer |
-| `rieko-detectors` | Engine | Liquidity and drift detectors |
+| `rieko-detectors` | Engine | Deterministic liquidity, settlement, backend-health, and cross-source correlation detectors |
 | `rieko-recommendations` | Engine | Findings → recommendations |
 | `rieko-alerts` | Engine | Alert dedup, cooldown, Telegram |
 | `rieko-llm` | Engine | LLM explanation client |
@@ -256,7 +331,8 @@ zero duplicates.
 ## Database
 
 The SQLite database is versioned internally and migrated transactionally on open.
-Run `cargo run -- status` to see your schema version. Back up before upgrading:
+With `rieko-agent` or `rieko serve` running, use `cargo run -- status` to see
+the schema version through the local API. Back up before upgrading:
 
 ```sh
 sqlite3 ~/.rieko/rieko.db ".backup 'backup.db'"
@@ -289,7 +365,7 @@ and `docs/adrs/0002-rebalance-execution-safety.md`.
 ## CI and testing
 
 ```sh
-cargo test --workspace --all-features          # 302+ tests
+cargo test --workspace --all-features
 cargo test -p rieko-cli --test release_e2e     # E2E binary smoke test
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
