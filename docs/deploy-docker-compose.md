@@ -93,7 +93,7 @@ docker compose ps
 docker compose logs -f rieko-agent
 ```
 
-The Compose file defaults to `ghcr.io/comwanga/rieko:v0.1.1`. Set
+The Compose file defaults to `ghcr.io/comwanga/rieko:v0.1.2`. Set
 `RIEKO_AGENT_IMAGE` to another published tag or immutable digest when an
 explicitly validated upgrade is required. The retained `build` section is for
 repository development and CI; it is not used by this clean-host procedure.
@@ -105,7 +105,7 @@ The public container contains `rieko-agent`. Install the matching checksummed
 Rust toolchain:
 
 ```sh
-RIEKO_VERSION=v0.1.1
+RIEKO_VERSION=v0.1.2
 RIEKO_ASSET="rieko-${RIEKO_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 RIEKO_RELEASE="https://github.com/comwanga/rieko/releases/download/${RIEKO_VERSION}"
 
@@ -113,7 +113,7 @@ curl -fLO "${RIEKO_RELEASE}/${RIEKO_ASSET}"
 curl -fLO "${RIEKO_RELEASE}/${RIEKO_ASSET}.sha256"
 sha256sum --check "${RIEKO_ASSET}.sha256"
 tar -xzf "${RIEKO_ASSET}"
-test "$(./rieko --version)" = "rieko 0.1.1"
+test "$(./rieko --version)" = "rieko 0.1.2"
 sudo install -o root -g root -m 0755 rieko /usr/local/bin/rieko
 rieko --version
 ```

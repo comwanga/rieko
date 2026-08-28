@@ -162,16 +162,16 @@ see [the Docker Compose deployment example](docs/deploy-docker-compose.md).
 
 Tagged releases publish the non-root agent image as
 `ghcr.io/comwanga/rieko:<version>`. The current stable image is
-`ghcr.io/comwanga/rieko:v0.1.1`. For example:
+`ghcr.io/comwanga/rieko:v0.1.2`. For example:
 
 ```sh
-docker pull ghcr.io/comwanga/rieko:v0.1.1
+docker pull ghcr.io/comwanga/rieko:v0.1.2
 docker run --rm --name rieko-agent \
   -p 127.0.0.1:8080:8080 \
   -v /etc/rieko:/etc/rieko:ro \
   -v /run/secrets:/run/secrets:ro \
   -v /var/lib/rieko:/var/lib/rieko \
-  ghcr.io/comwanga/rieko:v0.1.1 \
+  ghcr.io/comwanga/rieko:v0.1.2 \
   --config /etc/rieko/rieko.json \
   --db /var/lib/rieko/rieko.db \
   --token-file /run/secrets/rieko-api-token \
@@ -187,9 +187,9 @@ GHCR, verify the provenance and the registry-hosted SBOM attestation with:
 
 ```sh
 docker login ghcr.io
-gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.1 \
+gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.2 \
   --repo comwanga/rieko --bundle-from-oci
-gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.1 \
+gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.2 \
   --repo comwanga/rieko --bundle-from-oci \
   --predicate-type https://spdx.dev/Document/v2.3
 ```
