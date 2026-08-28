@@ -15,6 +15,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      stable: ${{ steps.version.outputs.stable }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Check out repository
@@ -34,6 +37,7 @@ jobs:
           fi
 
           major="${BASH_REMATCH[1]}"
+          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
           if [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "stable=true" >> "${GITHUB_OUTPUT}"
           else
@@ -103,3 +107,158 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           sbom-path: rieko-agent.spdx.json
           push-to-registry: true
+
+  publish-cli:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate CLI version matches release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rieko-cli") | .version')"
+          test "${cli_version}" = "${{ needs.publish.outputs.version }}"
+
+      - name: Build Linux x86_64 operator CLI
+        run: |
+          test "$(uname -m)" = "x86_64"
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/source" \
+            --workdir /source \
+            rust:1.86-bookworm \
+            cargo build --locked --release --package rieko-cli --bin rieko
+
+      - name: Package and verify operator CLI
+        id: asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="rieko-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          checksum="${asset}.sha256"
+
+          mkdir -p dist extracted
+          tar -C target/release -czf "dist/${asset}" rieko
+          file target/release/rieko | grep --quiet 'ELF 64-bit.*x86-64'
+          (
+            cd dist
+            sha256sum "${asset}" > "${checksum}"
+            sha256sum --check "${checksum}"
+          )
+          tar -C extracted -xzf "dist/${asset}"
+          test "$(./extracted/rieko --version)" = "rieko ${{ needs.publish.outputs.version }}"
+
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke operator CLI against authenticated agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="${RUNNER_TEMP}/rieko-cli-smoke"
+          network="rieko-cli-smoke"
+          volume="rieko-cli-smoke-data"
+          agent="rieko-cli-smoke-agent"
+
+          cleanup() {
+            docker rm --force "${agent}" >/dev/null 2>&1 || true
+            docker volume rm "${volume}" >/dev/null 2>&1 || true
+            docker network rm "${network}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p "${smoke}"
+          openssl rand -hex 32 > "${smoke}/api-token"
+          openssl rand -hex 32 > "${smoke}/btcpay-greenfield.key"
+          cat > "${smoke}/rieko.json" <<'JSON'
+          {
+            "version": 1,
+            "btcpay": {
+              "greenfield_base_url": "http://127.0.0.1:9",
+              "store_id": "release-cli-smoke",
+              "api_key_file": "/run/secrets/btcpay-greenfield.key",
+              "network": "regtest"
+            }
+          }
+          JSON
+          sudo chown 10001:10001 "${smoke}/rieko.json" "${smoke}/api-token" \
+            "${smoke}/btcpay-greenfield.key"
+          sudo chmod 0400 "${smoke}/rieko.json" "${smoke}/api-token" \
+            "${smoke}/btcpay-greenfield.key"
+
+          docker network create "${network}" >/dev/null
+          docker volume create "${volume}" >/dev/null
+          docker run --detach \
+            --name "${agent}" \
+            --network "${network}" \
+            --network-alias rieko-agent \
+            --user 10001:10001 \
+            --stop-signal SIGINT \
+            --mount "type=bind,source=${smoke}/rieko.json,target=/etc/rieko/rieko.json,readonly" \
+            --mount "type=bind,source=${smoke}/api-token,target=/run/secrets/rieko-api-token,readonly" \
+            --mount "type=bind,source=${smoke}/btcpay-greenfield.key,target=/run/secrets/btcpay-greenfield.key,readonly" \
+            --mount "type=volume,source=${volume},target=/var/lib/rieko" \
+            "ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}" \
+            --config /etc/rieko/rieko.json \
+            --db /var/lib/rieko/rieko.db \
+            --token-file /run/secrets/rieko-api-token \
+            --addr 0.0.0.0:8080 \
+            --allow-external >/dev/null
+
+          cli=(docker run --rm
+            --network "${network}"
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/extracted/rieko,target=/usr/local/bin/rieko,readonly"
+            --mount "type=bind,source=${smoke}/api-token,target=/run/secrets/rieko-api-token,readonly"
+            debian:bookworm-slim
+            rieko)
+          api=(--api-url http://rieko-agent:8080 --token-file /run/secrets/rieko-api-token)
+
+          for attempt in $(seq 1 60); do
+            if "${cli[@]}" status "${api[@]}" >/tmp/rieko-status.txt 2>/dev/null; then
+              break
+            fi
+            if [[ "${attempt}" = 60 ]]; then
+              docker logs "${agent}"
+              echo "rieko-agent did not become ready within 120 seconds" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker run --rm \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/extracted/rieko,target=/usr/local/bin/rieko,readonly" \
+            debian:bookworm-slim \
+            sh -c 'test ! -e /source && ! command -v cargo && rieko --version'
+          "${cli[@]}" inspect all "${api[@]}" >/tmp/rieko-inspect-all.txt
+          "${cli[@]}" doctor "${api[@]}" >/tmp/rieko-doctor.txt
+
+      - name: Create release and upload operator CLI assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.asset.outputs.asset }}
+          CHECKSUM: ${{ steps.asset.outputs.checksum }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            release_flags=()
+            if [[ "${{ needs.publish.outputs.stable }}" != "true" ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --title "Rieko ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "${release_flags[@]}"
+          fi
+          gh release upload "${GITHUB_REF_NAME}" \
+            "dist/${ASSET}" \
+            "dist/${CHECKSUM}" \
+            --clobber
