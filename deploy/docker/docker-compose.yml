@@ -3,7 +3,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: rieko-agent:local
+    image: ${RIEKO_AGENT_IMAGE:-ghcr.io/comwanga/rieko:v0.1.1}
     user: "10001:10001"
     command:
       - --config

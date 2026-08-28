@@ -10,20 +10,37 @@ The Compose file publishes the authenticated API only on host loopback at
 service as `http://rieko-agent:8080`, but every request still requires the API
 token.
 
-## Files
+## Prerequisites
 
-The example lives under `deploy/docker`:
+- A Linux host with Docker Engine and the Docker Compose v2 plugin
+- `curl` for downloading the deployment files and checking the API
+- `sha256sum` and `tar` for verifying and extracting the operator CLI
+- Root access or `sudo` for assigning the documented UID/GID and file modes
+
+## Prepare a clean deployment directory
+
+The agent source tree is not required. On a clean host, download only the
+Compose file and non-secret configuration example from the repository:
+
+```sh
+mkdir -p rieko/config rieko/secrets
+cd rieko
+curl -fsSLo docker-compose.yml \
+  https://raw.githubusercontent.com/comwanga/rieko/main/deploy/docker/docker-compose.yml
+curl -fsSLo config/rieko.json \
+  https://raw.githubusercontent.com/comwanga/rieko/main/deploy/docker/config/rieko.json.example
+```
+
+This produces:
 
 ```text
-deploy/docker/
-|-- Dockerfile
+rieko/
 |-- docker-compose.yml
 |-- config/
-|   |-- rieko.json.example
-|   `-- rieko.json                 UID 10001, mode 0400, not committed
+|   `-- rieko.json                 UID 10001, mode 0400
 `-- secrets/
-    |-- api-token                  UID 10001, mode 0400, not committed
-    `-- btcpay-greenfield.key      UID 10001, mode 0400, not committed
+    |-- api-token                  UID 10001, mode 0400
+    `-- btcpay-greenfield.key      UID 10001, mode 0400
 
 Docker volume: rieko-data          mounted at /var/lib/rieko
 SQLite file:  rieko.db             created with non-root ownership
@@ -34,12 +51,7 @@ Never add the two secret files to the Compose YAML or commit them to Git.
 
 ## Prepare config and secret mounts
 
-Copy the non-secret example and edit its URL, store, network, and optional node:
-
-```sh
-cd deploy/docker
-cp config/rieko.json.example config/rieko.json
-```
+Edit `config/rieko.json` with the BTCPay URL, store, network, and optional node.
 
 The key reference inside `config/rieko.json` must remain the container path:
 
@@ -72,21 +84,68 @@ except that persistent volume and a small in-memory `/tmp`.
 
 ## Start, inspect, and stop
 
-Build and start the sidecar:
+Pull the published stable image and start it without a source build:
 
 ```sh
-docker compose up --build -d
+docker compose pull rieko-agent
+docker compose up --no-build -d rieko-agent
 docker compose ps
 docker compose logs -f rieko-agent
 ```
 
-Use the mounted API token with existing CLI read commands from the host:
+The Compose file defaults to `ghcr.io/comwanga/rieko:v0.1.1`. Set
+`RIEKO_AGENT_IMAGE` to another published tag or immutable digest when an
+explicitly validated upgrade is required. The retained `build` section is for
+repository development and CI; it is not used by this clean-host procedure.
+
+## Install the operator CLI
+
+The public container contains `rieko-agent`. Install the matching checksummed
+`rieko` operator CLI from the same GitHub Release without a source checkout or
+Rust toolchain:
+
+```sh
+RIEKO_VERSION=v0.1.1
+RIEKO_ASSET="rieko-${RIEKO_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+RIEKO_RELEASE="https://github.com/comwanga/rieko/releases/download/${RIEKO_VERSION}"
+
+curl -fLO "${RIEKO_RELEASE}/${RIEKO_ASSET}"
+curl -fLO "${RIEKO_RELEASE}/${RIEKO_ASSET}.sha256"
+sha256sum --check "${RIEKO_ASSET}.sha256"
+tar -xzf "${RIEKO_ASSET}"
+test "$(./rieko --version)" = "rieko 0.1.1"
+sudo install -o root -g root -m 0755 rieko /usr/local/bin/rieko
+rieko --version
+```
+
+The mounted API token is intentionally readable only by container UID 10001.
+Create a separate protected host-client copy without exposing its value on the
+command line:
+
+```sh
+install -d -m 0700 "${HOME}/.config/rieko"
+sudo install -o "$(id -u)" -g "$(id -g)" -m 0400 \
+  ./secrets/api-token "${HOME}/.config/rieko/api-token"
+```
+
+Update or remove that copy when rotating the mounted API token. Then run the
+read-only operator commands against the loopback API:
 
 ```sh
 rieko status --api-url http://127.0.0.1:8080 \
-  --token-file ./secrets/api-token
+  --token-file "${HOME}/.config/rieko/api-token"
+rieko inspect all --api-url http://127.0.0.1:8080 \
+  --token-file "${HOME}/.config/rieko/api-token"
 rieko doctor --api-url http://127.0.0.1:8080 \
-  --token-file ./secrets/api-token
+  --token-file "${HOME}/.config/rieko/api-token"
+```
+
+Without a separately installed CLI, verify the authenticated API directly:
+
+```sh
+API_TOKEN="$(sudo cat ./secrets/api-token)"
+curl --fail --header "Authorization: Bearer ${API_TOKEN}" \
+  http://127.0.0.1:8080/status
 ```
 
 Stop with the agent's existing graceful `SIGINT` path and keep SQLite data:

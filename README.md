@@ -161,16 +161,17 @@ For a container sidecar using the same configuration and secret-file semantics,
 see [the Docker Compose deployment example](docs/deploy-docker-compose.md).
 
 Tagged releases publish the non-root agent image as
-`ghcr.io/comwanga/rieko:<version>`. For example:
+`ghcr.io/comwanga/rieko:<version>`. The current stable image is
+`ghcr.io/comwanga/rieko:v0.1.1`. For example:
 
 ```sh
-docker pull ghcr.io/comwanga/rieko:v1.2.3
+docker pull ghcr.io/comwanga/rieko:v0.1.1
 docker run --rm --name rieko-agent \
   -p 127.0.0.1:8080:8080 \
   -v /etc/rieko:/etc/rieko:ro \
   -v /run/secrets:/run/secrets:ro \
   -v /var/lib/rieko:/var/lib/rieko \
-  ghcr.io/comwanga/rieko:v1.2.3 \
+  ghcr.io/comwanga/rieko:v0.1.1 \
   --config /etc/rieko/rieko.json \
   --db /var/lib/rieko/rieko.db \
   --token-file /run/secrets/rieko-api-token \
@@ -186,15 +187,20 @@ GHCR, verify the provenance and the registry-hosted SBOM attestation with:
 
 ```sh
 docker login ghcr.io
-gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.1 \
   --repo comwanga/rieko --bundle-from-oci
-gh attestation verify oci://ghcr.io/comwanga/rieko:v1.2.3 \
+gh attestation verify oci://ghcr.io/comwanga/rieko:v0.1.1 \
   --repo comwanga/rieko --bundle-from-oci \
   --predicate-type https://spdx.dev/Document/v2.3
 ```
 
 The signing identity comes from GitHub Actions OIDC; no repository signing key
 is required.
+
+The matching Linux x86_64 `rieko` operator CLI and its SHA-256 checksum are
+published on the same GitHub Release. See the
+[Docker Compose deployment guide](docs/deploy-docker-compose.md#install-the-operator-cli)
+for checksum verification and installation without a Rust toolchain.
 
 ## API endpoints
 
