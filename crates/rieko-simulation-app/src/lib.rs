@@ -1000,6 +1000,7 @@ mod tests {
             .evaluate(
                 &graph,
                 &DetectorContext {
+                    evaluated_at: chrono::Utc::now(),
                     network: BitcoinNetwork::Regtest,
                     history: None,
                     source: Some(&source),

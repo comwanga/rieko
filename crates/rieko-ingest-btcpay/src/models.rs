@@ -41,6 +41,8 @@ pub struct InvoiceSettledPayload {
     pub invoice_id: String,
     pub timestamp: i64,
     #[serde(default)]
+    pub manually_marked: Option<bool>,
+    #[serde(default)]
     pub payment_method: Option<String>,
     #[serde(default)]
     pub payment_method_id: Option<String>,
@@ -59,6 +61,8 @@ pub struct InvoicePaymentReceivedPayload {
     pub store_id: String,
     pub invoice_id: String,
     pub timestamp: i64,
+    #[serde(default)]
+    pub after_expiration: Option<bool>,
     #[serde(default)]
     pub payment_method: Option<String>,
     #[serde(default)]
@@ -80,7 +84,7 @@ pub struct InvoicePaymentData {
     pub payment_hash: Option<String>,
 }
 
-/// Webhook payload for `InvoiceExpired`.
+/// Webhook payload for `InvoiceExpired` and `InvoiceInvalid`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InvoiceExpiredPayload {
@@ -89,6 +93,10 @@ pub struct InvoiceExpiredPayload {
     pub store_id: String,
     pub invoice_id: String,
     pub timestamp: i64,
+    #[serde(default)]
+    pub partially_paid: Option<bool>,
+    #[serde(default)]
+    pub manually_marked: Option<bool>,
 }
 
 /// Server information from `GET /api/v1/server/info`.

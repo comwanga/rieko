@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use rieko_domain::NodeEvent;
-use rieko_storage::SqliteStorage;
+use rieko_storage::{MemoryStorage, SqliteStorage, Storage};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -14,6 +14,247 @@ fn compute_sig(secret: &[u8], payload: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).unwrap();
     mac.update(payload);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn webhook_request(secret: Option<&str>, payload: &[u8]) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/integrations/btcpay/webhook")
+        .header("content-type", "application/json");
+    if let Some(secret) = secret {
+        request = request.header("BTCPay-Sig", compute_sig(secret.as_bytes(), payload));
+    }
+    request.body(Body::from(payload.to_vec())).unwrap()
+}
+
+#[tokio::test]
+async fn signed_unsupported_event_is_ignored_and_recorded_without_detector_input() {
+    for storage in [
+        Box::new(MemoryStorage::new()) as Box<dyn Storage + Send>,
+        Box::new(SqliteStorage::in_memory().unwrap()),
+    ] {
+        let (tx, mut rx) = mpsc::channel(1);
+        let api = rieko_api::RiekoApi::new(storage)
+            .unwrap()
+            .with_btcpay_webhook("secret", tx);
+        let payload = br#"{"deliveryId":"ignored-1","webhookId":"webhook","type":"InvoiceCreated","timestamp":1724250000,"storeId":"store","invoiceId":"invoice"}"#;
+        let response = api
+            .router()
+            .oneshot(webhook_request(Some("secret"), payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["status"], "ignored");
+        assert_eq!(body["delivery_id"], "ignored-1");
+        assert!(rx.try_recv().is_err());
+        let mut storage = api.state.storage.lock().await;
+        assert!(storage.is_webhook_delivery_processed("ignored-1").unwrap());
+        assert!(storage.pending_webhook_events(10).unwrap().is_empty());
+        assert!(storage.latest_findings(10).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ignored_event_requires_authentication_and_a_valid_envelope() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let api = rieko_api::RiekoApi::new(Box::new(SqliteStorage::in_memory().unwrap()))
+        .unwrap()
+        .with_btcpay_webhook("secret", tx);
+    let app = api.router();
+    let valid = serde_json::json!({"deliveryId":"ignored-safe", "webhookId":"webhook",
+        "type":"InvoiceCreated", "timestamp":1724250000, "storeId":"store", "invoiceId":"invoice"});
+    let valid_bytes = serde_json::to_vec(&valid).unwrap();
+    for secret in [None, Some("wrong-secret")] {
+        let response = app
+            .clone()
+            .oneshot(webhook_request(secret, &valid_bytes))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let mut malformed = vec![b"{".to_vec()];
+    for field in ["deliveryId", "webhookId", "type", "timestamp", "storeId"] {
+        let mut payload = valid.clone();
+        payload.as_object_mut().unwrap().remove(field);
+        malformed.push(serde_json::to_vec(&payload).unwrap());
+        if field != "timestamp" {
+            payload[field] = " ".into();
+            malformed.push(serde_json::to_vec(&payload).unwrap());
+        }
+    }
+    let mut bad_telemetry = valid.clone();
+    bad_telemetry["type"] = "InvoiceSettled".into();
+    bad_telemetry.as_object_mut().unwrap().remove("invoiceId");
+    malformed.push(serde_json::to_vec(&bad_telemetry).unwrap());
+    for payload in malformed {
+        let response = app
+            .clone()
+            .oneshot(webhook_request(Some("secret"), &payload))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+    }
+    assert!(!api
+        .state
+        .storage
+        .lock()
+        .await
+        .is_webhook_delivery_processed("ignored-safe")
+        .unwrap());
+    let response = app
+        .oneshot(webhook_request(Some("secret"), &valid_bytes))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Rejected requests must not consume delivery identity"
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(api
+        .state
+        .storage
+        .lock()
+        .await
+        .pending_webhook_events(10)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn ignored_delivery_and_canonical_redelivery_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ignored-restart.db");
+    let original = br#"{"deliveryId":"ignored-original","webhookId":"webhook","type":"PayoutCreated","timestamp":1724250000,"storeId":"store","payoutId":"payout"}"#;
+    {
+        let (tx, mut rx) = mpsc::channel(1);
+        let api = rieko_api::RiekoApi::new(Box::new(SqliteStorage::open(&path).unwrap()))
+            .unwrap()
+            .with_btcpay_webhook("secret", tx);
+        let response = api
+            .router()
+            .oneshot(webhook_request(Some("secret"), original))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["status"], "ignored");
+        assert!(rx.try_recv().is_err());
+    }
+    let (tx, mut rx) = mpsc::channel(1);
+    let api = rieko_api::RiekoApi::new(Box::new(SqliteStorage::open(&path).unwrap()))
+        .unwrap()
+        .with_btcpay_webhook("secret", tx);
+    let app = api.router();
+    let redelivery = br#"{"deliveryId":"ignored-retry","originalDeliveryId":"ignored-original","isRedelivery":true,"webhookId":"webhook","type":"PayoutCreated","timestamp":1724250100,"storeId":"store","payoutId":"payout"}"#;
+    for payload in [original.as_slice(), redelivery.as_slice()] {
+        let response = app
+            .clone()
+            .oneshot(webhook_request(Some("secret"), payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["status"], "already_processed");
+        assert_eq!(value["delivery_id"], "ignored-original");
+    }
+    assert!(rx.try_recv().is_err());
+    let mut storage = api.state.storage.lock().await;
+    assert!(storage
+        .is_webhook_delivery_processed("ignored-original")
+        .unwrap());
+    assert!(!storage
+        .is_webhook_delivery_processed("ignored-retry")
+        .unwrap());
+    assert!(storage.pending_webhook_events(10).unwrap().is_empty());
+    assert!(storage
+        .recent_processed_webhook_events(10)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_ignored_deliveries_never_enqueue_telemetry() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let api = rieko_api::RiekoApi::new(Box::new(SqliteStorage::in_memory().unwrap()))
+        .unwrap()
+        .with_btcpay_webhook("secret", tx);
+    let app = api.router();
+    let payload = br#"{"deliveryId":"ignored-concurrent","webhookId":"webhook","type":"InvoiceCreated","timestamp":1724250000,"storeId":"store","invoiceId":"invoice"}"#;
+    let (first, second) = tokio::join!(
+        app.clone()
+            .oneshot(webhook_request(Some("secret"), payload)),
+        app.oneshot(webhook_request(Some("secret"), payload))
+    );
+    for response in [first.unwrap(), second.unwrap()] {
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert!(rx.try_recv().is_err());
+    let mut storage = api.state.storage.lock().await;
+    assert!(storage
+        .is_webhook_delivery_processed("ignored-concurrent")
+        .unwrap());
+    assert!(storage.pending_webhook_events(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ignored_delivery_is_not_acknowledged_when_persistence_fails_and_can_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ignored-write-failure.db");
+    let (tx, mut rx) = mpsc::channel(1);
+    let api = rieko_api::RiekoApi::new(Box::new(SqliteStorage::open(&path).unwrap()))
+        .unwrap()
+        .with_btcpay_webhook("secret", tx);
+    let app = api.router();
+    let mut blocker = SqliteStorage::open(&path).unwrap();
+    blocker.begin_transaction().unwrap();
+    let payload = br#"{"deliveryId":"ignored-recover","webhookId":"webhook","type":"InvoiceCreated","timestamp":1724250000,"storeId":"store","invoiceId":"invoice"}"#;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        app.clone()
+            .oneshot(webhook_request(Some("secret"), payload)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["error"]["code"], "persistence_failed");
+    assert!(!api
+        .state
+        .storage
+        .lock()
+        .await
+        .is_webhook_delivery_processed("ignored-recover")
+        .unwrap());
+    blocker.rollback_transaction().unwrap();
+    let response = app
+        .oneshot(webhook_request(Some("secret"), payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["status"], "ignored");
+    assert!(rx.try_recv().is_err());
+    let mut storage = api.state.storage.lock().await;
+    assert!(storage
+        .is_webhook_delivery_processed("ignored-recover")
+        .unwrap());
+    assert!(storage.pending_webhook_events(10).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -355,6 +596,7 @@ async fn webhook_queue_saturation_preserves_the_durable_event() {
 
     // Fill the 1-slot channel
     let dummy_event = rieko_domain::NodeEvent::InvoiceExpired(rieko_domain::InvoiceExpiredEvent {
+        partially_paid: None,
         id: "dummy".into(),
         store_id: None,
         amount_msat: None,

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use hmac::{Hmac, Mac};
 use rieko_domain::{
-    InvoiceExpiredEvent, InvoicePaymentReceivedEvent, InvoiceSettledEvent, NodeEvent,
+    InvoiceExpiredEvent, InvoiceInvalidEvent, InvoicePaymentReceivedEvent, InvoiceSettledEvent,
+    NodeEvent,
 };
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -100,8 +101,9 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
 
             let payment_hash = payload.payment.and_then(|p| p.payment_hash);
 
-            Ok(NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+            let event = InvoiceSettledEvent {
                 id: payload.invoice_id,
+                manually_marked: payload.manually_marked,
                 store_id: Some(payload.store_id),
                 payment_method: payload.payment_method.or(payload.payment_method_id),
                 amount_msat,
@@ -109,7 +111,12 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
                 timestamp,
                 payment_hash,
                 metadata: metadata_map,
-            }))
+            };
+            Ok(if envelope.event_type == "InvoiceProcessing" {
+                NodeEvent::InvoiceProcessing(event)
+            } else {
+                NodeEvent::InvoiceSettled(event)
+            })
         }
         "InvoiceReceivedPayment" => {
             let payload: InvoicePaymentReceivedPayload = serde_json::from_slice(payload_bytes)?;
@@ -130,6 +137,7 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
             Ok(NodeEvent::InvoicePaymentReceived(
                 InvoicePaymentReceivedEvent {
                     id: payload.invoice_id,
+                    after_expiration: payload.after_expiration,
                     store_id: Some(payload.store_id),
                     payment_method: payload.payment_method,
                     amount_msat,
@@ -140,16 +148,23 @@ pub fn normalize_webhook_payload(payload_bytes: &[u8]) -> Result<NodeEvent, BtcP
         }
         "InvoiceExpired" | "InvoiceInvalid" => {
             let payload: InvoiceExpiredPayload = serde_json::from_slice(payload_bytes)?;
+            if envelope.event_type == "InvoiceInvalid" {
+                return Ok(NodeEvent::InvoiceInvalid(InvoiceInvalidEvent {
+                    id: payload.invoice_id,
+                    store_id: Some(payload.store_id),
+                    manually_marked: payload.manually_marked,
+                    timestamp,
+                }));
+            }
             Ok(NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
                 id: payload.invoice_id,
+                partially_paid: payload.partially_paid,
                 store_id: Some(payload.store_id),
                 amount_msat: None,
                 timestamp,
             }))
         }
-        other_type => Err(BtcPayError::MalformedPayload(format!(
-            "unsupported or non-telemetry webhook event type: {other_type}"
-        ))),
+        other_type => Err(BtcPayError::UnsupportedWebhookEventType(other_type.into())),
     }
 }
 

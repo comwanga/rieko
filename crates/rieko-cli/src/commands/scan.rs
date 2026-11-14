@@ -96,6 +96,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let observation_source = source.observation_source()?;
     let normalizer = source.normalizer();
     let detector_context = rieko_detectors::DetectorContext {
+        evaluated_at: chrono::Utc::now(),
         network: source.network,
         history: None,
         source: Some(&observation_source),

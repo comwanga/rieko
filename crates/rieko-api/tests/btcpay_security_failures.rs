@@ -95,7 +95,7 @@ async fn failure_mode_malformed_json_body_rejected_before_normalization() {
 }
 
 #[tokio::test]
-async fn failure_mode_unknown_event_type_fails_closed_without_escape_hatch() {
+async fn signed_unknown_event_is_ignored_without_telemetry_and_still_requires_authentication() {
     let (tx, mut rx) = mpsc::channel(16);
     let secret = "test-webhook-secret-123";
 
@@ -123,12 +123,42 @@ async fn failure_mode_unknown_event_type_fails_closed_without_escape_hatch() {
         .body(Body::from(unknown_type_payload.to_vec()))
         .unwrap();
 
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(val["error"]["code"], "normalization_failed");
+    assert_eq!(val["status"], "ignored");
+    assert!(api
+        .state
+        .storage
+        .lock()
+        .await
+        .is_webhook_delivery_processed("del-unknown-type")
+        .unwrap());
+    assert!(api
+        .state
+        .storage
+        .lock()
+        .await
+        .pending_webhook_events(10)
+        .unwrap()
+        .is_empty());
+
+    // Deduplication must never acknowledge an unauthenticated request, even
+    // when the canonical identity is already in the ledger.
+    let forged = Request::builder()
+        .method("POST")
+        .uri("/api/v1/integrations/btcpay/webhook")
+        .header("content-type", "application/json")
+        .header(
+            "BTCPay-Sig",
+            compute_sig(b"wrong-secret", unknown_type_payload),
+        )
+        .body(Body::from(unknown_type_payload.to_vec()))
+        .unwrap();
+    let response = app.oneshot(forged).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     // Zero domain events enqueued
     assert!(rx.try_recv().is_err());

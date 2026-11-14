@@ -58,6 +58,7 @@ fn lightning_settlement_reliability_degradation_e2e_pipeline() {
     // 2. Ingest BTCPay Temporal Webhook Events (4 expired invoices, 1 settled invoice)
     let events = vec![
         NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+            manually_marked: Some(false),
             id: "btcpay-inv-101".into(),
             store_id: Some("merchant-store-main".into()),
             payment_method: Some("BTC-LightningLike".into()),
@@ -68,24 +69,28 @@ fn lightning_settlement_reliability_degradation_e2e_pipeline() {
             metadata: std::collections::HashMap::new(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "btcpay-inv-102".into(),
             store_id: Some("merchant-store-main".into()),
             amount_msat: Some(100_000_000),
             timestamp: Utc::now(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "btcpay-inv-103".into(),
             store_id: Some("merchant-store-main".into()),
             amount_msat: Some(250_000_000),
             timestamp: Utc::now(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "btcpay-inv-104".into(),
             store_id: Some("merchant-store-main".into()),
             amount_msat: Some(80_000_000),
             timestamp: Utc::now(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "btcpay-inv-105".into(),
             store_id: Some("merchant-store-main".into()),
             amount_msat: Some(150_000_000),
@@ -108,6 +113,7 @@ fn lightning_settlement_reliability_degradation_e2e_pipeline() {
     };
 
     let ctx = DetectorContext {
+        evaluated_at: chrono::Utc::now(),
         network: BitcoinNetwork::Mainnet,
         history: None,
         source: Some(&btcpay_source),
@@ -128,7 +134,7 @@ fn lightning_settlement_reliability_degradation_e2e_pipeline() {
 
     let finding = &cycle.findings[0];
     assert_eq!(finding.detector, "settlement_reliability");
-    assert_eq!(finding.detector_version, "1");
+    assert_eq!(finding.detector_version, "2");
     assert_eq!(finding.severity, Severity::Critical);
     assert_eq!(finding.node.as_deref(), Some(local_node_str));
     assert_eq!(finding.channel.as_deref(), Some(drained_channel_id));

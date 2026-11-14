@@ -17,6 +17,9 @@ pub enum BtcPayError {
     #[error("malformed payload: {0}")]
     MalformedPayload(String),
 
+    #[error("unsupported webhook event type: {0}")]
+    UnsupportedWebhookEventType(String),
+
     #[error("Greenfield API error (status {status}): {message}")]
     Api { status: u16, message: String },
 
@@ -36,6 +39,11 @@ impl From<BtcPayError> for rieko_domain::IngestionError {
             BtcPayError::Http(e) => rieko_domain::IngestionError::Connection(e.to_string()),
             BtcPayError::Json(e) => rieko_domain::IngestionError::Normalization(e.to_string()),
             BtcPayError::MalformedPayload(msg) => rieko_domain::IngestionError::Normalization(msg),
+            BtcPayError::UnsupportedWebhookEventType(event_type) => {
+                rieko_domain::IngestionError::Normalization(format!(
+                    "unsupported webhook event type: {event_type}"
+                ))
+            }
             BtcPayError::Api { status, message } => {
                 if status == 401 || status == 403 {
                     rieko_domain::IngestionError::Authentication(message)

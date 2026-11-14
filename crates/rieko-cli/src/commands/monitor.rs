@@ -267,6 +267,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 
         let observation_source = source.observation_source()?;
         let ctx = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: source.network,
             history: Some(&history),
             source: Some(&observation_source),

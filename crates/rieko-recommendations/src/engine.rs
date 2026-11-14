@@ -84,10 +84,10 @@ struct LiquidityTrendInput {
 
 struct SettlementReliabilityInput {
     channel: Option<String>,
-    expired_invoices: f64,
+    failed_invoices: f64,
     settled_invoices: f64,
     failure_rate: f64,
-    chain_synchronized: bool,
+    chain_synchronized: Option<bool>,
     root_cause: String,
     evidence_refs: Vec<String>,
 }
@@ -217,7 +217,7 @@ impl RecommendationEngine {
     ) -> Vec<Recommendation> {
         let SettlementReliabilityInput {
             channel,
-            expired_invoices,
+            failed_invoices,
             settled_invoices,
             failure_rate,
             chain_synchronized,
@@ -227,21 +227,23 @@ impl RecommendationEngine {
 
         let target_chan = channel.unwrap_or_else(|| "primary-routing-path".to_string());
 
-        let summary = if chain_synchronized {
+        let summary = if chain_synchronized == Some(true) {
             format!(
-                "Lightning invoice settlement degradation detected: {:.1}% failure rate ({} expired, {} settled). \
+                "Lightning invoice settlement degradation detected: {:.1}% failure rate ({} failed, {} settled). \
                  Bitcoin Core node is synchronized; rebalance channel {} to restore outbound liquidity on merchant settlement paths.",
                 failure_rate * 100.0,
-                expired_invoices as u64,
+                failed_invoices as u64,
                 settled_invoices as u64,
                 target_chan
             )
-        } else {
+        } else if chain_synchronized == Some(false) {
             format!(
                 "Invoice settlement failure rate is elevated ({:.1}% failure rate). \
                  Bitcoin Core is not synchronized; verify chain synchronization before executing Lightning rebalances.",
                 failure_rate * 100.0
             )
+        } else {
+            format!("Invoice settlement failures were observed for {} of {} eligible invoices ({:.1}% failure rate). Core synchronization has not been observed; investigate the invoice and channel evidence before acting.", failed_invoices as u64, (failed_invoices + settled_invoices) as u64, failure_rate * 100.0)
         };
 
         vec![Recommendation {
@@ -253,7 +255,8 @@ impl RecommendationEngine {
                 serde_json::json!({
                     "reason": "lightning invoice settlement reliability degradation",
                     "failure_rate": failure_rate,
-                    "expired_invoices": expired_invoices,
+                    "failed_invoices": failed_invoices,
+                    "expired_invoices": finding.evidence_value("expired_invoices"),
                     "settled_invoices": settled_invoices,
                     "chain_synchronized": chain_synchronized,
                     "root_cause": root_cause,
@@ -355,19 +358,30 @@ impl LiquidityTrendInput {
 
 impl SettlementReliabilityInput {
     fn parse(finding: &Finding) -> Result<Self, RecommendationEngineError> {
-        validate_common(finding)?;
-        let expired_invoices = required_nonnegative_number(finding, "expired_invoices")?;
+        let version = validate_common(finding)?;
+        let failed_invoices = required_nonnegative_number(
+            finding,
+            if version == 2 {
+                "failed_invoices"
+            } else {
+                "expired_invoices"
+            },
+        )?;
         let settled_invoices = required_nonnegative_number(finding, "settled_invoices")?;
         let failure_rate = required_ratio(finding, "failure_rate")?;
         let chain_sync_str = required_nonempty_text(finding, "chain_synchronized")?;
-        let chain_synchronized = chain_sync_str == "true";
+        let chain_synchronized = match chain_sync_str {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
         let root_cause = required_nonempty_text(finding, "root_cause")?.to_string();
 
         let channel = finding.channel.clone().filter(|c| !c.trim().is_empty());
 
         Ok(Self {
             channel,
-            expired_invoices,
+            failed_invoices,
             settled_invoices,
             failure_rate,
             chain_synchronized,
@@ -1135,5 +1149,42 @@ mod tests {
             rec.rationale.actionability,
             Actionability::OperatorActionable
         );
+    }
+
+    #[test]
+    fn v2_settlement_consumer_uses_all_failures_and_preserves_unknown_chain_state() {
+        let now = chrono::Utc::now();
+        let finding = Finding {
+            id: "settlement-v2".into(),
+            detector: "settlement_reliability".into(),
+            detector_version: "2".into(),
+            schema_version: FINDING_SCHEMA_VERSION,
+            severity: Severity::Warning,
+            node: Some("node".into()),
+            channel: None,
+            evidence: vec![
+                Evidence::number("failed_invoices", 2.0),
+                Evidence::number("expired_invoices", 0.0),
+                Evidence::number("settled_invoices", 1.0),
+                Evidence::number("failure_rate", 2.0 / 3.0),
+                Evidence::string("chain_synchronized", "unknown"),
+                Evidence::string("root_cause", "undetermined"),
+            ],
+            provenance: None,
+            explanation: None,
+            timestamp: now,
+            first_seen_at: now,
+            last_seen_at: now,
+            lifecycle: FindingLifecycle::Active,
+        };
+        let recommendations = RecommendationEngine.recommend(&finding).unwrap();
+        assert_eq!(recommendations.len(), 1);
+        let action = &recommendations[0].action;
+        assert!(action.summary.contains("2 of 3 eligible invoices"));
+        assert!(action.summary.contains("has not been observed"));
+        assert!(!action.summary.contains("not synchronized"));
+        assert_eq!(action.params["failed_invoices"], 2.0);
+        assert_eq!(action.params["expired_invoices"], 0.0);
+        assert!(action.params["chain_synchronized"].is_null());
     }
 }

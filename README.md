@@ -236,6 +236,7 @@ to 5 requests per second.
 Rieko supports ingestion from BTCPay Server Greenfield:
 - **Webhook Ingestion**: Real-time event streaming (`InvoiceSettled`, `InvoiceExpired`, `InvoicePaymentReceived`) via `POST /api/v1/integrations/btcpay/webhook` with constant-time HMAC-SHA256 signature verification (`BTCPay-Sig`).
 - **Finding Pipeline**: `rieko-agent` owns the long-running webhook, detector, persistence, and local API runtime. `rieko serve` delegates to that same implementation for compatibility. When configured with the webhook secret, network, and node scope, normalized invoice events feed the deterministic settlement-reliability detector and findings are persisted for `GET /findings` and the API-backed `rieko findings` command. The endpoint fails closed when this integration is not configured.
+- **Unsupported events**: The first delivery of a correctly signed, well-formed webhook envelope for an event type Rieko does not consume returns HTTP 200 with `status: "ignored"`. Its delivery ID is recorded for durable deduplication, and no event reaches the detector. Redeliveries use the existing `already_processed` response. Malformed payloads and invalid signatures remain rejected.
 - **REST Client**: Asynchronous polling of Lightning info, channels, balances, on-chain wallets, and invoices.
 - **Normalized Ingestion Adapter**: Pluggable `NodeIngestionAdapter` yielding an asynchronous stream of normalized domain `NodeEvent` and `NodeSnapshot` objects.
 
@@ -304,7 +305,7 @@ LND / BTCPay / Core ──▶ Ingestion Adapters ──▶ Normalized Domain Eve
 |----------|----|----------------|
 | Liquidity | `channel_liquidity` | Channels imbalanced below threshold (outbound/inbound/severely drained) |
 | Drift | `liquidity_trend` | Channels trending toward drain over multiple snapshots |
-| Settlement reliability | `settlement_reliability` | Repeated BTCPay invoice settlement failures in the bounded event window |
+| Settlement reliability | `settlement_reliability` | Distinct invoices with payment-supported failures in a configurable 60-minute window; [v2 semantics](docs/settlement-reliability.md) |
 | BTCPay backend health | `btcpay_backend_health` | Persisted Greenfield connectivity is degraded |
 | Bitcoin Core sync correlation | `bitcoin_core_sync_correlation` | BTCPay and Core are reachable, but persisted Core state is unsynchronized |
 | Lightning chain sync correlation | `lightning_chain_sync_correlation` | BTCPay and synchronized Core are reachable, but persisted LND state is not synced to chain |
