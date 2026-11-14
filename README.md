@@ -61,14 +61,16 @@ npm run check
 npm run build
 npx --no-install playwright install chromium
 cd ..
-cargo build -p rieko-cli --bin rieko-agent
+cargo build -p rieko-cli
 cd frontend
 npm run test:browser
 ```
 
 On Linux CI, install Chromium's system dependencies with
-`npx --no-install playwright install --with-deps chromium`. Failure traces,
-screenshots and agent logs are written to `frontend/test-results/`.
+`npx --no-install playwright install --with-deps chromium`. The browser suite
+disables request traces to avoid recording bearer headers. Failure screenshots
+and status/error artifacts remain in `frontend/test-results/`; agent diagnostics
+are attached to the test report. Tests use synthetic tokens only.
 
 ### Fixture scan (no LND)
 
@@ -114,6 +116,27 @@ Snapshot retention is configurable with `--retention-days` (default 30),
 `--closed-retention-days` (default 3), and `--cleanup-interval` (default 6h).
 
 ### Serve API and UI
+
+Each UI view has its own address (`#/overview`, `#/findings`,
+`#/recommendations`, `#/simulations`, `#/channels`, `#/audit`), so views can be
+bookmarked and the browser's back and forward buttons work. The UI is dark by
+default; the button in the top bar switches to a light theme and the choice is
+remembered in this browser's `localStorage` (it is a display preference, not a
+credential).
+
+When the API requires authentication, the UI prompts for the raw token from your
+configured token file. A successful check remembers it in `sessionStorage` for
+that browser tab and origin, including reloads and session restores. Same-origin
+JavaScript can access this storage; it is not a memory-only secret store. If
+storage is unavailable, the UI can use the token in memory and reports that limit.
+Tokens are never placed in URLs or `localStorage`. A configured API base must
+remain on the UI's origin to receive a token; same-origin path prefixes work.
+
+Use **Forget token** to clear this page's credential and cached data and remove
+the app's saved token. If storage removal fails, the UI reports that a saved value
+may remain; clear the site's session data before reloading, or restore storage
+access and retry Forget. Forget does not revoke the server's token or undo an
+already accepted request. Requests are not automatically replayed after login.
 
 ```sh
 # Loopback (safe default)

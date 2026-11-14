@@ -1,51 +1,173 @@
+/* Design tokens. The dark surfaces are sampled from the approved reference
+   image; text colours are chosen to meet WCAG 2.2 AA contrast on them. The
+   light theme keeps the previous palette. */
 :root {
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-  color-scheme: light dark;
-  color: #1a1a2e;
-  background: #f4f5f7;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --radius: 8px;
+
+  --bg: #090f15;
+  --surface-sidebar: #0a1016;
+  --surface-topbar: #0d1319;
+  --surface-card: #11181f;
+  --surface-input: #1c242c;
+  --surface-active: #1e3044;
+  --text-on-active: #ffffff;
+  --border: #1c232b;
+  --border-strong: #5b6b7c;
+  --text: #e6edf3;
+  --text-muted: #9aa7b4;
+  --accent: #6cb0ff;
+  --focus: #8cc4ff;
+  --critical-bg: #4a1c1c;
+  --critical-text: #ffb3ad;
+  --warning-bg: #46300c;
+  --warning-text: #ffd089;
+  --info-bg: #17334d;
+  --info-text: #a5d3ff;
+  --scrim: rgba(0, 0, 0, 0.6);
+
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --surface-sidebar: #ffffff;
+  --surface-topbar: #ffffff;
+  --surface-card: #ffffff;
+  --surface-input: #ffffff;
+  --surface-active: #1a1a2e;
+  --text-on-active: #ffffff;
+  --border: #e2e4ea;
+  --border-strong: #6b7280;
+  --text: #1a1a2e;
+  --text-muted: #5b6472;
+  --accent: #1d4ed8;
+  --focus: #1d4ed8;
+  --critical-bg: #fdecea;
+  --critical-text: #b42318;
+  --warning-bg: #fef4e6;
+  --warning-text: #b54708;
+  --info-bg: #e8f4fd;
+  --info-text: #026aa2;
+  --scrim: rgba(0, 0, 0, 0.35);
+
+  color-scheme: light;
 }
 
 body {
   margin: 0;
+  background: var(--bg);
 }
 
 a {
   color: inherit;
 }
 
-main {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 1.5rem;
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
-h1 {
-  font-size: 1.4rem;
+.layout {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+main {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  padding: var(--space-5);
+}
+
+/* Programmatic focus targets (skip target and the view heading after
+   navigation) are not controls, so they do not draw a focus ring. */
+main:focus,
+main h2[tabindex="-1"]:focus {
+  outline: none;
+}
+
+.skip {
+  left: -999rem;
+  position: absolute;
+  top: var(--space-2);
+  z-index: 20;
+}
+
+.skip:focus {
+  left: var(--space-2);
+}
+
+@media (max-width: 1023.98px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+  }
+
+  main {
+    padding: var(--space-4);
+  }
 }
 
 h2 {
   font-size: 1.1rem;
-  margin-top: 2rem;
+  margin-top: 0;
+}
+
+button,
+input,
+select {
+  background: var(--surface-input);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+button {
+  cursor: pointer;
+  padding: 0.35rem 0.8rem;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+  gap: var(--space-3);
 }
 
 .card {
-  background: #fff;
-  border: 1px solid #e2e4ea;
-  border-radius: 8px;
-  padding: 0.75rem 1rem;
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
 }
 
 .kv {
   display: flex;
+  gap: var(--space-3);
   justify-content: space-between;
   font-size: 0.85rem;
-  margin-bottom: 0.25rem;
+  margin-bottom: var(--space-1);
 }
 
 table {
@@ -58,7 +180,7 @@ th,
 td {
   text-align: left;
   padding: 0.45rem 0.6rem;
-  border-bottom: 1px solid #eceef2;
+  border-bottom: 1px solid var(--border);
 }
 
 .tag {
@@ -69,21 +191,21 @@ td {
 }
 
 .critical {
-  background: #fdecea;
-  color: #b42318;
+  background: var(--critical-bg);
+  color: var(--critical-text);
 }
 
 .warning {
-  background: #fef4e6;
-  color: #b54708;
+  background: var(--warning-bg);
+  color: var(--warning-text);
 }
 
 .info {
-  background: #e8f4fd;
-  color: #026aa2;
+  background: var(--info-bg);
+  color: var(--info-text);
 }
 
 .muted {
-  color: #6b7280;
+  color: var(--text-muted);
   font-size: 0.8rem;
 }

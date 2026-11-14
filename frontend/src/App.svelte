@@ -1,5 +1,11 @@
 <script lang="ts">
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
+  import { onDestroy, tick } from "svelte";
+  import { AuthenticationError, authState, initializeAuth } from "./lib/auth";
+  import { route, startRouter } from "./lib/router";
+  import Sidebar from "./lib/Sidebar.svelte";
+  import TokenPrompt from "./lib/TokenPrompt.svelte";
+  import TopBar from "./lib/TopBar.svelte";
   import Findings from "./pages/Findings.svelte";
   import Snapshots from "./pages/Snapshots.svelte";
   import Status from "./pages/Status.svelte";
@@ -7,65 +13,63 @@
   import Recommendations from "./pages/Recommendations.svelte";
   import Simulations from "./pages/Simulations.svelte";
 
-  const queryClient = new QueryClient();
+  initializeAuth();
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: (failures, error) => !(error instanceof AuthenticationError) && failures < 3 } },
+  });
+  let observedGeneration = -1;
+  const unsubscribe = authState.subscribe(state => {
+    if (state.generation !== observedGeneration) {
+      queryClient.clear();
+      observedGeneration = state.generation;
+    }
+  });
 
-  type Tab = "status" | "findings" | "recommendations" | "simulations" | "snapshots" | "audit";
-  let tab: Tab = "status";
+  let content: HTMLElement;
+  // After the reader chooses a view, move focus to its heading so keyboard and
+  // screen-reader users land on the new content. Not done on the initial load.
+  async function focusView() {
+    await tick();
+    const heading = content?.querySelector<HTMLElement>("h2");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
+  }
+  const stopRouter = startRouter(focusView);
+  onDestroy(() => { stopRouter(); unsubscribe(); queryClient.clear(); });
 </script>
 
 <QueryClientProvider client={queryClient}>
-  <main>
-    <header>
-      <h1>Rieko</h1>
-      <nav>
-        <button class:active={tab === "status"} on:click={() => (tab = "status")}>Overview</button>
-        <button class:active={tab === "findings"} on:click={() => (tab = "findings")}>Findings</button>
-        <button class:active={tab === "recommendations"} on:click={() => (tab = "recommendations")}>Recommendations</button>
-        <button class:active={tab === "simulations"} on:click={() => (tab = "simulations")}>Simulations</button>
-        <button class:active={tab === "snapshots"} on:click={() => (tab = "snapshots")}>Channels</button>
-        <button class:active={tab === "audit"} on:click={() => (tab = "audit")}>Audit</button>
-      </nav>
-    </header>
-
-    {#if tab === "status"}
-      <Status />
-    {:else if tab === "findings"}
-      <Findings />
-    {:else if tab === "recommendations"}
-      <Recommendations />
-    {:else if tab === "simulations"}
-      <Simulations />
-    {:else if tab === "snapshots"}
-      <Snapshots />
-    {:else}
-      <Audit />
-    {/if}
-  </main>
+  <button class="skip" on:click={() => content.focus()}>Skip to content</button>
+  <div class="layout">
+    <Sidebar onReselect={focusView} />
+    <div class="content">
+      <TopBar />
+      <main bind:this={content} tabindex="-1">
+        {#if $authState.storage === "clear-failed"}
+          <p class="critical" role="alert">Browser storage could not be cleared; a saved token may remain. Clear this site's session data before reloading, or retry Forget token after restoring storage access. {#if $authState.hasToken}The current token is held in memory.{/if}</p>
+        {:else if $authState.storage === "memory"}
+          <p class="muted" role="status">Session storage is unavailable. This page will use memory for the token.</p>
+        {/if}
+        {#key $authState.generation}
+        {#if $authState.required}
+          <TokenPrompt />
+        {:else if $route === "overview"}
+          <Status />
+        {:else if $route === "findings"}
+          <Findings />
+        {:else if $route === "recommendations"}
+          <Recommendations />
+        {:else if $route === "simulations"}
+          <Simulations />
+        {:else if $route === "channels"}
+          <Snapshots />
+        {:else}
+          <Audit />
+        {/if}
+        {/key}
+      </main>
+    </div>
+  </div>
 </QueryClientProvider>
-
-<style>
-  header {
-    display: flex;
-    align-items: center;
-    gap: 1.5rem;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-  }
-  nav {
-    display: flex;
-    gap: 0.25rem;
-    flex-wrap: wrap;
-  }
-  button {
-    border: 1px solid transparent;
-    background: transparent;
-    border-radius: 6px;
-    padding: 0.35rem 0.8rem;
-    cursor: pointer;
-    font-size: 0.9rem;
-  }
-  button.active {
-    background: #1a1a2e;
-    color: #fff;
-  }
-</style>

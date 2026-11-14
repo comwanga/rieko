@@ -54,8 +54,10 @@ jobs:
         run: cargo test -p rieko-api --test embedded_ui
       - name: Build & test
         run: cargo test --workspace --all-features
-      - name: Build browser-test agent
-        run: cargo build -p rieko-cli --bin rieko-agent
+      # The browser suite runs the agent and seeds data with the `rieko` CLI.
+      # Build both binaries here rather than relying on an earlier step.
+      - name: Build browser-test binaries
+        run: cargo build -p rieko-cli
       - name: Install Chromium
         working-directory: frontend
         run: npx --no-install playwright install --with-deps chromium

@@ -26,7 +26,7 @@
   {@const status = $q.data}
   {@const counts = status.counts}
   <p class="muted">
-    {status.engine} v{status.version} \xb7 schema {status.schema_version} \xb7
+    {status.engine} v{status.version} · schema {status.schema_version} ·
     {status.read_only ? "node read-only" : "node mutation capable"}
   </p>
   <div class="grid">

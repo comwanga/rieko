@@ -2,7 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: "browser-smoke.spec.ts",
+  testMatch: ["browser-smoke.spec.ts", "api-auth.spec.ts"],
   timeout: 30_000,
   globalTimeout: 120_000,
   workers: 1,

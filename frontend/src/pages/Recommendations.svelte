@@ -206,20 +206,20 @@
 
 <style>
 .overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+  position: fixed; inset: 0; background: var(--scrim);
   display: flex; align-items: center; justify-content: center;
   z-index: 10;
 }
 .overlay-card {
-  background: #fff; border-radius: 8px; padding: 1.5rem;
+  background: var(--surface-card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem;
   max-width: 520px; width: 90%; max-height: 90vh; overflow-y: auto;
 }
 .form-group { margin: 0.75rem 0; }
 .form-group label { display: block; font-size: 0.85rem; margin-bottom: 0.25rem; }
 select, input[type="number"] {
-  width: 100%; padding: 0.4rem 0.5rem; border: 1px solid #e2e4ea; border-radius: 6px;
+  width: 100%; padding: 0.4rem 0.5rem; border: 1px solid var(--border-strong); border-radius: 6px;
   font-size: 0.85rem;
 }
 .form-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
-.btn-secondary { background: #f0f1f4; color: #1a1a2e; border: 1px solid #d0d3db; }
+.btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--border-strong); }
 </style>
