@@ -28,6 +28,10 @@
   --warning-text: #ffd089;
   --info-bg: #17334d;
   --info-text: #a5d3ff;
+  --ok-bg: #18422c;
+  --ok-text: #8fe3a6;
+  --neutral-bg: #1c242c;
+  --neutral-text: #c3ccd5;
   --scrim: rgba(0, 0, 0, 0.6);
 
   color-scheme: dark;
@@ -56,6 +60,10 @@
   --warning-text: #b54708;
   --info-bg: #e8f4fd;
   --info-text: #026aa2;
+  --ok-bg: #e7f6ec;
+  --ok-text: #146c2e;
+  --neutral-bg: #eef0f3;
+  --neutral-text: #3f4753;
   --scrim: rgba(0, 0, 0, 0.35);
 
   color-scheme: light;
@@ -208,4 +216,33 @@ td {
 .muted {
   color: var(--text-muted);
   font-size: 0.8rem;
+}
+
+/* State badges. Kinds come from lib/overview.ts. */
+.badge {
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.6rem;
+  white-space: nowrap;
+}
+
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+
+.badge.warning {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.badge.critical {
+  background: var(--critical-bg);
+  color: var(--critical-text);
+}
+
+.badge.neutral {
+  background: var(--neutral-bg);
+  color: var(--neutral-text);
 }

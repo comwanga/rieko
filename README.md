@@ -124,6 +124,14 @@ default; the button in the top bar switches to a light theme and the choice is
 remembered in this browser's `localStorage` (it is a display preference, not a
 credential).
 
+The Overview shows one card each for Bitcoin Core, LND, BTCPay Server and Rieko,
+plus the active findings. Service cards report only what the agent has observed:
+**Not observed** (no poll recorded), **Never connected** (polls attempted, none
+succeeded), **Connected**, or **Disconnected** (the values shown are the last ones
+seen). The Rieko card and the top-bar pill show the agent's own pipeline state from
+`/status`; it does not yet account for Bitcoin Core or LND reachability, so it is
+never presented as the health of every system.
+
 When the API requires authentication, the UI prompts for the raw token from your
 configured token file. A successful check remembers it in `sessionStorage` for
 that browser tab and origin, including reloads and session restores. Same-origin

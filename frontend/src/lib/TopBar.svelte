@@ -1,12 +1,16 @@
 <script lang="ts">
   import { authState, forgetToken } from "./auth";
   import Icon from "./Icon.svelte";
+  import StatusPill from "./StatusPill.svelte";
   import { setTheme, theme } from "./theme";
 
   $: next = $theme === "dark" ? ("light" as const) : ("dark" as const);
 </script>
 
 <header>
+  {#if !$authState.required}
+    {#key $authState.generation}<StatusPill />{/key}
+  {/if}
   {#if $authState.hasToken || $authState.required || $authState.storage === "clear-failed"}
     <button on:click={forgetToken}>Forget token</button>
   {/if}

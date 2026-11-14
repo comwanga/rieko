@@ -1,7 +1,8 @@
 import { expect, test, type TestInfo } from "@playwright/test";
 import { execFile, spawn } from "node:child_process";
 import { access, mkdir, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer, type AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,7 @@ async function withAgent(
   run: (url: string) => Promise<void>,
   token?: string,
   seed = false,
+  extraArgs: string[] = [],
 ) {
   const binary = join(repo, "target/debug", process.platform === "win32" ? "rieko-agent.exe" : "rieko-agent");
   await access(binary);
@@ -56,6 +58,7 @@ async function withAgent(
     args.push("--token-file", tokenFile);
   }
   if (mode === "static") args.push("--static-dir", join(repo, "frontend/dist"));
+  args.push(...extraArgs);
   const agent = spawn(binary, args, {
     cwd: directory, env: environment, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
   });
@@ -249,6 +252,7 @@ const TEXT = [
   "aside a", "aside p", "aside h1", "aside button", "header button",
   "main h2", "main h3", "main h4", "main p", "main th", "main td", "main label", "main button",
   "main input", "main select", "main code", "main .tag", "main .kv > span",
+  "main dt", "main dd", "main li", "main a", "main .badge", "main small", "header a",
 ].join(", ");
 
 /** WCAG contrast of each visible, enabled text element against its effective background. */
@@ -535,6 +539,327 @@ test.describe("application shell", () => {
   });
 });
 
+// ─── Overview (MS-2.3b) ───
+
+const PIPELINE: Record<string, string> = {
+  healthy: "Healthy", degraded: "Degraded", unhealthy: "Unhealthy", not_initialized: "Not initialized",
+};
+const SERVICES = ["Bitcoin Core", "LND", "BTCPay Server"] as const;
+
+/** A card's term/definition pairs, keyed by term. */
+async function cardValues(page: Page, name: string) {
+  const card = page.getByRole("region", { name: "System health", exact: true }).getByRole("region", { name, exact: true });
+  const terms = await card.getByRole("term").allTextContents();
+  const values = await card.getByRole("definition").allTextContents();
+  expect(values.length).toBe(terms.length);
+  return Object.fromEntries(terms.map((term, index) => [term.trim(), values[index].trim()]));
+}
+
+function card(page: Page, name: string) {
+  return page.getByRole("region", { name: "System health", exact: true }).getByRole("region", { name, exact: true });
+}
+
+interface MockSource { url: string; stop(): Promise<void> }
+
+/** A loopback JSON server standing in for a real service. Its responses follow our
+    reading of each service's API; only the regtest workflow checks real services. */
+async function mockSource(respond: (method: string, path: string) => unknown): Promise<MockSource> {
+  const server = createHttpServer((request, response) => {
+    request.resume();
+    const body = respond(request.method ?? "GET", new URL(request.url ?? "/", "http://mock").pathname);
+    if (body === undefined) response.writeHead(404).end();
+    else response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+  });
+  await new Promise<void>(ready => server.listen(0, "127.0.0.1", ready));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    stop: () => new Promise<void>(done => { server.closeAllConnections(); server.close(() => done()); }),
+  };
+}
+
+const CORE_RESULT = { chain: "regtest", blocks: 250, headers: 250, initialblockdownload: false };
+const LND_INFO = {
+  identity_pubkey: `02${"ab".repeat(32)}`, alias: "mock-node", version: "0.18.5-beta",
+  chains: [{ chain: "bitcoin", network: "regtest" }], synced_to_chain: true,
+  num_active_channels: 3, num_inactive_channels: 1,
+};
+
+const mockCore = () => mockSource(method => method === "POST"
+  ? { result: CORE_RESULT, error: null, id: "rieko-core-observation" } : undefined);
+const mockLnd = () => mockSource((_, path) => path === "/v1/getinfo" ? LND_INFO : undefined);
+const mockBtcPay = () => mockSource((_, path) => {
+  if (path === "/api/v1/server/info") return { version: "2.1.0", supportedPaymentMethods: ["BTC"], fullySynced: true };
+  if (path.endsWith("/lightning/BTC/info")) return { nodeURIs: [`${LND_INFO.identity_pubkey}@127.0.0.1:9735`], blockHeight: 250 };
+  if (path.endsWith("/lightning/BTC/channels")) return [];
+  if (path.endsWith("/onchain/BTC/wallet")) return { balance: "0", confirmedBalance: "0", unconfirmedBalance: "0" };
+  return undefined;
+});
+
+/** Agent flags for the given mock sources, with synthetic credentials in files. */
+async function sourceArgs(info: TestInfo, sources: { core?: string; lnd?: string; btcpay?: string }) {
+  const directory = info.outputPath("sources");
+  await mkdir(directory, { recursive: true });
+  const args: string[] = [];
+  if (sources.core) {
+    await writeFile(join(directory, "core-password"), "synthetic-core-password");
+    args.push("--bitcoin-core-rpc-url", sources.core, "--bitcoin-core-rpc-user", "rieko",
+      "--bitcoin-core-rpc-password-file", join(directory, "core-password"),
+      "--bitcoin-core-poll-interval", "1", "--bitcoin-core-poll-timeout", "2");
+  }
+  if (sources.lnd) {
+    await writeFile(join(directory, "macaroon"), Buffer.from([0xde, 0xad, 0xbe, 0xef]));
+    args.push("--lnd-rest-url", sources.lnd, "--lnd-macaroon-file", join(directory, "macaroon"),
+      "--lnd-network", "regtest", "--lnd-allow-insecure", "--lnd-poll-interval", "1", "--lnd-poll-timeout", "2");
+  }
+  if (sources.btcpay) {
+    await writeFile(join(directory, "btcpay-key"), "synthetic-greenfield-key");
+    args.push("--btcpay-greenfield-url", sources.btcpay, "--btcpay-greenfield-api-key-file", join(directory, "btcpay-key"),
+      "--btcpay-greenfield-store", "store-test", "--btcpay-greenfield-network", "regtest",
+      "--btcpay-poll-interval", "1", "--btcpay-poll-timeout", "2");
+  }
+  return args;
+}
+
+/** Poll an agent endpoint (not through the UI) until `ready` holds. */
+async function waitFor(url: string, path: string, ready: (body: any) => boolean) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const body = await (await fetch(`${url}${path}`)).json();
+    if (ready(body)) return body;
+    if (Date.now() > deadline) throw new Error(`${path} did not become ready: ${JSON.stringify(body)}`);
+    await delay(100);
+  }
+}
+
+async function freePort() {
+  const reservation = createServer();
+  await new Promise<void>(ready => reservation.listen(0, "127.0.0.1", ready));
+  const { port } = reservation.address() as AddressInfo;
+  await new Promise<void>(done => reservation.close(() => done()));
+  return port;
+}
+
+test.describe("Overview", () => {
+  test("with no sources every service is not observed and no value is invented", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const statusResponse = page.waitForResponse(response => new URL(response.url()).pathname === "/status");
+      await page.goto(url);
+      const status = await (await statusResponse).json();
+      for (const name of SERVICES) {
+        await expect(card(page, name).locator(".badge")).toHaveText("Not observed");
+        await expect(card(page, name).getByRole("definition")).toHaveCount(0);
+      }
+      await expect(card(page, "Rieko").locator(".badge")).toHaveText(`Pipeline: ${PIPELINE[status.overall]}`);
+      await expect(page.getByRole("link", { name: /^Rieko pipeline:/ })).toHaveText(`Rieko pipeline: ${PIPELINE[status.overall]}`);
+      await expect(page.getByRole("region", { name: "Active findings", exact: true })).toContainText("No active findings");
+      await expect(page.locator("body")).not.toContainText("All systems operational");
+    });
+  });
+
+  test("Core and LND values equal the API; BTCPay stays not observed despite a default state row (M2b)", async ({ page }, info) => {
+    const core = await mockCore();
+    const lnd = await mockLnd();
+    try {
+      await withAgent("embedded", info, async url => {
+        const bitcoin = await waitFor(url, "/inspect/bitcoin", body => body.state?.connected === true);
+        const lightning = await waitFor(url, "/inspect/lightning", body => body.state?.connected === true);
+        // M2b reproduced at runtime: no BTCPay is configured, yet the shared state
+        // row exists with the default fixture source.
+        const btcpay = await (await fetch(`${url}/inspect/btcpay`)).json();
+        const status = await (await fetch(`${url}/status`)).json();
+        expect(btcpay.state?.source).toBe("Fixture");
+        expect(status.source).toBe("fixture");
+        expect(status.last_ingestion?.success ?? null).toBeNull();
+
+        await page.goto(url);
+        await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Connected");
+        const snapshot = bitcoin.state.snapshot;
+        expect(await cardValues(page, "Bitcoin Core")).toEqual({
+          Network: snapshot.network,
+          "Block height": snapshot.block_height.toLocaleString("en-US"),
+          "Header height": snapshot.header_height.toLocaleString("en-US"),
+          Synchronized: snapshot.synchronized ? "Yes" : "No",
+        });
+        await expect(card(page, "LND").locator(".badge")).toHaveText("Connected");
+        const node = lightning.state.snapshot;
+        expect(await cardValues(page, "LND")).toEqual({
+          "Node ID": node.node_id,
+          "Synced to chain": node.synced_to_chain ? "Yes" : "No",
+          "Active channels": String(node.active_channels),
+          "Inactive channels": String(node.inactive_channels),
+        });
+        await expect(card(page, "BTCPay Server").locator(".badge")).toHaveText("Not observed");
+        expect(await cardValues(page, "Rieko")).not.toHaveProperty("Channel data source");
+        for (const name of SERVICES) await expect(card(page, name)).not.toContainText("Healthy");
+      }, undefined, false, await sourceArgs(info, { core: core.url, lnd: lnd.url }));
+    } finally {
+      await core.stop();
+      await lnd.stop();
+    }
+  });
+
+  test("a connected BTCPay Greenfield source shows its poll times", async ({ page }, info) => {
+    const btcpay = await mockBtcPay();
+    try {
+      await withAgent("embedded", info, async url => {
+        const inspection = await waitFor(url, "/inspect/btcpay", body => body.state?.source?.BtcPayGreenfield?.connected === true);
+        await page.goto(url);
+        await expect(card(page, "BTCPay Server").locator(".badge")).toHaveText("Connected");
+        const values = await cardValues(page, "BTCPay Server");
+        expect(Object.keys(values)).toEqual(["Last successful poll", "Last attempt", "Data as of"]);
+        // Formatted in the page, so the expectation uses the browser's locale.
+        const expected = await page.evaluate(iso => new Date(iso).toLocaleString(), inspection.state.last_success);
+        expect(values["Last successful poll"]).toContain(expected);
+      }, undefined, false, await sourceArgs(info, { btcpay: btcpay.url }));
+    } finally {
+      await btcpay.stop();
+    }
+  });
+
+  test("a Core outage changes only the Core card and keeps last known values", async ({ page }, info) => {
+    const core = await mockCore();
+    const lnd = await mockLnd();
+    try {
+      await withAgent("embedded", info, async url => {
+        await waitFor(url, "/inspect/bitcoin", body => body.state?.connected === true);
+        await waitFor(url, "/inspect/lightning", body => body.state?.connected === true);
+        await page.goto(url);
+        await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Connected");
+        const before = await cardValues(page, "Bitcoin Core");
+        await core.stop();
+        await waitFor(url, "/inspect/bitcoin", body => body.state?.connected === false);
+        await page.reload();
+        await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Disconnected");
+        await expect(card(page, "Bitcoin Core")).toContainText("Last known values");
+        expect(await cardValues(page, "Bitcoin Core")).toEqual(before);
+        await expect(card(page, "LND").locator(".badge")).toHaveText("Connected");
+      }, undefined, false, await sourceArgs(info, { core: core.url, lnd: lnd.url }));
+    } finally {
+      await core.stop();
+      await lnd.stop();
+    }
+  });
+
+  test("an unreachable Core is never connected and shows only its attempt", async ({ page }, info) => {
+    const unreachable = `http://127.0.0.1:${await freePort()}`;
+    await withAgent("embedded", info, async url => {
+      await waitFor(url, "/inspect/bitcoin", body => body.state !== null && body.state.connected === false);
+      await page.goto(url);
+      await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Never connected");
+      await expect(card(page, "Bitcoin Core").getByRole("definition")).toHaveCount(0);
+      await expect(card(page, "Bitcoin Core")).toContainText("Last attempt");
+    }, undefined, false, await sourceArgs(info, { core: unreachable }));
+  });
+
+  test("one failing endpoint affects only its own card", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      await page.route(`${url}/inspect/lightning`, route => route.fulfill({ status: 500, body: "synthetic failure" }));
+      await page.goto(url);
+      // Non-authentication errors keep the client's default three retries.
+      await expect(card(page, "LND")).toContainText("Unavailable: 500", { timeout: 15_000 });
+      await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Not observed");
+      await expect(card(page, "Rieko").getByRole("definition").first()).toBeVisible();
+    });
+  });
+
+  // Review findings F1 and F2: a request that fails after a successful load must
+  // not leave the earlier answer on screen as if it were current.
+  test("a failing /status after a good load makes the pill and Rieko card unavailable", async ({ page }, info) => {
+    test.setTimeout(60_000);
+    await withAgent("embedded", info, async url => {
+      await page.goto(url);
+      const pill = page.getByRole("link", { name: /^Rieko pipeline:/ });
+      await expect(pill).toHaveText(/^Rieko pipeline: (Healthy|Degraded|Unhealthy|Not initialized)$/);
+      await page.route(`${url}/status`, route => route.abort("connectionrefused"));
+      // Remounting the Overview refetches; the pill shares the same query.
+      await page.getByRole("link", { name: "Findings", exact: true }).click();
+      await page.getByRole("link", { name: "Overview", exact: true }).click();
+      await expect(card(page, "Rieko")).toContainText("Unavailable", { timeout: 30_000 });
+      await expect(pill).toHaveText("Rieko pipeline: unavailable");
+    });
+  });
+
+  test("a failing findings request after a good load removes the Rieko card's count", async ({ page }, info) => {
+    test.setTimeout(60_000);
+    await withAgent("embedded", info, async url => {
+      await page.goto(url);
+      await expect(page.getByRole("region", { name: "Active findings", exact: true }).getByRole("listitem").first()).toBeVisible();
+      expect(await cardValues(page, "Rieko")).toHaveProperty("Active findings");
+      await page.route(url => url.pathname === "/findings", route => route.fulfill({ status: 500, body: "synthetic failure" }));
+      await page.getByRole("link", { name: "Findings", exact: true }).click();
+      await page.getByRole("link", { name: "Overview", exact: true }).click();
+      await expect(page.getByRole("region", { name: "Active findings", exact: true })).toContainText("Unavailable: 500", { timeout: 30_000 });
+      expect(await cardValues(page, "Rieko")).not.toHaveProperty("Active findings");
+    }, undefined, true);
+  });
+
+  test("seeded active findings match the API and link to Findings", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const findingsResponse = page.waitForResponse(response =>
+        new URL(response.url()).pathname === "/findings" && new URL(response.url()).searchParams.get("lifecycle") === "active");
+      await page.goto(url);
+      const findings = await (await findingsResponse).json();
+      expect(findings.length).toBeGreaterThan(0);
+      const panel = page.getByRole("region", { name: "Active findings", exact: true });
+      await expect(panel.getByRole("listitem")).toHaveCount(findings.length);
+      await expect(panel.locator(".count")).toHaveText(String(findings.length));
+      await expect(panel.getByRole("listitem").locator(".tag")).toHaveText(findings.map((finding: { severity: string }) => finding.severity));
+      expect((await cardValues(page, "Rieko"))["Active findings"]).toBe(String(findings.length));
+      await panel.getByRole("link", { name: "View all findings", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Findings", exact: true })).toBeVisible();
+    }, undefined, true);
+  });
+
+  test("while the token prompt is shown there is no pill and no Overview request", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      // Before the first 401 the UI does not yet know a token is required, so
+      // only requests made after the prompt appears are counted.
+      await page.goto(url);
+      await expect(page.getByLabel("API token", { exact: true })).toBeVisible();
+      const paths: string[] = [];
+      page.on("request", request => paths.push(new URL(request.url()).pathname));
+      await page.waitForTimeout(1000);
+      expect(paths.filter(path => path.startsWith("/inspect") || path === "/findings")).toEqual([]);
+      await expect(page.getByRole("link", { name: /^Rieko pipeline:/ })).toHaveCount(0);
+      await unlock(page);
+      await expect(page.getByRole("link", { name: /^Rieko pipeline:/ })).toBeVisible();
+      await expect(card(page, "Bitcoin Core").locator(".badge")).toHaveText("Not observed");
+    }, "synthetic-browser-token");
+  });
+
+  test("readable and without overflow in both themes at every width, with all sources and findings", async ({ page }, info) => {
+    const [core, lnd, btcpay] = await Promise.all([mockCore(), mockLnd(), mockBtcPay()]);
+    try {
+      await withAgent("embedded", info, async url => {
+        await waitFor(url, "/inspect/btcpay", body => body.state?.source?.BtcPayGreenfield?.connected === true);
+        await waitFor(url, "/inspect/lightning", body => body.state?.connected === true);
+        await waitFor(url, "/inspect/bitcoin", body => body.state?.connected === true);
+        for (const theme of ["dark", "light"] as const) {
+          for (const width of WIDTHS) {
+            await page.setViewportSize({ width, height: 900 });
+            await page.goto(`${url}/#/overview`);
+            await useTheme(page, theme);
+            for (const name of SERVICES) await expect(card(page, name).locator(".badge")).toHaveText("Connected");
+            await expect(page.getByRole("region", { name: "Active findings", exact: true }).getByRole("listitem").first()).toBeVisible();
+            await expectReadable(page, `${theme} ${width}px overview`);
+            const overflow = await page.evaluate(() => {
+              const main = document.querySelector("main")!;
+              return {
+                page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+                main: main.scrollWidth - main.clientWidth,
+              };
+            });
+            expect(overflow, `${theme} ${width}px`).toEqual({ page: 0, main: 0 });
+          }
+        }
+      }, undefined, true, await sourceArgs(info, { core: core.url, lnd: lnd.url, btcpay: btcpay.url }));
+    } finally {
+      await Promise.all([core.stop(), lnd.stop(), btcpay.stop()]);
+    }
+  });
+});
+
 for (const mode of ["embedded", "static"] as const) {
   test(`${mode} Overview renders real status without CSP violations`, async ({ page }, info) => {
     await withAgent(mode, info, async url => {
@@ -560,9 +885,13 @@ for (const mode of ["embedded", "static"] as const) {
         const response = statusResponses.at(-1)!;
         expect(response.status()).toBe(200);
         const status = await response.json();
-        await expect(health.getByRole("status")).toHaveText([status.overall, status.integrity]);
-        await expect(page.getByRole("region", { name: "Record counts", exact: true })).toContainText(String(status.counts.findings));
-        await expect(page.getByText(`${status.engine} v${status.version}`, { exact: false })).toBeVisible();
+        const rieko = await cardValues(page, "Rieko");
+        expect(rieko.Version).toBe(`v${status.version}`);
+        expect(rieko.Schema).toBe(String(status.schema_version));
+        expect(rieko["Database integrity"]).toBe(status.integrity);
+        expect(rieko["Findings (all)"]).toBe(String(status.counts.findings));
+        await expect(health.getByRole("region", { name: "Rieko", exact: true }).locator(".badge")).toHaveText(`Pipeline: ${PIPELINE[status.overall]}`);
+        await expect(page.getByRole("link", { name: /^Rieko pipeline:/ })).toHaveText(`Rieko pipeline: ${PIPELINE[status.overall]}`);
         expect(document?.headers()["content-security-policy"]).toContain("connect-src 'self'");
         expect(pageErrors).toEqual([]);
         const cspViolations = await page.evaluate(() => (window as typeof window & { cspViolations: string[] }).cspViolations);
