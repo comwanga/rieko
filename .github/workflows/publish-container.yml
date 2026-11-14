@@ -146,7 +146,7 @@ jobs:
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/source" \
             --workdir /source \
-            rust:1.86-bookworm \
+            rust:1.89-bookworm \
             cargo build --locked --release --package rieko-cli --bin rieko
 
       - name: Package and verify operator CLI

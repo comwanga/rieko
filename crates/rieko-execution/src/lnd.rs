@@ -139,7 +139,7 @@ fn base64_payment_addr() -> String {
             out.push(chars[(n & 0x3F) as usize] as char);
         }
     }
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push('=');
     }
     out

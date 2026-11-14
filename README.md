@@ -41,7 +41,7 @@ liquidity table. Existing `#/channels` links also open Services.
 
 ### Prerequisites
 
-- **Rust** 1.86+
+- **Rust** 1.89+
 - **Node.js** 22+ (for building the frontend)
 - **LND** 0.17+ (optional — only for live-node observation)
 
