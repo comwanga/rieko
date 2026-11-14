@@ -2,12 +2,13 @@
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { onDestroy, tick } from "svelte";
   import { AuthenticationError, authState, initializeAuth } from "./lib/auth";
-  import { route, startRouter } from "./lib/router";
+  import { route, routeParam, startRouter } from "./lib/router";
   import Sidebar from "./lib/Sidebar.svelte";
   import TokenPrompt from "./lib/TokenPrompt.svelte";
   import TopBar from "./lib/TopBar.svelte";
+  import FindingDetail from "./pages/FindingDetail.svelte";
   import Findings from "./pages/Findings.svelte";
-  import Snapshots from "./pages/Snapshots.svelte";
+  import Services from "./pages/Services.svelte";
   import Status from "./pages/Status.svelte";
   import Audit from "./pages/Audit.svelte";
   import Recommendations from "./pages/Recommendations.svelte";
@@ -58,13 +59,17 @@
         {:else if $route === "overview"}
           <Status />
         {:else if $route === "findings"}
-          <Findings />
+          {#if $routeParam}
+            {#key $routeParam}<FindingDetail id={$routeParam} />{/key}
+          {:else}
+            <Findings />
+          {/if}
         {:else if $route === "recommendations"}
           <Recommendations />
         {:else if $route === "simulations"}
           <Simulations />
-        {:else if $route === "channels"}
-          <Snapshots />
+        {:else if $route === "services"}
+          <Services />
         {:else}
           <Audit />
         {/if}

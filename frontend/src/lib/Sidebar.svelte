@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { authState } from "./auth";
+  import FindingsBadge from "./FindingsBadge.svelte";
   import Icon from "./Icon.svelte";
   import { ROUTES, route, routeHref } from "./router";
 
@@ -28,9 +30,17 @@
 
   <nav id="primary-navigation" aria-label="Primary" class:open>
     {#each ROUTES as item}
-      <a href={routeHref(item.id)} aria-current={$route === item.id ? "page" : undefined} on:click={() => select(item.id)}>
-        <Icon name={item.icon} /> {item.label}
-      </a>
+      <div class="nav-item">
+        <a href={routeHref(item.id)} aria-current={$route === item.id ? "page" : undefined}
+          aria-describedby={item.id === "findings" ? "findings-count" : undefined} on:click={() => select(item.id)}>
+          <Icon name={item.icon} /> {item.label}
+        </a>
+        <!-- Outside the link so its accessible name stays "Findings"; shown only
+             while no token prompt is displayed, like the pipeline pill. -->
+        {#if item.id === "findings" && !$authState.required}
+          {#key $authState.generation}<FindingsBadge />{/key}
+        {/if}
+      </div>
     {/each}
   </nav>
 
@@ -66,6 +76,20 @@
     text-decoration: none;
   }
   nav a:hover { background: var(--surface-input); }
+  .nav-item { position: relative; }
+  .nav-item :global(.nav-count) {
+    background: var(--neutral-bg);
+    border-radius: 999px;
+    color: var(--neutral-text);
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.05rem 0.5rem;
+    pointer-events: none;
+    position: absolute;
+    right: 0.75rem;
+    top: 50%;
+    transform: translateY(-50%);
+  }
   nav a[aria-current="page"] { background: var(--surface-active); color: var(--text-on-active); font-weight: 600; }
   .links {
     border: 1px solid var(--border);

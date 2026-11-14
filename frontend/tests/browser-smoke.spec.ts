@@ -244,7 +244,7 @@ const VIEWS = [
   { id: "findings", link: "Findings", heading: "Findings", request: "/findings" },
   { id: "recommendations", link: "Recommendations", heading: "Recommendations", request: "/recommendations" },
   { id: "simulations", link: "Simulations", heading: "Simulations", request: "/api/v2/simulations" },
-  { id: "channels", link: "Channels", heading: "Channel liquidity", request: "/snapshots" },
+  { id: "services", link: "Services", heading: "Services", request: "/snapshots" },
   { id: "audit", link: "Audit", heading: "Audit log", request: "/audit" },
 ] as const;
 const WIDTHS = [1440, 1024, 768, 390] as const;
@@ -253,6 +253,7 @@ const TEXT = [
   "main h2", "main h3", "main h4", "main p", "main th", "main td", "main label", "main button",
   "main input", "main select", "main code", "main .tag", "main .kv > span",
   "main dt", "main dd", "main li", "main a", "main .badge", "main small", "header a",
+  "main pre", "main strong", "main span", "aside .nav-count",
 ].join(", ");
 
 /** WCAG contrast of each visible, enabled text element against its effective background. */
@@ -355,7 +356,7 @@ test.describe("application shell", () => {
           await expect(page.locator("nav a[aria-current=page]")).toHaveText([view.link]);
         }
         await page.goBack();
-        await expect(page.getByRole("heading", { name: "Channel liquidity", exact: true })).toBeVisible();
+        await expect(page.getByRole("heading", { name: "Services", exact: true })).toBeVisible();
         await page.goForward();
         await expect(page.getByRole("heading", { name: "Audit log", exact: true })).toBeVisible();
         await page.goto(`${url}/#/no-such-view`);
@@ -803,7 +804,8 @@ test.describe("Overview", () => {
       expect(findings.length).toBeGreaterThan(0);
       const panel = page.getByRole("region", { name: "Active findings", exact: true });
       await expect(panel.getByRole("listitem")).toHaveCount(findings.length);
-      await expect(panel.locator(".count")).toHaveText(String(findings.length));
+      await expect(panel.locator(".count")).toHaveText(`${findings.length} active findings`);
+      await expect(panel.locator(".count .visually-hidden")).toHaveText(" active findings");
       await expect(panel.getByRole("listitem").locator(".tag")).toHaveText(findings.map((finding: { severity: string }) => finding.severity));
       expect((await cardValues(page, "Rieko"))["Active findings"]).toBe(String(findings.length));
       await panel.getByRole("link", { name: "View all findings", exact: true }).click();
@@ -906,3 +908,295 @@ for (const mode of ["embedded", "static"] as const) {
     });
   });
 }
+
+// ─── Findings and Services (MS-2.3c) ───
+
+/** Captures the next GET to `path` (optionally with matching query parameters). */
+function nextGet(page: Page, path: string, params: Record<string, string> = {}) {
+  return page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET" && url.pathname === path
+      && Object.entries(params).every(([key, value]) => url.searchParams.get(key) === value);
+  });
+}
+
+const findingRows = (page: Page) => page.getByRole("table", { name: "Findings", exact: true }).locator("tbody tr");
+
+test.describe("Findings and Services", () => {
+  test("the lifecycle filter requests and shows exactly the chosen findings, Active by default", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const active = nextGet(page, "/findings", { lifecycle: "active", limit: "200" });
+      await page.goto(`${url}/#/findings`);
+      const activeBody = await (await active).json();
+      const group = page.getByRole("group", { name: "Lifecycle", exact: true });
+      await expect(group.getByRole("button", { name: "Active", exact: true })).toHaveAttribute("aria-pressed", "true");
+      await expect(findingRows(page)).toHaveCount(activeBody.length);
+      expect(await findingRows(page).getByRole("link").evaluateAll(links => links.map(link => link.getAttribute("href"))))
+        .toEqual(activeBody.map((finding: { id: string }) => `#/findings/${encodeURIComponent(finding.id)}`));
+      await expect(page.getByRole("columnheader", { name: "Ratio" })).toHaveCount(0);
+
+      const resolved = nextGet(page, "/findings", { lifecycle: "resolved" });
+      await group.getByRole("button", { name: "Resolved", exact: true }).click();
+      const resolvedBody = await (await resolved).json();
+      await expect(group.getByRole("button", { name: "Resolved", exact: true })).toHaveAttribute("aria-pressed", "true");
+      // The seed has no resolved findings; this checks the empty state truthfully.
+      expect(resolvedBody).toEqual([]);
+      await expect(page.locator("main")).toContainText("No resolved findings.");
+
+      const all = nextGet(page, "/findings", { lifecycle: "all" });
+      await group.getByRole("button", { name: "All", exact: true }).click();
+      const allBody = await (await all).json();
+      await expect(findingRows(page)).toHaveCount(allBody.length);
+      expect(await findingRows(page).getByRole("link").evaluateAll(links => links.map(link => link.getAttribute("href"))))
+        .toEqual(allBody.map((finding: { id: string }) => `#/findings/${encodeURIComponent(finding.id)}`));
+    }, undefined, true);
+  });
+
+  test("finding detail shows exactly the stored evidence, provenance and linked recommendations", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      await page.goto(`${url}/#/findings`);
+      await expect(findingRows(page).first()).toBeVisible();
+      const link = findingRows(page).first().getByRole("link");
+      const id = decodeURIComponent((await link.getAttribute("href"))!.replace("#/findings/", ""));
+      const detail = nextGet(page, `/findings/${id}`);
+      const recommendations = nextGet(page, "/recommendations", { lifecycle: "all", limit: "500" });
+      await link.focus();
+      await page.keyboard.press("Enter");
+      const finding = await (await detail).json();
+      const linked = (await (await recommendations).json()).filter((rec: { finding_id: string }) => rec.finding_id === id);
+      expect(new URL(page.url()).hash).toBe(`#/findings/${encodeURIComponent(id)}`);
+      await expect(page.getByRole("heading", { level: 2 })).toBeFocused();
+      await expect(page.locator("nav a[aria-current=page]")).toHaveText(["Findings"]);
+
+      const section = (name: string) => page.getByRole("region", { name, exact: true });
+      const pairs = async (name: string) => {
+        const terms = await section(name).getByRole("term").allTextContents();
+        const values = await section(name).getByRole("definition").allTextContents();
+        return Object.fromEntries(terms.map((term, index) => [term.trim(), values[index].trim()]));
+      };
+      const evidence = await pairs("Evidence");
+      expect(Object.keys(evidence)).toEqual(finding.evidence.map((item: { key: string }) => item.key));
+      for (const item of finding.evidence) {
+        const expected = item.value !== null && typeof item.value === "object" ? JSON.stringify(item.value, null, 2) : String(item.value);
+        expect(evidence[item.key]).toBe(expected);
+      }
+      const summary = await pairs("Summary");
+      expect(summary).toMatchObject({ Severity: finding.severity, State: finding.lifecycle, Detector: `${finding.detector} v${finding.detector_version}` });
+      expect(finding.provenance.source.kind).toBe("fixture");
+      expect(await pairs("Provenance")).toMatchObject({
+        Network: finding.provenance.network, Source: "Fixture", "Content hash": finding.provenance.source.redacted_hash,
+      });
+      const producers = section("Provenance").getByRole("table", { name: "Producers", exact: true }).locator("tbody tr");
+      await expect(producers).toHaveCount(finding.provenance.producers.length);
+      for (const [index, producer] of finding.provenance.producers.entries()) {
+        await expect(producers.nth(index).getByRole("cell")).toHaveText([producer.name, producer.version, producer.role]);
+      }
+      await expect(section("Provenance")).toContainText(finding.provenance.observation.snapshot.state_digest);
+
+      const items = section("Recommendations").getByRole("listitem").filter({ has: page.getByRole("heading", { level: 4 }) });
+      expect(linked.length).toBeGreaterThan(0);
+      await expect(items).toHaveCount(linked.length);
+      for (const [index, rec] of linked.entries()) {
+        await expect(items.nth(index).getByRole("heading", { level: 4 })).toHaveText(rec.action.summary);
+        await expect(items.nth(index)).toContainText(rec.rationale.expected_effect);
+        await expect(items.nth(index).getByRole("definition")).toHaveText([
+          rec.action.action_type, rec.action.stage, rec.lifecycle ?? "active",
+          rec.rationale.actionability === "OperatorActionable" ? "Operator may choose to act" : rec.rationale.actionability,
+        ]);
+        await expect(items.nth(index).getByRole("listitem")).toHaveText([
+          ...rec.rationale.evidence, ...rec.rationale.preconditions, ...rec.rationale.risks, ...rec.rationale.limitations,
+        ]);
+      }
+      await expect(section("Recommendations")).not.toContainText("may be incomplete");
+      await page.getByRole("link", { name: "Back to findings", exact: true }).click();
+      await expect(findingRows(page).first()).toBeVisible();
+      await page.goBack();
+      await expect(section("Evidence")).toBeVisible();
+      await expect(page.getByRole("heading", { level: 2 })).toBeFocused();
+      await page.goForward();
+      await expect(findingRows(page).first()).toBeVisible();
+    }, undefined, true);
+  });
+
+  test("Overview findings open their detail page", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      await page.goto(url);
+      const panel = page.getByRole("region", { name: "Active findings", exact: true });
+      const first = panel.getByRole("link", { name: /^View details for / }).first();
+      await expect(first).toBeVisible();
+      await first.click();
+      await expect(page).toHaveURL(/#\/findings\/finding-/);
+      await expect(page.getByRole("region", { name: "Evidence", exact: true })).toBeVisible();
+    }, undefined, true);
+  });
+
+  test("missing provenance is stated, not implied (labelled test double)", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const findings = await (await fetch(`${url}/findings?lifecycle=active`)).json();
+      const id = findings[0].id;
+      // Test double: the real response with provenance removed, as agent-raised
+      // findings are stored. Producing one for real needs a signed webhook flow.
+      await page.route(`${url}/findings/${id}`, async route => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: { ...(await response.json()), provenance: null } });
+      });
+      await page.goto(`${url}/#/findings/${encodeURIComponent(id)}`);
+      const provenance = page.getByRole("region", { name: "Provenance", exact: true });
+      await expect(provenance).toContainText("No provenance is recorded for this finding.");
+      await expect(provenance.getByRole("definition")).toHaveCount(0);
+    }, undefined, true);
+  });
+
+  test("an unknown finding is reported as not found without retries", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      let requests = 0;
+      page.on("request", request => { if (new URL(request.url()).pathname === "/findings/finding-does-not-exist") requests++; });
+      await page.goto(`${url}/#/findings/finding-does-not-exist`);
+      await expect(page.locator("main")).toContainText("Finding not found.", { timeout: 3_000 });
+      expect(requests).toBe(1);
+    });
+  });
+
+  test("Services shows the service cards and channels, and the old Channels address still works", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      await page.goto(`${url}/#/channels`);
+      await expect(page.getByRole("heading", { name: "Services", exact: true })).toBeVisible();
+      await expect(page.locator("nav a[aria-current=page]")).toHaveText(["Services"]);
+      const services = page.getByRole("region", { name: "Service status", exact: true });
+      for (const name of SERVICES) {
+        await expect(services.getByRole("region", { name, exact: true }).locator(".badge")).toHaveText("Not observed");
+      }
+      await expect(page.getByRole("heading", { name: "Channel liquidity", exact: true })).toBeVisible();
+      await expect(page.locator("main tbody tr").first()).toBeVisible();
+      await expect(page.getByRole("link", { name: "Channels", exact: true })).toHaveCount(0);
+    }, undefined, true);
+  });
+
+  test("the sidebar count equals the active findings and keeps the link name", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const active = nextGet(page, "/findings", { lifecycle: "active" });
+      await page.goto(url);
+      const findings = await (await active).json();
+      const link = page.getByRole("link", { name: "Findings", exact: true });
+      await expect(link).toHaveAccessibleDescription(`${findings.length} active findings`);
+      await expect(page.locator("aside .nav-count")).toHaveText(String(findings.length));
+    }, undefined, true);
+  });
+
+  test("the sidebar reports zero active findings on an empty database", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const active = nextGet(page, "/findings", { lifecycle: "active", limit: "50" });
+      await page.goto(url);
+      expect(await (await active).json()).toEqual([]);
+      await expect(page.getByRole("link", { name: "Findings", exact: true })).toHaveAccessibleDescription("0 active findings");
+      await expect(page.locator("aside .nav-count")).toHaveText("0");
+    });
+  });
+
+  test("large structured evidence and the recommendation limit are explicit (labelled test doubles)", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      const findings = await (await fetch(`${url}/findings?lifecycle=active`)).json();
+      const id = findings[0].id;
+      const value = { invoice_ids: Array.from({ length: 80 }, (_, index) => `${index}-${"x".repeat(100)}`) };
+      await page.route(`${url}/findings/${id}`, async route => {
+        const response = await route.fetch();
+        const finding = await response.json();
+        await route.fulfill({ response, json: { ...finding, evidence: [{ key: "structured", value }] } });
+      });
+      await page.route(`${url}/recommendations?lifecycle=all&limit=500`, async route => {
+        const response = await route.fetch();
+        const [rec] = await response.json();
+        await route.fulfill({ response, json: Array.from({ length: 500 }, (_, index) => ({
+          ...rec, finding_id: index === 0 ? id : "unrelated-finding", action: { ...rec.action, id: `test-${index}` },
+        })) });
+      });
+      await page.setViewportSize({ width: 390, height: 900 });
+      await page.goto(`${url}/#/findings/${encodeURIComponent(id)}`);
+      const evidence = page.getByRole("region", { name: "Evidence", exact: true });
+      await expect(evidence.getByRole("definition")).toHaveText(JSON.stringify(value, null, 2));
+      const recommendations = page.getByRole("region", { name: "Recommendations", exact: true });
+      await expect(recommendations).toContainText("Only the latest 500 recommendations were checked, so this list may be incomplete.");
+      await expect(recommendations.getByRole("heading", { level: 4 })).toHaveCount(1);
+      expect(await page.evaluate(() => {
+        const main = document.querySelector("main")!;
+        return [document.documentElement.scrollWidth - document.documentElement.clientWidth, main.scrollWidth - main.clientWidth];
+      })).toEqual([0, 0]);
+    }, undefined, true);
+  });
+
+  test("detail loading and failure are visible without rendering a summary (labelled test double)", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      let release!: () => void;
+      const held = new Promise<void>(done => { release = done; });
+      await page.route(`${url}/findings/finding-unavailable`, async route => {
+        await held;
+        await route.fulfill({ status: 503, body: "synthetic service failure" });
+      });
+      try {
+        await page.goto(`${url}/#/findings/finding-unavailable`);
+        await expect(page.locator("main")).toContainText("Loading…");
+        await expect(page.getByRole("region", { name: "Summary", exact: true })).toHaveCount(0);
+        release();
+        await expect(page.locator("main").getByRole("alert")).toContainText("Unavailable: 503 synthetic service failure", { timeout: 15_000 });
+        await expect(page.getByRole("region", { name: "Summary", exact: true })).toHaveCount(0);
+      } finally { release(); }
+    });
+  });
+
+  test("no sidebar count while the token prompt is shown", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      await page.goto(url);
+      await expect(page.getByLabel("API token", { exact: true })).toBeVisible();
+      await expect(page.locator("aside .nav-count")).toHaveCount(0);
+      const active = nextGet(page, "/findings", { lifecycle: "active", limit: "50" });
+      await unlock(page);
+      const findings = await (await active).json();
+      expect(findings.length).toBeGreaterThan(0);
+      await expect(page.locator("aside .nav-count")).toHaveText(String(findings.length));
+      await page.getByRole("button", { name: "Forget token", exact: true }).click();
+      await expect(page.getByLabel("API token", { exact: true })).toBeVisible();
+      await expect(page.locator("aside .nav-count")).toHaveCount(0);
+    }, "synthetic-browser-token", true);
+  });
+
+  test("list, detail and Services are readable without overflow in both themes at every width", async ({ page }, info) => {
+    test.setTimeout(90_000);
+    await withAgent("embedded", info, async url => {
+      const findings = await (await fetch(`${url}/findings?lifecycle=active`)).json();
+      const detail = `#/findings/${encodeURIComponent(findings[0].id)}`;
+      for (const theme of ["dark", "light"] as const) {
+        for (const width of WIDTHS) {
+          await page.setViewportSize({ width, height: 900 });
+          for (const [hash, ready, mainMayScroll] of [
+            ["#/findings", () => findingRows(page).first(), false],
+            [detail, () => page.getByRole("region", { name: "Evidence", exact: true }).getByRole("term").first(), false],
+            ["#/services", () => page.locator("main tbody tr").first(), true],
+          ] as const) {
+            await page.goto(`${url}/${hash}`);
+            await useTheme(page, theme);
+            await expect(ready()).toBeVisible();
+            await expectReadable(page, `${theme} ${width}px ${hash}`);
+            const overflow = await page.evaluate(() => {
+              const main = document.querySelector("main")!;
+              return {
+                page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+                main: main.scrollWidth - main.clientWidth,
+              };
+            });
+            expect(overflow.page, `${theme} ${width}px ${hash} page`).toBe(0);
+            // The unchanged channel table may scroll inside the content area (review note m4).
+            if (!mainMayScroll) expect(overflow.main, `${theme} ${width}px ${hash} main`).toBe(0);
+            await page.screenshot({ path: info.outputPath(`${hash === detail ? "detail" : hash.slice(2)}-${theme}-${width}.png`), fullPage: true });
+            if (hash === "#/findings" && width === 390) {
+              const table = page.getByRole("region", { name: "Findings table", exact: true });
+              await table.focus();
+              await expect(table).toBeFocused();
+              await page.keyboard.press("ArrowRight");
+              await expect.poll(() => table.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
+            }
+          }
+        }
+      }
+    }, undefined, true);
+  });
+});

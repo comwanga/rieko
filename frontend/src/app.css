@@ -246,3 +246,33 @@ td {
   background: var(--neutral-bg);
   color: var(--neutral-text);
 }
+
+/* Text available to assistive technology only. */
+.visually-hidden {
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+/* Wide tables scroll inside their own region instead of the content area. */
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Structured evidence values. */
+pre.json {
+  background: var(--surface-input);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: var(--space-2);
+  white-space: pre-wrap;
+}

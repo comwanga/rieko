@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Finding } from "./api";
   import { findingsCount, formatTime } from "./overview";
+  import { findingHref } from "./router";
 
   export let findings: Finding[] | undefined;
   export let loading: boolean;
@@ -15,7 +16,7 @@
 <section class="card" aria-labelledby="active-findings-title">
   <div class="head">
     <h3 id="active-findings-title">Active findings</h3>
-    {#if findings && !error}<span class="count">{findingsCount(findings.length, limit)}</span>{/if}
+    {#if findings && !error}<span class="count">{findingsCount(findings.length, limit)}<span class="visually-hidden">{" "}active findings</span></span>{/if}
     <a href="#/findings">View all findings</a>
   </div>
 
@@ -40,6 +41,7 @@
             <p><span class="muted">Explanation:</span> {finding.explanation}</p>
           {/if}
           <p class="muted">First seen {first.relative} <small>({first.absolute})</small>; last seen {last.relative} <small>({last.absolute})</small></p>
+          <a class="details" href={findingHref(finding.id)}>View details<span class="visually-hidden"> for {finding.detector}{#if finding.channel ?? finding.node} on {finding.channel ?? finding.node}{/if}</span></a>
         </li>
       {/each}
     </ul>
@@ -56,5 +58,6 @@
   .title { align-items: center; display: flex; flex-wrap: wrap; gap: var(--space-2); }
   .target { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.8rem; overflow-wrap: anywhere; }
   p { font-size: 0.85rem; margin: 0; overflow-wrap: anywhere; }
+  .details { color: var(--accent); font-size: 0.85rem; justify-self: start; }
   .problem { color: var(--critical-text); }
 </style>

@@ -27,6 +27,16 @@ Open `http://localhost:8080` for the UI. The scan runs the pipeline: ingest →
 detect → recommend → explain → alert → persist. Findings are written to
 `~/.rieko/rieko.db` by default (override with `--db`).
 
+The Findings view starts with active findings; use Resolved or All to include
+history. Open a finding from the list or Overview to see its stored evidence,
+provenance (when recorded), and linked recommendations with their rationale.
+Linked recommendations are drawn from the latest 500; the page states when
+that limit may make the list incomplete. The sidebar shows the active findings
+count, with `50+` when its request limit is reached.
+
+Services shows Bitcoin Core, LND and BTCPay Server status cards above the channel
+liquidity table. Existing `#/channels` links also open Services.
+
 ## Running locally
 
 ### Prerequisites

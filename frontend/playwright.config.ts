@@ -2,7 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: ["browser-smoke.spec.ts", "api-auth.spec.ts", "overview-model.spec.ts"],
+  testMatch: ["browser-smoke.spec.ts", "api-auth.spec.ts", "overview-model.spec.ts", "findings-model.spec.ts"],
   timeout: 30_000,
   // The Overview tests wait on real agent polling of mock sources.
   globalTimeout: 240_000,
