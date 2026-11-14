@@ -40,9 +40,9 @@
   }
   function closeSim() { selectedRec = null; }
 
-  function distinctChannels(): string[] {
+  function distinctChannels(snapshots: ChannelSnapshot[]): string[] {
     const latest = new Map<string, ChannelSnapshot>();
-    for (const s of $snapQ.data ?? []) {
+    for (const s of snapshots) {
       const key = `${s.network ?? "legacy"}\x00${s.node_id ?? "unknown"}\x00${s.channel_id}`;
       const cur = latest.get(key);
       if (!cur || s.ts > cur.ts) latest.set(key, s);
@@ -101,7 +101,7 @@
     return s === "Critical" ? "critical" : s === "Warning" ? "warning" : "info";
   }
 
-  $: channels = distinctChannels();
+  $: channels = distinctChannels($snapQ.data ?? []);
 </script>
 
 <h2>Recommendations</h2>
@@ -192,7 +192,7 @@
         </label>
       </div>
       {#if formError}
-        <p class="critical" role="alert">{formError}</p>
+        <p class="critical simulation-error" role="alert">{formError}</p>
       {/if}
       <div class="form-actions">
         <button on:click={submitSim} disabled={formSubmitting}>
@@ -215,6 +215,7 @@
   max-width: 520px; width: 90%; max-height: 90vh; overflow-y: auto;
 }
 .form-group { margin: 0.75rem 0; }
+.simulation-error { overflow-wrap: anywhere; }
 .form-group label { display: block; font-size: 0.85rem; margin-bottom: 0.25rem; }
 select, input[type="number"] {
   width: 100%; padding: 0.4rem 0.5rem; border: 1px solid var(--border-strong); border-radius: 6px;

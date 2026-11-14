@@ -1200,3 +1200,146 @@ test.describe("Findings and Services", () => {
     }, undefined, true);
   });
 });
+
+// DC3: the Create simulation dialog belongs to Recommendations.
+const simulationDialog = (page: Page) => page.getByRole("dialog", { name: "Create simulation", exact: true });
+const channelChoices = (select: import("@playwright/test").Locator) =>
+  select.locator("option").evaluateAll(options => options.map(option => (option as HTMLOptionElement).value));
+
+test.describe("DC3 simulation dialog", () => {
+  test("a cold dialog gains the real channel choices when delayed snapshots arrive", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      let release!: () => void;
+      const held = new Promise<void>(done => { release = done; });
+      await page.route(`${url}/snapshots?limit=500`, async route => {
+        const response = await route.fetch();
+        await held;
+        await route.fulfill({ response });
+      });
+      try {
+        const snapshotsResponse = nextGet(page, "/snapshots", { limit: "500" });
+        const recommendationsResponse = nextGet(page, "/recommendations", { limit: "100" });
+        await page.goto(`${url}/#/recommendations`);
+        const recommendations = await (await recommendationsResponse).json();
+        await page.getByRole("button", { name: "Simulate", exact: true }).first().click();
+        const dialog = simulationDialog(page);
+        const source = dialog.getByLabel("Source channel", { exact: true });
+        const destination = dialog.getByLabel("Destination channel", { exact: true });
+        await expect(source.locator("option")).toHaveCount(1);
+        await expect(destination.locator("option")).toHaveCount(1);
+        await expect(source).toHaveValue("");
+        await expect(destination).toHaveValue("");
+        release();
+        const snapshots = await (await snapshotsResponse).json();
+        const ids = [...new Set<string>(snapshots.map((snapshot: { channel_id: string }) => snapshot.channel_id))].sort();
+        expect(ids.length).toBeGreaterThanOrEqual(2);
+        await expect.poll(() => channelChoices(source)).toEqual(["", ...ids]);
+        await expect.poll(() => channelChoices(destination)).toEqual(["", ...ids]);
+        await expect(source).toHaveValue("");
+        await expect(destination).toHaveValue("");
+        await source.selectOption(ids[0]);
+        await destination.selectOption(ids[1]);
+        await dialog.getByLabel("Amount in sats", { exact: true }).fill("1000");
+        const submitted = page.waitForResponse(response => new URL(response.url()).pathname === "/api/v2/simulations" && response.request().method() === "POST");
+        await dialog.getByRole("button", { name: "Run simulation", exact: true }).click();
+        const response = await submitted;
+        expect(response.request().postDataJSON()).toEqual({
+          recommendation_id: recommendations[0].action.id, model_id: "liquidity-redistribution",
+          source_channel: ids[0], destination_channel: ids[1], amount_sats: 1000, allow_stale: false,
+        });
+        // The real fixture is refused (stale or missing spendable reserves), as
+        // documented by the standing smoke test. This does not claim success.
+        expect([400, 409]).toContain(response.status());
+        expect(["invalid_input", "stale_input"]).toContain((await response.json()).error.code);
+        await expect(dialog.getByRole("alert")).toContainText(String(response.status()));
+      } finally { release(); }
+    }, undefined, true);
+  });
+
+  test("a later snapshot poll updates choices once and retains selections (labelled response double)", async ({ page }, info) => {
+    test.setTimeout(45_000);
+    await withAgent("embedded", info, async url => {
+      const snapshots = await (await fetch(`${url}/snapshots?limit=500`)).json();
+      const ids = [...new Set<string>(snapshots.map((snapshot: { channel_id: string }) => snapshot.channel_id))].sort();
+      let update = false;
+      let updatesDelivered = 0;
+      await page.route(`${url}/snapshots?limit=500`, async route => {
+        if (!update) { await route.continue(); return; }
+        const response = await route.fetch();
+        // Deliberately labelled double: add one channel and repeat an existing
+        // observation, in unsorted order, on the real 15-second polling request.
+        await route.fulfill({ response, json: [
+          { ...snapshots[0], channel_id: "dc3-added-channel" }, ...snapshots, snapshots[0],
+        ] });
+        updatesDelivered++;
+      });
+      await page.goto(`${url}/#/services`);
+      await expect(page.locator("main tbody tr").first()).toBeVisible();
+      await page.getByRole("link", { name: "Recommendations", exact: true }).click();
+      await page.getByRole("button", { name: "Simulate", exact: true }).first().click();
+      const dialog = simulationDialog(page);
+      const source = dialog.getByLabel("Source channel", { exact: true });
+      const destination = dialog.getByLabel("Destination channel", { exact: true });
+      await expect.poll(() => channelChoices(source)).toEqual(["", ...ids]);
+      await source.selectOption(ids[0]);
+      await destination.selectOption(ids[1]);
+      update = true;
+      await expect.poll(() => updatesDelivered, { timeout: 25_000 }).toBeGreaterThan(0);
+      const expected = ["", ...[...ids, "dc3-added-channel"].sort()];
+      await expect.poll(() => channelChoices(source)).toEqual(expected);
+      await expect.poll(() => channelChoices(destination)).toEqual(expected);
+      await expect(source).toHaveValue(ids[0]);
+      await expect(destination).toHaveValue(ids[1]);
+    }, undefined, true);
+  });
+
+  test("the full real refusal wraps inside the dialog in both themes at every width", async ({ page }, info) => {
+    test.setTimeout(60_000);
+    await withAgent("embedded", info, async url => {
+      // Warm the real snapshot cache to isolate layout from the cold-load case.
+      await page.goto(`${url}/#/services`);
+      await expect(page.locator("main tbody tr").first()).toBeVisible();
+      await page.getByRole("link", { name: "Recommendations", exact: true }).click();
+      await expect(page.getByRole("button", { name: "Simulate", exact: true }).first()).toBeVisible();
+      const measurements: { theme: string; width: number; error: number; card: number }[] = [];
+      for (const theme of ["dark", "light"] as const) {
+        await useTheme(page, theme);
+        await page.getByRole("button", { name: "Simulate", exact: true }).first().click();
+        const dialog = simulationDialog(page);
+        const source = dialog.getByLabel("Source channel", { exact: true });
+        const ids = (await channelChoices(source)).filter(Boolean);
+        expect(ids.length).toBeGreaterThanOrEqual(2);
+        await source.selectOption(ids[0]);
+        await dialog.getByLabel("Destination channel", { exact: true }).selectOption(ids[1]);
+        await dialog.getByLabel("Amount in sats", { exact: true }).fill("1000");
+        const submitted = page.waitForResponse(response => new URL(response.url()).pathname === "/api/v2/simulations" && response.request().method() === "POST");
+        await dialog.getByRole("button", { name: "Run simulation", exact: true }).click();
+        const response = await submitted;
+        expect([400, 409]).toContain(response.status());
+        const body = await response.text();
+        expect(["invalid_input", "stale_input"]).toContain(JSON.parse(body).error.code);
+        const alert = dialog.getByRole("alert");
+        await expect(alert).toHaveText(`${response.status()} ${body}`);
+        for (const width of WIDTHS) {
+          await page.setViewportSize({ width, height: 900 });
+          await expectReadable(page, `${theme} ${width}px simulation refusal`);
+          const measured = await alert.evaluate(element => {
+            const card = element.closest(".overlay-card")!;
+            return { error: element.scrollWidth - element.clientWidth, card: card.scrollWidth - card.clientWidth };
+          });
+          measurements.push({ theme, width, ...measured });
+          await alert.scrollIntoViewIfNeeded();
+          await page.screenshot({ path: info.outputPath(`refusal-${theme}-${width}.png`), fullPage: true });
+          for (const name of ["Run simulation", "Cancel"]) {
+            const button = dialog.getByRole("button", { name, exact: true });
+            await button.scrollIntoViewIfNeeded();
+            await expect(button).toBeInViewport({ ratio: 1 });
+          }
+        }
+        await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      }
+      await writeFile(info.outputPath("refusal-measurements.json"), JSON.stringify(measurements, null, 2));
+      expect(measurements).toEqual(measurements.map(item => ({ ...item, error: 0, card: 0 })));
+    }, undefined, true);
+  });
+});
