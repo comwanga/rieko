@@ -27,6 +27,41 @@ async fn get(app: &axum::Router, uri: &str, bearer: Option<&str>) -> axum::respo
         .unwrap()
 }
 
+fn assert_security_headers(resp: &axum::response::Response) {
+    let headers = resp.headers();
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("cross-origin-opener-policy", "same-origin"),
+    ] {
+        assert_eq!(headers.get(name).unwrap(), value, "{name}");
+    }
+    let directives: Vec<_> = headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .collect();
+    let expected = [
+        "default-src 'none'",
+        "connect-src 'self'",
+        "img-src 'self' data:",
+        "style-src 'self' 'unsafe-inline'",
+        "script-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+    ];
+    assert_eq!(directives.len(), expected.len());
+    for directive in expected {
+        assert!(directives.contains(&directive), "missing CSP: {directive}");
+    }
+    assert!(headers.get("access-control-allow-origin").is_none());
+}
+
 #[tokio::test]
 async fn unauthenticated_requests_fail_when_token_configured() {
     let app = app_with_auth(Some("top-secret"));
@@ -83,25 +118,73 @@ async fn no_token_configured_means_open_loopback_access() {
 async fn security_headers_are_present_on_api_responses() {
     let app = app_with_auth(None);
     let resp = get(&app, "/status", None).await;
-    let headers = resp.headers();
-    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
-    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
-    assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
-    assert_eq!(
-        headers.get("cross-origin-resource-policy").unwrap(),
-        "same-origin"
-    );
-    let csp = headers
-        .get("content-security-policy")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(csp.contains("default-src 'none'"));
-    assert!(csp.contains("frame-ancestors 'none'"));
+    assert_security_headers(&resp);
     // Sensitive data must never be cached.
-    assert_eq!(headers.get("cache-control").unwrap(), "no-store, max-age=0");
-    // No permissive CORS header: cross-origin readers get nothing.
-    assert!(headers.get("access-control-allow-origin").is_none());
+    assert_eq!(resp.headers()["cache-control"], "no-store, max-age=0");
+}
+
+#[tokio::test]
+async fn static_files_and_fallback_receive_headers_without_bypassing_api_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(
+        dir.path().join("index.html"),
+        "<!doctype html><title>Test</title>",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("assets/app.js"), "// fixture").unwrap();
+    let app = RiekoApi::new(Box::new(MemoryStorage::new()))
+        .unwrap()
+        .with_static_dir(dir.path())
+        .with_auth("test-token")
+        .unwrap()
+        .router();
+
+    for (path, bearer, status) in [
+        ("/", None, StatusCode::OK),
+        ("/assets/app.js", None, StatusCode::OK),
+        ("/assets/missing.js", None, StatusCode::NOT_FOUND),
+        ("/missing", None, StatusCode::NOT_FOUND),
+        ("/status", None, StatusCode::UNAUTHORIZED),
+        ("/status", Some("wrong-token"), StatusCode::UNAUTHORIZED),
+        ("/status", Some("test-token"), StatusCode::OK),
+    ] {
+        let response = get(&app, path, bearer).await;
+        assert_eq!(response.status(), status, "{path}");
+        assert_security_headers(&response);
+        if !path.starts_with("/assets") {
+            assert_eq!(response.headers()["cache-control"], "no-store, max-age=0");
+        }
+    }
+}
+
+#[tokio::test]
+async fn static_asset_cache_and_conditional_requests_are_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/app.js"), "// cache fixture").unwrap();
+    let app = RiekoApi::new(Box::new(MemoryStorage::new()))
+        .unwrap()
+        .with_static_dir(dir.path())
+        .router();
+    let response = get(&app, "/assets/app.js", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+    let modified = response.headers()[header::LAST_MODIFIED].clone();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::IF_MODIFIED_SINCE, modified)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_security_headers(&response);
+    assert!(response.headers().get(header::CACHE_CONTROL).is_none());
 }
 
 #[tokio::test]
@@ -133,6 +216,7 @@ async fn oversized_request_body_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_security_headers(&resp);
 }
 
 #[tokio::test]

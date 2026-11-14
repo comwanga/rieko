@@ -48,6 +48,28 @@ The release binary embeds the frontend. In development, `cargo run -- serve`
 serves the API without the UI; add `--static-dir frontend/dist` after building
 the frontend.
 
+### Browser smoke tests
+
+The smoke tests use Chromium and a real local agent to check that Overview data
+loads under the embedded and filesystem UI security policies. They use isolated
+databases and no external node services or credentials.
+
+```sh
+cd frontend
+npm ci
+npm run check
+npm run build
+npx --no-install playwright install chromium
+cd ..
+cargo build -p rieko-cli --bin rieko-agent
+cd frontend
+npm run test:browser
+```
+
+On Linux CI, install Chromium's system dependencies with
+`npx --no-install playwright install --with-deps chromium`. Failure traces,
+screenshots and agent logs are written to `frontend/test-results/`.
+
 ### Fixture scan (no LND)
 
 ```sh
