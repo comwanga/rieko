@@ -216,7 +216,7 @@
       <div class="kv" style="margin-top:0.5rem"><span>Error</span><span class="tag critical" role="status">{selected.error_code}</span></div>
     {/if}
 
-    <p class="muted" style="margin-top:1rem;padding:0.5rem;background:#f8f9fa;border-radius:6px" role="note">
+    <p class="muted" style="margin-top:1rem;padding:0.5rem;background:var(--surface-input);border-radius:6px" role="note">
       This is a deterministic projection based on recorded data. Rieko did not execute any action, and the Lightning Network may behave differently.
     </p>
   </div>
@@ -226,7 +226,7 @@
 .compare-bar {
   display: flex; align-items: center; gap: 0.75rem;
   margin-top: 1rem; padding: 0.6rem 0.75rem;
-  background: #f8f9fa; border-radius: 8px; font-size: 0.85rem;
+  background: var(--surface-input); border-radius: 8px; font-size: 0.85rem;
 }
-.btn-secondary { background: #f0f1f4; color: #1a1a2e; border: 1px solid #d0d3db; }
+.btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--border-strong); }
 </style>

@@ -213,6 +213,73 @@ fn normalizes_invoice_expired_payload() {
     }
 }
 
+#[test]
+fn unsupported_event_type_is_distinct_from_malformed_payload() {
+    let unsupported = br#"{"deliveryId":"delivery","webhookId":"webhook","type":"InvoiceCreated","timestamp":1724250000,"storeId":"store","invoiceId":"invoice"}"#;
+    assert!(
+        matches!(normalize_webhook_payload(unsupported), Err(rieko_ingest_btcpay::BtcPayError::UnsupportedWebhookEventType(kind)) if kind == "InvoiceCreated")
+    );
+    for malformed in [b"{".as_slice(), br#"{"type":"InvoiceCreated"}"#.as_slice(),
+        br#"{"deliveryId":"delivery","webhookId":"webhook","type":"InvoiceSettled","timestamp":1724250000,"storeId":"store"}"#.as_slice()] {
+        let error = normalize_webhook_payload(malformed).unwrap_err();
+        assert!(!matches!(error, rieko_ingest_btcpay::BtcPayError::UnsupportedWebhookEventType(_)));
+    }
+}
+
+#[test]
+fn invoice_lifecycle_and_payment_evidence_survive_normalization() {
+    for (kind, flag, field, normalized) in [
+        (
+            "InvoiceExpired",
+            "partiallyPaid",
+            "partially_paid",
+            "invoice_expired",
+        ),
+        (
+            "InvoiceInvalid",
+            "manuallyMarked",
+            "manually_marked",
+            "invoice_invalid",
+        ),
+        (
+            "InvoiceSettled",
+            "manuallyMarked",
+            "manually_marked",
+            "invoice_settled",
+        ),
+        (
+            "InvoiceReceivedPayment",
+            "afterExpiration",
+            "after_expiration",
+            "invoice_payment_received",
+        ),
+    ] {
+        for value in [Some(true), Some(false), None] {
+            let mut payload = serde_json::json!({
+                "deliveryId":"delivery", "webhookId":"webhook", "type":kind,
+                "timestamp":1724248900, "storeId":"store", "invoiceId":"invoice"
+            });
+            if let Some(value) = value {
+                payload[flag] = value.into();
+            }
+            let event = normalize_webhook_payload(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            let stored = serde_json::to_value(event).unwrap();
+            assert_eq!(stored["type"], normalized);
+            assert_eq!(
+                stored.get(field).and_then(serde_json::Value::as_bool),
+                value
+            );
+            payload[flag] = "false".into();
+            assert!(normalize_webhook_payload(&serde_json::to_vec(&payload).unwrap()).is_err());
+        }
+    }
+    let processing = br#"{"deliveryId":"d","webhookId":"w","type":"InvoiceProcessing","timestamp":1724248900,"storeId":"s","invoiceId":"i"}"#;
+    assert!(matches!(
+        normalize_webhook_payload(processing).unwrap(),
+        NodeEvent::InvoiceProcessing(_)
+    ));
+}
+
 #[tokio::test]
 async fn adapter_event_stream_propagates_webhook_events() {
     let client = BtcPayGreenfieldClient::new("https://btcpay.mock.test", "test-api-key")

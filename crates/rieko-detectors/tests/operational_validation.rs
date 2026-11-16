@@ -185,6 +185,7 @@ fn full_operational_pipeline_btcpay_lnd_webhooks_to_recommendations() {
     };
 
     let ctx = DetectorContext {
+        evaluated_at: chrono::Utc::now(),
         network: BitcoinNetwork::Mainnet,
         history: None,
         source: Some(&btcpay_source),

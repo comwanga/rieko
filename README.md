@@ -27,11 +27,21 @@ Open `http://localhost:8080` for the UI. The scan runs the pipeline: ingest →
 detect → recommend → explain → alert → persist. Findings are written to
 `~/.rieko/rieko.db` by default (override with `--db`).
 
+The Findings view starts with active findings; use Resolved or All to include
+history. Open a finding from the list or Overview to see its stored evidence,
+provenance (when recorded), and linked recommendations with their rationale.
+Linked recommendations are drawn from the latest 500; the page states when
+that limit may make the list incomplete. The sidebar shows the active findings
+count, with `50+` when its request limit is reached.
+
+Services shows Bitcoin Core, LND and BTCPay Server status cards above the channel
+liquidity table. Existing `#/channels` links also open Services.
+
 ## Running locally
 
 ### Prerequisites
 
-- **Rust** 1.86+
+- **Rust** 1.89+
 - **Node.js** 22+ (for building the frontend)
 - **LND** 0.17+ (optional — only for live-node observation)
 
@@ -47,6 +57,30 @@ cargo build --release
 The release binary embeds the frontend. In development, `cargo run -- serve`
 serves the API without the UI; add `--static-dir frontend/dist` after building
 the frontend.
+
+### Browser smoke tests
+
+The smoke tests use Chromium and a real local agent to check that Overview data
+loads under the embedded and filesystem UI security policies. They use isolated
+databases and no external node services or credentials.
+
+```sh
+cd frontend
+npm ci
+npm run check
+npm run build
+npx --no-install playwright install chromium
+cd ..
+cargo build -p rieko-cli
+cd frontend
+npm run test:browser
+```
+
+On Linux CI, install Chromium's system dependencies with
+`npx --no-install playwright install --with-deps chromium`. The browser suite
+disables request traces to avoid recording bearer headers. Failure screenshots
+and status/error artifacts remain in `frontend/test-results/`; agent diagnostics
+are attached to the test report. Tests use synthetic tokens only.
 
 ### Fixture scan (no LND)
 
@@ -92,6 +126,35 @@ Snapshot retention is configurable with `--retention-days` (default 30),
 `--closed-retention-days` (default 3), and `--cleanup-interval` (default 6h).
 
 ### Serve API and UI
+
+Each UI view has its own address (`#/overview`, `#/findings`,
+`#/recommendations`, `#/simulations`, `#/channels`, `#/audit`), so views can be
+bookmarked and the browser's back and forward buttons work. The UI is dark by
+default; the button in the top bar switches to a light theme and the choice is
+remembered in this browser's `localStorage` (it is a display preference, not a
+credential).
+
+The Overview shows one card each for Bitcoin Core, LND, BTCPay Server and Rieko,
+plus the active findings. Service cards report only what the agent has observed:
+**Not observed** (no poll recorded), **Never connected** (polls attempted, none
+succeeded), **Connected**, or **Disconnected** (the values shown are the last ones
+seen). The Rieko card and the top-bar pill show the agent's own pipeline state from
+`/status`; it does not yet account for Bitcoin Core or LND reachability, so it is
+never presented as the health of every system.
+
+When the API requires authentication, the UI prompts for the raw token from your
+configured token file. A successful check remembers it in `sessionStorage` for
+that browser tab and origin, including reloads and session restores. Same-origin
+JavaScript can access this storage; it is not a memory-only secret store. If
+storage is unavailable, the UI can use the token in memory and reports that limit.
+Tokens are never placed in URLs or `localStorage`. A configured API base must
+remain on the UI's origin to receive a token; same-origin path prefixes work.
+
+Use **Forget token** to clear this page's credential and cached data and remove
+the app's saved token. If storage removal fails, the UI reports that a saved value
+may remain; clear the site's session data before reloading, or restore storage
+access and retry Forget. Forget does not revoke the server's token or undo an
+already accepted request. Requests are not automatically replayed after login.
 
 ```sh
 # Loopback (safe default)
@@ -236,6 +299,7 @@ to 5 requests per second.
 Rieko supports ingestion from BTCPay Server Greenfield:
 - **Webhook Ingestion**: Real-time event streaming (`InvoiceSettled`, `InvoiceExpired`, `InvoicePaymentReceived`) via `POST /api/v1/integrations/btcpay/webhook` with constant-time HMAC-SHA256 signature verification (`BTCPay-Sig`).
 - **Finding Pipeline**: `rieko-agent` owns the long-running webhook, detector, persistence, and local API runtime. `rieko serve` delegates to that same implementation for compatibility. When configured with the webhook secret, network, and node scope, normalized invoice events feed the deterministic settlement-reliability detector and findings are persisted for `GET /findings` and the API-backed `rieko findings` command. The endpoint fails closed when this integration is not configured.
+- **Unsupported events**: The first delivery of a correctly signed, well-formed webhook envelope for an event type Rieko does not consume returns HTTP 200 with `status: "ignored"`. Its delivery ID is recorded for durable deduplication, and no event reaches the detector. Redeliveries use the existing `already_processed` response. Malformed payloads and invalid signatures remain rejected.
 - **REST Client**: Asynchronous polling of Lightning info, channels, balances, on-chain wallets, and invoices.
 - **Normalized Ingestion Adapter**: Pluggable `NodeIngestionAdapter` yielding an asynchronous stream of normalized domain `NodeEvent` and `NodeSnapshot` objects.
 
@@ -304,7 +368,7 @@ LND / BTCPay / Core ──▶ Ingestion Adapters ──▶ Normalized Domain Eve
 |----------|----|----------------|
 | Liquidity | `channel_liquidity` | Channels imbalanced below threshold (outbound/inbound/severely drained) |
 | Drift | `liquidity_trend` | Channels trending toward drain over multiple snapshots |
-| Settlement reliability | `settlement_reliability` | Repeated BTCPay invoice settlement failures in the bounded event window |
+| Settlement reliability | `settlement_reliability` | Distinct invoices with payment-supported failures in a configurable 60-minute window; [v2 semantics](docs/settlement-reliability.md) |
 | BTCPay backend health | `btcpay_backend_health` | Persisted Greenfield connectivity is degraded |
 | Bitcoin Core sync correlation | `bitcoin_core_sync_correlation` | BTCPay and Core are reachable, but persisted Core state is unsynchronized |
 | Lightning chain sync correlation | `lightning_chain_sync_correlation` | BTCPay and synchronized Core are reachable, but persisted LND state is not synced to chain |

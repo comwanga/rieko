@@ -6,7 +6,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM rust:1.86-bookworm AS rust-builder
+FROM rust:1.89-bookworm AS rust-builder
 
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./

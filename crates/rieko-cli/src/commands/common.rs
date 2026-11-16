@@ -356,13 +356,32 @@ fn persist_cycle<S: Storage + rieko_status::OperationalStateStore>(
         for snapshot in snapshots {
             storage.save_channel_snapshot(snapshot)?;
         }
+        let in_scope = |scope: &FindingCycleScope, finding: &Finding| {
+            finding.detector == scope.detector
+                && finding.node == scope.node
+                && finding
+                    .provenance
+                    .as_ref()
+                    .is_none_or(|provenance| provenance.network == scope.network)
+        };
         for scope in scopes {
-            storage.resolve_findings_for_scope(scope)?;
+            let scoped_findings: Vec<_> = findings
+                .iter()
+                .filter(|finding| in_scope(scope, finding))
+                .cloned()
+                .collect();
+            storage.apply_finding_cycle(scope, &scoped_findings)?;
         }
-        // Cascade any newly-resolved findings to their recommendations (Item 6).
-        storage
-            .sync_recommendation_lifecycles()
-            .context("syncing recommendation lifecycles")?;
+        // Compatibility for callers persisting findings without cycle scopes.
+        if scopes.is_empty() {
+            storage.sync_recommendation_lifecycles()?;
+        }
+        for finding in findings
+            .iter()
+            .filter(|finding| !scopes.iter().any(|scope| in_scope(scope, finding)))
+        {
+            storage.save_finding(finding)?;
+        }
         let recommendations = persist_cycle_locked(storage, engine, findings)?;
         record_cycle_success(storage)?;
         Ok(recommendations)
@@ -453,8 +472,6 @@ fn persist_cycle_locked<S: Storage>(
 ) -> Result<Vec<Recommendation>> {
     let mut all = Vec::new();
     for finding in findings {
-        storage.save_finding(finding)?;
-
         let recommendations = engine.recommend(finding).with_context(|| {
             format!(
                 "recommending for finding {} from detector {} version {}",
@@ -554,6 +571,7 @@ mod tests {
         let observation_source = source.observation_source().unwrap();
         let normalizer = source.normalizer();
         let context = rieko_detectors::DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: source.network,
             history: None,
             source: Some(&observation_source),

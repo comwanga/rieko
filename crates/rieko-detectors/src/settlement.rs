@@ -1,5 +1,7 @@
-use chrono::Utc;
-use rieko_domain::{ChannelStatus, NodeEvent, NodeId, PaymentStatus};
+use std::collections::BTreeMap;
+
+use chrono::Duration;
+use rieko_domain::{ChannelStatus, NodeEvent, NodeId};
 use rieko_findings::{
     channel_snapshot_state_digest, finding_identity, ChannelSnapshotReference, Evidence, Finding,
     FindingLifecycle, FindingProvenance, ObservationReference, Severity, FINDING_SCHEMA_VERSION,
@@ -11,7 +13,9 @@ use crate::registry::{provenance_producers, Detector, DetectorContext};
 /// Tunable thresholds for the lightning settlement reliability degradation detector.
 #[derive(Debug, Clone, Copy)]
 pub struct SettlementReliabilityThresholds {
-    /// Minimum failed/expired invoices in the evaluation window before raising a finding.
+    /// Time horizon for invoice evidence, evaluated against the caller clock.
+    pub window: Duration,
+    /// Minimum failed invoices in the evaluation window before raising a finding.
     pub min_failed_invoices: usize,
     /// Failure rate (failed / (failed + settled)) threshold for Warning.
     pub warn_failure_rate: f64,
@@ -24,6 +28,7 @@ pub struct SettlementReliabilityThresholds {
 impl Default for SettlementReliabilityThresholds {
     fn default() -> Self {
         Self {
+            window: Duration::minutes(60),
             min_failed_invoices: 2,
             warn_failure_rate: 0.40,
             critical_failure_rate: 0.70,
@@ -32,16 +37,9 @@ impl Default for SettlementReliabilityThresholds {
     }
 }
 
-/// Detector #3: Lightning Settlement Reliability Degradation.
-///
-/// Correlates:
-/// 1. BTCPay Server invoice settlement failures and expiries over a temporal window.
-/// 2. LND outbound liquidity exhaustion or channel inactivity on key paths.
-/// 3. Bitcoin Core chain synchronization health.
-///
-/// When invoice failures increase while Bitcoin Core remains fully synchronized,
-/// Rieko determines the root cause is **Lightning operational degradation (liquidity exhaustion / channel downtime)**,
-/// rather than blockchain synchronization lag, and raises a typed finding with concrete rebalancing recommendations.
+/// Invoice settlement failures supported by explicit payment/lifecycle evidence.
+/// Abandoned checkouts and unknown or pending outcomes are excluded from the
+/// rate. Each store/invoice contributes at most once in the configured window.
 pub struct SettlementReliabilityDetector {
     pub thresholds: SettlementReliabilityThresholds,
     pub local_node: NodeId,
@@ -72,7 +70,7 @@ impl Detector for SettlementReliabilityDetector {
     }
 
     fn version(&self) -> &'static str {
-        "1"
+        "2"
     }
 
     fn run(&self, view: &dyn GraphView, ctx: &DetectorContext) -> Vec<Finding> {
@@ -87,66 +85,90 @@ impl Detector for SettlementReliabilityDetector {
             return Vec::new();
         }
 
-        // 1. Analyze BTCPay temporal invoice events
-        let mut expired_count: usize = 0;
-        let mut settled_count: usize = 0;
-        let mut invoice_ids = Vec::new();
-        let mut store_ids = Vec::new();
-        let mut observed_at = Vec::new();
-
-        for event in events {
-            match event {
-                NodeEvent::InvoiceExpired(invoice) => {
-                    expired_count += 1;
-                    invoice_ids.push(invoice.id.clone());
-                    store_ids.extend(invoice.store_id.iter().cloned());
-                    observed_at.push(invoice.timestamp);
-                }
-                NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
-                    status: PaymentStatus::Failed,
-                    ..
-                })
-                | NodeEvent::PaymentMetric(rieko_domain::PaymentMetricEvent {
-                    status: PaymentStatus::Failed,
-                    ..
-                }) => {
-                    expired_count += 1;
-                }
-                NodeEvent::InvoiceSettled(invoice) => {
-                    settled_count += 1;
-                    invoice_ids.push(invoice.id.clone());
-                    store_ids.extend(invoice.store_id.iter().cloned());
-                    observed_at.push(invoice.timestamp);
-                }
-                NodeEvent::InvoicePaymentReceived(invoice) => {
-                    settled_count += 1;
-                    invoice_ids.push(invoice.id.clone());
-                    store_ids.extend(invoice.store_id.iter().cloned());
-                    observed_at.push(invoice.timestamp);
-                }
-                NodeEvent::PaymentAttempt(rieko_domain::PaymentEvent {
-                    status: PaymentStatus::Succeeded,
-                    ..
-                })
-                | NodeEvent::PaymentMetric(rieko_domain::PaymentMetricEvent {
-                    status: PaymentStatus::Succeeded,
-                    ..
-                }) => {
-                    settled_count += 1;
-                }
-                _ => {}
-            }
-        }
-
-        let total_invoices = expired_count + settled_count;
-        if total_invoices == 0 || expired_count < self.thresholds.min_failed_invoices {
+        let Some(window_start) = ctx.evaluated_at.checked_sub_signed(self.thresholds.window) else {
+            return Vec::new();
+        };
+        if self.thresholds.window <= Duration::zero() {
             return Vec::new();
         }
-
-        let failure_rate = expired_count as f64 / total_invoices as f64;
+        #[derive(Default)]
+        struct InvoiceOutcome {
+            failed: bool,
+            settled: bool,
+            abandoned: bool,
+            unknown: bool,
+            partial_expiry: bool,
+        }
+        let mut invoices: BTreeMap<(Option<String>, String), InvoiceOutcome> = BTreeMap::new();
+        for event in events {
+            if event.timestamp() < window_start || event.timestamp() > ctx.evaluated_at {
+                continue;
+            }
+            let (id, store) = match event {
+                NodeEvent::InvoiceSettled(e) | NodeEvent::InvoiceProcessing(e) => {
+                    (&e.id, &e.store_id)
+                }
+                NodeEvent::InvoiceExpired(e) => (&e.id, &e.store_id),
+                NodeEvent::InvoiceInvalid(e) => (&e.id, &e.store_id),
+                NodeEvent::InvoicePaymentReceived(e) => (&e.id, &e.store_id),
+                _ => continue,
+            };
+            let invoice = invoices.entry((store.clone(), id.clone())).or_default();
+            match event {
+                NodeEvent::InvoiceExpired(e) => match e.partially_paid {
+                    Some(true) => {
+                        invoice.failed = true;
+                        invoice.partial_expiry = true;
+                    }
+                    Some(false) => invoice.abandoned = true,
+                    None => invoice.unknown = true,
+                },
+                NodeEvent::InvoiceInvalid(e) => match e.manually_marked {
+                    Some(false) => invoice.failed = true,
+                    _ => invoice.unknown = true,
+                },
+                NodeEvent::InvoiceSettled(e) => match e.manually_marked {
+                    Some(false) => invoice.settled = true,
+                    _ => invoice.unknown = true,
+                },
+                NodeEvent::InvoicePaymentReceived(e) => match e.after_expiration {
+                    Some(true) => invoice.failed = true,
+                    Some(false) => {} // Receiving a payment does not prove settlement.
+                    None => invoice.unknown = true,
+                },
+                _ => {} // Processing is pending, not settled.
+            }
+        }
+        // Failure evidence takes precedence over eventual settlement. This is
+        // a rate of invoices with failures observed in the window, not a claim
+        // that an invoice never subsequently recovered. Unioning facts makes
+        // redeliveries and out-of-order events deterministic.
+        let failed_count = invoices.values().filter(|i| i.failed).count();
+        let settled_count = invoices.values().filter(|i| !i.failed && i.settled).count();
+        let abandoned_count = invoices
+            .values()
+            .filter(|i| !i.failed && !i.settled && i.abandoned)
+            .count();
+        let unknown_count = invoices
+            .values()
+            .filter(|i| !i.failed && !i.settled && !i.abandoned && i.unknown)
+            .count();
+        let pending_count =
+            invoices.len() - failed_count - settled_count - abandoned_count - unknown_count;
+        let expired_count = invoices.values().filter(|i| i.partial_expiry).count();
+        let total_invoices = failed_count + settled_count;
+        if total_invoices == 0 || failed_count < self.thresholds.min_failed_invoices {
+            return Vec::new();
+        }
+        let failure_rate = failed_count as f64 / total_invoices as f64;
         if failure_rate < self.thresholds.warn_failure_rate {
             return Vec::new();
         }
+        let mut invoice_ids: Vec<_> = invoices.keys().map(|(_, id)| id.clone()).collect();
+        let mut store_ids: Vec<_> = invoices
+            .keys()
+            .filter_map(|(store, _)| store.clone())
+            .collect();
 
         // 2. Analyze LND channel states and outbound liquidity
         let channels = view.channels();
@@ -186,10 +208,7 @@ impl Detector for SettlementReliabilityDetector {
             !drained_channels.is_empty() || !inactive_channels.is_empty();
 
         // 4. Determine severity
-        let severity = if failure_rate >= self.thresholds.critical_failure_rate
-            || expired_count >= 5
-            || (!drained_channels.is_empty() && !inactive_channels.is_empty())
-        {
+        let severity = if failure_rate >= self.thresholds.critical_failure_rate {
             Severity::Critical
         } else {
             Severity::Warning
@@ -197,6 +216,19 @@ impl Detector for SettlementReliabilityDetector {
 
         // 5. Structure evidence
         let mut evidence = vec![
+            Evidence::number("failed_invoices", failed_count as f64),
+            Evidence::number("abandoned_invoices", abandoned_count as f64),
+            Evidence::number("unknown_invoices", unknown_count as f64),
+            Evidence::number("pending_invoices", pending_count as f64),
+            Evidence::number("observed_invoices", invoices.len() as f64),
+            Evidence::number("window_seconds", self.thresholds.window.num_milliseconds() as f64 / 1000.0),
+            Evidence::number("minimum_failed_invoices", self.thresholds.min_failed_invoices as f64),
+            Evidence::number("warning_failure_rate", self.thresholds.warn_failure_rate),
+            Evidence::number("critical_failure_rate", self.thresholds.critical_failure_rate),
+            Evidence::string("window_started_at", window_start.to_rfc3339()),
+            Evidence::string("window_ended_at", ctx.evaluated_at.to_rfc3339()),
+            Evidence::string("failure_definition", "InvoiceExpired partially_paid=true, InvoiceInvalid manually_marked=false, or payment after_expiration=true; each store/invoice counted once; observed failure takes precedence over later settlement."),
+            Evidence { key: "invoice_keys".into(), value: serde_json::json!(invoices.keys().map(|(store, id)| serde_json::json!({"store_id":store,"invoice_id":id})).collect::<Vec<_>>()) },
             Evidence::number("expired_invoices", expired_count as f64),
             Evidence::number("settled_invoices", settled_count as f64),
             Evidence::number("total_invoices", total_invoices as f64),
@@ -233,7 +265,6 @@ impl Detector for SettlementReliabilityDetector {
         invoice_ids.dedup();
         store_ids.sort();
         store_ids.dedup();
-        observed_at.sort();
         evidence.extend([
             Evidence {
                 key: "invoice_ids".into(),
@@ -254,18 +285,11 @@ impl Detector for SettlementReliabilityDetector {
                 ),
             },
         ]);
-        if let (Some(first), Some(last)) = (observed_at.first(), observed_at.last()) {
-            evidence.extend([
-                Evidence::string("window_started_at", first.to_rfc3339()),
-                Evidence::string("window_ended_at", last.to_rfc3339()),
-            ]);
-        }
-
         if let Some(ref ch_id) = target_channel_id {
             evidence.push(Evidence::string("bottleneck_channel", ch_id.clone()));
         }
 
-        let now = Utc::now();
+        let now = ctx.evaluated_at;
         let node_id_str = self.local_node.to_string();
 
         let id = finding_identity(
@@ -311,27 +335,15 @@ impl Detector for SettlementReliabilityDetector {
             }
         });
 
-        let explanation = match (chain_synchronized, lightning_degradation_observed) {
-            (Some(true), true) => format!(
-                "Lightning settlement reliability degraded: {} of {} invoices failed or expired ({:.1}% failure rate). \
-                 Bitcoin Core is synchronized, confirming root cause is Lightning channel liquidity exhaustion ({} drained, {} inactive).",
-                expired_count,
-                total_invoices,
-                failure_rate * 100.0,
-                drained_channels.len(),
-                inactive_channels.len()
-            ),
-            (Some(false), _) => format!(
-                "Invoice settlements failing due to Bitcoin Core synchronization lag ({} expired invoices).",
-                expired_count
-            ),
-            _ => format!(
-                "Invoice settlement reliability degraded: {} of {} invoices failed or expired ({:.1}% failure rate). Direct Bitcoin and Lightning evidence is not yet available, so the root cause is undetermined.",
-                expired_count,
-                total_invoices,
-                failure_rate * 100.0,
-            ),
+        let observations = match (chain_synchronized, lightning_degradation_observed) {
+            (Some(true), true) => format!("Core is synchronized; {} drained and {} inactive Lightning channels were also observed. These observations do not establish causation.", drained_channels.len(), inactive_channels.len()),
+            (Some(false), _) => "Core is unsynchronized; this observation alone does not establish the cause of the invoice failures.".into(),
+            _ => "The cause is undetermined from the available observations.".into(),
         };
+        let explanation = format!(
+            "Settlement failures were observed for {failed_count} of {total_invoices} eligible invoices ({:.1}% failure rate) in the last {} seconds. Each store/invoice is counted once. Excluded: {abandoned_count} abandoned, {unknown_count} unknown and {pending_count} pending invoices. {observations}",
+            failure_rate * 100.0, self.thresholds.window.num_seconds()
+        );
 
         vec![Finding {
             id,
@@ -353,12 +365,18 @@ impl Detector for SettlementReliabilityDetector {
 
     fn is_complete(&self, _view: &dyn GraphView, ctx: &DetectorContext) -> bool {
         ctx.events.is_some()
+            && self.thresholds.window > Duration::zero()
+            && ctx
+                .evaluated_at
+                .checked_sub_signed(self.thresholds.window)
+                .is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use rieko_domain::{
         BitcoinNetwork, Channel, ChannelId, FeePolicy, InvoiceExpiredEvent, InvoiceSettledEvent,
         LiquidityProfile,
@@ -404,6 +422,7 @@ mod tests {
 
         let events = vec![
             NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+                manually_marked: Some(false),
                 id: "inv-1".into(),
                 store_id: None,
                 payment_method: None,
@@ -414,18 +433,21 @@ mod tests {
                 metadata: std::collections::HashMap::new(),
             }),
             NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: "inv-2".into(),
                 store_id: None,
                 amount_msat: Some(1000),
                 timestamp: Utc::now(),
             }),
             NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: "inv-3".into(),
                 store_id: None,
                 amount_msat: Some(2000),
                 timestamp: Utc::now(),
             }),
             NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: "inv-4".into(),
                 store_id: None,
                 amount_msat: Some(3000),
@@ -440,6 +462,7 @@ mod tests {
         };
 
         let ctx = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Regtest,
             history: None,
             source: Some(&source),
@@ -490,12 +513,14 @@ mod tests {
 
         let events = vec![
             NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: "inv-1".into(),
                 store_id: None,
                 amount_msat: Some(1000),
                 timestamp: Utc::now(),
             }),
             NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: "inv-2".into(),
                 store_id: None,
                 amount_msat: Some(2000),
@@ -504,6 +529,7 @@ mod tests {
         ];
 
         let ctx = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Regtest,
             history: None,
             source: None,
@@ -543,6 +569,7 @@ mod tests {
 
         let events = vec![
             NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+                manually_marked: Some(false),
                 id: "inv-1".into(),
                 store_id: None,
                 payment_method: None,
@@ -553,6 +580,7 @@ mod tests {
                 metadata: std::collections::HashMap::new(),
             }),
             NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+                manually_marked: Some(false),
                 id: "inv-2".into(),
                 store_id: None,
                 payment_method: None,
@@ -565,6 +593,7 @@ mod tests {
         ]; // 0 expired, 2 settled -> 0% failure rate
 
         let ctx = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Regtest,
             history: None,
             source: None,

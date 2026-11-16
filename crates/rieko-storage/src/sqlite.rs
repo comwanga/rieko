@@ -29,6 +29,91 @@ const SYNCHRONOUS_MODE: &str = "NORMAL";
 
 /// Sync strategy for opening connections; ensures reproducible connection state.
 impl SqliteStorage {
+    fn row_to_webhook_event(row: &rusqlite::Row) -> rusqlite::Result<WebhookEventRecord> {
+        let event_json: String = row.get(1)?;
+        let event = serde_json::from_str(&event_json).map_err(|error| {
+            invalid_storage_column(1, format!("invalid webhook event: {error}"))
+        })?;
+        let accepted_at = parse_persisted_timestamp(2, "webhook accepted_at", row.get(2)?)?;
+        let processed_at = row
+            .get::<_, Option<String>>(3)?
+            .map(|value| parse_persisted_timestamp(3, "webhook processed_at", value))
+            .transpose()?;
+        Ok(WebhookEventRecord {
+            delivery_id: row.get(0)?,
+            event,
+            accepted_at,
+            processed_at,
+        })
+    }
+
+    fn save_finding_scoped(
+        &mut self,
+        finding: &Finding,
+        network: Option<rieko_domain::BitcoinNetwork>,
+    ) -> Result<(), StorageError> {
+        crate::storage::validate_finding_schema(finding.schema_version)?;
+        let severity = finding.severity as i64;
+        let evidence = serde_json::to_string(&finding.evidence)
+            .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
+        let provenance = finding
+            .provenance
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StorageError::Corrupt(format!("finding provenance: {e}")))?;
+        self.conn.execute(
+            "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
+                     evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
+                     lifecycle, schema_version, consecutive_absent, scope_network)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                      MIN(?11, COALESCE((
+                         SELECT MIN(first_seen_at) FROM findings
+                         WHERE detector = ?2 AND detector_version = ?3
+                           AND node_id IS ?5 AND channel_id IS ?6
+                           AND scope_network IS ?14
+                      ), ?11)), ?12, 'active', ?13, 0, ?14)
+              ON CONFLICT(id) DO UPDATE SET
+                first_seen_at = MIN(findings.first_seen_at, excluded.first_seen_at),
+                severity = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.severity ELSE findings.severity END,
+                evidence = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.evidence ELSE findings.evidence END,
+                scope_network = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.scope_network ELSE findings.scope_network END,
+                provenance = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.provenance ELSE findings.provenance END,
+                explanation = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.explanation ELSE findings.explanation END,
+                schema_version = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.schema_version ELSE findings.schema_version END,
+                ts = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN excluded.ts ELSE findings.ts END,
+                last_seen_at = MAX(findings.last_seen_at, excluded.last_seen_at),
+                lifecycle = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN 'active' ELSE findings.lifecycle END,
+                consecutive_absent = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
+                    THEN 0 ELSE findings.consecutive_absent END",
+            params![
+                finding.id,
+                finding.detector,
+                finding.detector_version,
+                severity,
+                finding.node,
+                finding.channel,
+                evidence,
+                provenance,
+                finding.explanation,
+                finding.timestamp.to_rfc3339(),
+                finding.first_seen_at.to_rfc3339(),
+                finding.last_seen_at.to_rfc3339(),
+                finding.schema_version,
+                network.map(|network| network.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
         let conn = Connection::open(path).map_err(|e| {
@@ -278,7 +363,7 @@ impl Storage for SqliteStorage {
     ) -> Result<(), StorageError> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO webhook_deliveries (delivery_id, webhook_id, event_type, processed_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, webhook_id, event_type, processed_at) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     delivery_id,
                     webhook_id,
@@ -412,29 +497,35 @@ impl Storage for SqliteStorage {
                 ))
             })?;
         let rows = statement
-            .query_map([row_limit], |row| {
-                let event_json: String = row.get(1)?;
-                let event = serde_json::from_str(&event_json).map_err(|error| {
-                    invalid_storage_column(1, format!("invalid webhook event: {error}"))
-                })?;
-                let accepted_at = parse_persisted_timestamp(2, "webhook accepted_at", row.get(2)?)?;
-                let processed_at = row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| parse_persisted_timestamp(3, "webhook processed_at", value))
-                    .transpose()?;
-                Ok(WebhookEventRecord {
-                    delivery_id: row.get(0)?,
-                    event,
-                    accepted_at,
-                    processed_at,
-                })
-            })
+            .query_map([row_limit], Self::row_to_webhook_event)
             .map_err(|error| {
                 StorageError::Backend(format!("querying processed webhook history: {error}"))
             })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
             StorageError::Corrupt(format!("reading processed webhook history: {error}"))
         })
+    }
+
+    fn processed_webhook_events_since(
+        &mut self,
+        observed_since: DateTime<Utc>,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT delivery_id, event_json, accepted_at, processed_at
+             FROM webhook_events WHERE processed_at IS NOT NULL
+               AND (julianday(json_extract(event_json, '$.timestamp')) >= julianday(?1)
+                    OR julianday(json_extract(event_json, '$.timestamp')) IS NULL)
+             ORDER BY accepted_at ASC, delivery_id ASC",
+        )?;
+        let rows =
+            statement.query_map([observed_since.to_rfc3339()], Self::row_to_webhook_event)?;
+        let mut records = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+        // SQLite date functions round fractions; enforce the detector's exact
+        // boundary with typed timestamps after the SQL prefilter.
+        records.retain(|record| record.event.timestamp() >= observed_since);
+        Ok(records)
     }
 
     fn mark_webhook_event_processed(
@@ -498,63 +589,19 @@ impl Storage for SqliteStorage {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
-        crate::storage::validate_finding_schema(finding.schema_version)?;
-        let severity = finding.severity as i64;
-        let evidence = serde_json::to_string(&finding.evidence)
-            .map_err(|e| StorageError::Corrupt(format!("finding evidence: {e}")))?;
-        let provenance = finding
-            .provenance
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| StorageError::Corrupt(format!("finding provenance: {e}")))?;
-        self.conn.execute(
-            "INSERT INTO findings (id, detector, detector_version, severity, node_id, channel_id,
-                     evidence, provenance, explanation, ts, first_seen_at, last_seen_at,
-                     lifecycle, schema_version, consecutive_absent)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                      MIN(?11, COALESCE((
-                         SELECT MIN(first_seen_at) FROM findings
-                         WHERE detector = ?2 AND detector_version = ?3
-                           AND node_id IS ?5 AND channel_id IS ?6
-                           AND json_extract(provenance, '$.network') IS
-                               json_extract(?8, '$.network')
-                      ), ?11)), ?12, 'active', ?13, 0)
-              ON CONFLICT(id) DO UPDATE SET
-                first_seen_at = MIN(findings.first_seen_at, excluded.first_seen_at),
-                severity = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.severity ELSE findings.severity END,
-                evidence = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.evidence ELSE findings.evidence END,
-                provenance = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.provenance ELSE findings.provenance END,
-                explanation = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.explanation ELSE findings.explanation END,
-                schema_version = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.schema_version ELSE findings.schema_version END,
-                ts = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN excluded.ts ELSE findings.ts END,
-                last_seen_at = MAX(findings.last_seen_at, excluded.last_seen_at),
-                lifecycle = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN 'active' ELSE findings.lifecycle END,
-                consecutive_absent = CASE WHEN excluded.last_seen_at >= findings.last_seen_at
-                    THEN 0 ELSE findings.consecutive_absent END",
-            params![
-                finding.id,
-                finding.detector,
-                finding.detector_version,
-                severity,
-                finding.node,
-                finding.channel,
-                evidence,
-                provenance,
-                finding.explanation,
-                finding.timestamp.to_rfc3339(),
-                finding.first_seen_at.to_rfc3339(),
-                finding.last_seen_at.to_rfc3339(),
-                finding.schema_version,
-            ],
-        )?;
+        self.save_finding_scoped(finding, finding.provenance.as_ref().and_then(|p| p.network))
+    }
+
+    fn apply_finding_cycle(
+        &mut self,
+        scope: &FindingCycleScope,
+        findings: &[Finding],
+    ) -> Result<(), StorageError> {
+        self.resolve_findings_for_scope(scope)?;
+        self.sync_recommendation_lifecycles()?;
+        for finding in findings {
+            self.save_finding_scoped(finding, scope.network)?;
+        }
         Ok(())
     }
 
@@ -563,13 +610,12 @@ impl Storage for SqliteStorage {
         scope: &FindingCycleScope,
     ) -> Result<(), StorageError> {
         if scope.complete {
-            // Hysteresis: only resolve findings that have been absent for at
-            // least 2 consecutive complete cycles. Findings absent for exactly
-            // 0–1 cycles get their counter incremented instead.
+            // Hysteresis: resolve on the third consecutive complete cycle of
+            // absence. A stored count of 2 records the two prior clean cycles.
             self.conn.execute(
                 "UPDATE findings SET lifecycle = 'resolved', consecutive_absent = 0
                  WHERE detector = ?1 AND node_id IS ?2
-                   AND json_extract(provenance, '$.network') IS ?3
+                   AND scope_network IS ?3
                    AND lifecycle = 'active'
                    AND consecutive_absent >= 2",
                 params![
@@ -581,7 +627,7 @@ impl Storage for SqliteStorage {
             self.conn.execute(
                 "UPDATE findings SET consecutive_absent = consecutive_absent + 1
                  WHERE detector = ?1 AND node_id IS ?2
-                   AND json_extract(provenance, '$.network') IS ?3
+                   AND scope_network IS ?3
                    AND lifecycle = 'active'
                    AND consecutive_absent < 2",
                 params![
@@ -3566,6 +3612,41 @@ mod tests {
     }
 
     #[test]
+    fn recording_a_duplicate_delivery_preserves_original_metadata() {
+        let mut storage = SqliteStorage::in_memory().unwrap();
+        let first = Utc::now();
+        storage
+            .record_webhook_delivery(
+                "delivery",
+                Some("first-webhook"),
+                Some("InvoiceCreated"),
+                first,
+            )
+            .unwrap();
+        storage
+            .record_webhook_delivery(
+                "delivery",
+                Some("replacement"),
+                Some("InvoiceSettled"),
+                first + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        let record: (String, String, String) = storage.conn.query_row(
+            "SELECT webhook_id, event_type, processed_at FROM webhook_deliveries WHERE delivery_id = 'delivery'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        ).unwrap();
+        assert_eq!(
+            record,
+            (
+                "first-webhook".into(),
+                "InvoiceCreated".into(),
+                first.to_rfc3339()
+            )
+        );
+        assert!(storage.pending_webhook_events(10).unwrap().is_empty());
+    }
+
+    #[test]
     fn concurrent_reader_and_writer_do_not_fail_with_busy() {
         use std::thread;
         // One writer committing inside a transaction while another connection
@@ -3823,6 +3904,114 @@ mod tests {
             assert_eq!(
                 finding_by_id(storage.as_mut(), &mainnet.id).lifecycle,
                 FindingLifecycle::Active
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_scope_without_provenance_is_network_isolated_and_transactional() {
+        for mut storage in lifecycle_backends() {
+            let mut regtest = sample_finding();
+            regtest.detector = "settlement_reliability".into();
+            regtest.provenance = None;
+            let mut mainnet = regtest.clone();
+            mainnet.id = "mainnet-settlement".into();
+            mainnet.first_seen_at += chrono::Duration::minutes(1);
+            mainnet.last_seen_at = mainnet.first_seen_at;
+            let scope = FindingCycleScope {
+                detector: regtest.detector.clone(),
+                network: Some(BitcoinNetwork::Regtest),
+                node: regtest.node.clone(),
+                complete: true,
+            };
+            let mainnet_scope = FindingCycleScope {
+                network: Some(BitcoinNetwork::Mainnet),
+                ..scope.clone()
+            };
+            storage.begin_transaction().unwrap();
+            storage
+                .apply_finding_cycle(&scope, std::slice::from_ref(&regtest))
+                .unwrap();
+            storage
+                .apply_finding_cycle(&mainnet_scope, std::slice::from_ref(&mainnet))
+                .unwrap();
+            storage.commit_transaction().unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &mainnet.id).first_seen_at,
+                mainnet.first_seen_at
+            );
+
+            // Rolling back multiple absent cycles must restore the counter too.
+            storage.begin_transaction().unwrap();
+            for _ in 0..2 {
+                storage.apply_finding_cycle(&scope, &[]).unwrap();
+            }
+            let mut wrong_scope = mainnet_scope.clone();
+            wrong_scope.network = None;
+            storage
+                .apply_finding_cycle(&wrong_scope, std::slice::from_ref(&mainnet))
+                .unwrap();
+            storage.rollback_transaction().unwrap();
+            for i in 1..=3 {
+                storage.apply_finding_cycle(&scope, &[]).unwrap();
+                assert_eq!(
+                    finding_by_id(storage.as_mut(), &regtest.id).lifecycle,
+                    if i == 3 {
+                        FindingLifecycle::Resolved
+                    } else {
+                        FindingLifecycle::Active
+                    }
+                );
+                assert_eq!(
+                    finding_by_id(storage.as_mut(), &mainnet.id).lifecycle,
+                    FindingLifecycle::Active
+                );
+            }
+            // The mainnet scope must survive the rolled-back metadata change.
+            for _ in 0..3 {
+                storage.apply_finding_cycle(&mainnet_scope, &[]).unwrap();
+            }
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &mainnet.id).lifecycle,
+                FindingLifecycle::Resolved
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_and_recurring_cycles_do_not_resolve_scoped_findings() {
+        for mut storage in lifecycle_backends() {
+            let mut finding = sample_finding();
+            finding.provenance = None;
+            let mut scope = FindingCycleScope {
+                detector: finding.detector.clone(),
+                network: Some(BitcoinNetwork::Regtest),
+                node: finding.node.clone(),
+                complete: false,
+            };
+            storage
+                .apply_finding_cycle(&scope, std::slice::from_ref(&finding))
+                .unwrap();
+            for _ in 0..4 {
+                storage.apply_finding_cycle(&scope, &[]).unwrap();
+            }
+            scope.complete = true;
+            for _ in 0..6 {
+                storage
+                    .apply_finding_cycle(&scope, std::slice::from_ref(&finding))
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                storage.apply_finding_cycle(&scope, &[]).unwrap();
+            }
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &finding.id).lifecycle,
+                FindingLifecycle::Active
+            );
+            storage.apply_finding_cycle(&scope, &[]).unwrap();
+            assert_eq!(
+                finding_by_id(storage.as_mut(), &finding.id).lifecycle,
+                FindingLifecycle::Resolved
             );
         }
     }

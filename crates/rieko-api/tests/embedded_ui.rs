@@ -25,6 +25,20 @@ async fn body_text(resp: axum::response::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+fn assert_security_headers(resp: &axum::response::Response) {
+    let headers = resp.headers();
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["x-frame-options"], "DENY");
+    assert_eq!(headers["referrer-policy"], "no-referrer");
+    assert_eq!(headers["cross-origin-resource-policy"], "same-origin");
+    assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
+    assert!(headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .any(|directive| directive.trim() == "connect-src 'self'"));
+}
+
 #[tokio::test]
 async fn embedded_ui_serves_index_from_binary() {
     let api = RiekoApi::new(Box::new(MemoryStorage::new())).unwrap();
@@ -32,6 +46,8 @@ async fn embedded_ui_serves_index_from_binary() {
 
     let resp = get(&app, "/").await;
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_security_headers(&resp);
+    assert_eq!(resp.headers()["cache-control"], "no-store, max-age=0");
     let html = body_text(resp).await;
     assert!(
         html.contains("<title>Rieko</title>"),
@@ -51,11 +67,14 @@ async fn embedded_ui_serves_hashed_assets_referenced_by_index() {
 
     let js_resp = get(&app, &js.unwrap()).await;
     assert_eq!(js_resp.status(), StatusCode::OK);
+    assert_security_headers(&js_resp);
+    assert!(js_resp.headers().get("cache-control").is_none());
     let js_body = body_text(js_resp).await;
     assert!(!js_body.is_empty(), "JS bundle must not be empty");
 
     let css_resp = get(&app, &css.unwrap()).await;
     assert_eq!(css_resp.status(), StatusCode::OK);
+    assert_security_headers(&css_resp);
     assert!(
         !body_text(css_resp).await.is_empty(),
         "CSS bundle must not be empty"
@@ -71,6 +90,7 @@ async fn embedded_ui_returns_404_for_unknown_paths() {
 
     let resp = get(&app, "/some/client/route").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_security_headers(&resp);
 }
 
 #[tokio::test]
@@ -79,6 +99,7 @@ async fn unknown_asset_is_404() {
     let app = api.router();
     let resp = get(&app, "/assets/does-not-exist.js").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_security_headers(&resp);
 }
 
 fn first_asset(html: &str, ext: &str) -> Option<String> {

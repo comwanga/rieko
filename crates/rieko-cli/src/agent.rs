@@ -11,6 +11,7 @@ use rieko_api::RiekoApi;
 use rieko_detectors::{
     BitcoinCoreSyncCorrelationDetector, BtcPayBackendHealthDetector, Detector, DetectorContext,
     LightningChainSyncCorrelationDetector, SettlementReliabilityDetector,
+    SettlementReliabilityThresholds,
 };
 use rieko_domain::{BitcoinNetwork, NodeEvent, NodeIngestionAdapter, NodeSnapshot};
 use rieko_findings::channel_snapshot_state_digest;
@@ -23,7 +24,22 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
 
 const BTCPAY_EVENT_BUFFER: usize = 1024;
-const BTCPAY_DETECTOR_WINDOW: usize = 100;
+const BTCPAY_REPLAY_BATCH: u32 = 100;
+
+#[derive(Clone, Copy)]
+struct SettlementConfig {
+    window: chrono::Duration,
+    interval: Duration,
+}
+
+impl Default for SettlementConfig {
+    fn default() -> Self {
+        Self {
+            window: chrono::Duration::minutes(60),
+            interval: Duration::from_secs(60),
+        }
+    }
+}
 const BTCPAY_CORE_CORRELATION_NODE: &str = "btcpay-greenfield";
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -74,6 +90,10 @@ pub struct AgentArgs {
     /// Local node identity used to scope BTCPay webhook findings.
     #[arg(long, value_name = "NODE", requires = "btcpay_webhook_secret_file")]
     btcpay_node: Option<String>,
+
+    /// Minutes of invoice evidence considered for settlement reliability (1..=10080).
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=10_080))]
+    btcpay_settlement_window_minutes: u64,
 
     /// BTCPay Server base URL for bounded Greenfield health polling.
     #[arg(
@@ -273,7 +293,16 @@ async fn run_until(
     drop(api);
     let mut webhook_worker = btcpay_worker.map(|(receiver, storage, network, node)| {
         info!(%network, %node, "BTCPay webhook finding pipeline enabled");
-        tokio::spawn(run_btcpay_finding_loop(receiver, storage, network, node))
+        tokio::spawn(run_btcpay_finding_loop(
+            receiver,
+            storage,
+            network,
+            node,
+            SettlementConfig {
+                window: chrono::Duration::minutes(args.btcpay_settlement_window_minutes as i64),
+                ..Default::default()
+            },
+        ))
     });
     let (poll_shutdown_tx, poll_shutdown_rx) = watch::channel(false);
     let bitcoin_core_shutdown_rx = poll_shutdown_tx.subscribe();
@@ -774,11 +803,7 @@ fn persist_operational_detector_cycle(
 ) -> Result<usize, rieko_storage::StorageError> {
     storage.begin_transaction()?;
     let result = (|| {
-        storage.resolve_findings_for_scope(&cycle.scope)?;
-        storage.sync_recommendation_lifecycles()?;
-        for finding in &cycle.findings {
-            storage.save_finding(finding)?;
-        }
+        storage.apply_finding_cycle(&cycle.scope, &cycle.findings)?;
         let completed_at = chrono::Utc::now();
         storage
             .update_operational_state(&|state| {
@@ -1055,10 +1080,17 @@ async fn run_btcpay_finding_loop(
     storage: Arc<Mutex<Box<dyn Storage + Send>>>,
     network: BitcoinNetwork,
     node: String,
+    config: SettlementConfig,
 ) {
-    let detector = SettlementReliabilityDetector::new(node.clone());
+    let detector = SettlementReliabilityDetector::with_thresholds(
+        node.clone(),
+        SettlementReliabilityThresholds {
+            window: config.window,
+            ..Default::default()
+        },
+    );
     let graph = InMemoryGraph::new();
-    let mut events = match reconstruct_btcpay_event_window(&storage).await {
+    let mut events = match reconstruct_btcpay_event_window(&storage, config.window).await {
         Ok(events) => events,
         Err(error) => {
             warn!(%error, "failed to reconstruct the BTCPay detector window");
@@ -1067,47 +1099,114 @@ async fn run_btcpay_finding_loop(
     };
     info!(
         events = events.len(),
+        window_seconds = config.window.num_seconds(),
         "BTCPay detector window reconstructed"
     );
-
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.interval,
+        config.interval,
+    );
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Err(error) =
-            drain_pending_webhook_events(&storage, network, &node, &detector, &graph, &mut events)
-                .await
+        if let Err(error) = drain_pending_webhook_events(
+            &storage,
+            network,
+            &node,
+            &detector,
+            &graph,
+            &mut events,
+            false,
+        )
+        .await
         {
             warn!(%error, "durable BTCPay event replay paused");
         }
-        if receiver.recv().await.is_none() {
-            let _ = drain_pending_webhook_events(
-                &storage,
-                network,
-                &node,
-                &detector,
-                &graph,
-                &mut events,
-            )
-            .await;
-            break;
+        tokio::select! {
+            message = receiver.recv() => {
+                if message.is_none() {
+                    let _ = drain_pending_webhook_events(&storage, network, &node, &detector, &graph, &mut events, false).await;
+                    break;
+                }
+            }
+            _ = tick.tick() => {
+                // A tick reconciles once, after all accepted data is applied.
+                if let Err(error) = drain_pending_webhook_events(&storage, network, &node, &detector, &graph, &mut events, true).await {
+                    warn!(%error, "BTCPay settlement tick failed");
+                }
+            }
         }
     }
 }
 
 async fn reconstruct_btcpay_event_window(
     storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    window: chrono::Duration,
 ) -> Result<VecDeque<NodeEvent>> {
     let history_storage = storage.clone();
+    let since = chrono::Utc::now() - window;
     let history = tokio::task::spawn_blocking(move || {
         history_storage
             .blocking_lock()
-            .recent_processed_webhook_events(BTCPAY_DETECTOR_WINDOW as u32)
+            .processed_webhook_events_since(since)
     })
     .await
     .context("joining processed webhook history query")??;
-    let mut events = VecDeque::with_capacity(BTCPAY_DETECTOR_WINDOW);
+    let mut events = VecDeque::new();
     for record in history {
         push_settlement_event(&mut events, record.event);
     }
     Ok(events)
+}
+
+fn evaluate_settlement_window(
+    network: BitcoinNetwork,
+    node: &str,
+    detector: &SettlementReliabilityDetector,
+    graph: &InMemoryGraph,
+    events: &mut VecDeque<NodeEvent>,
+) -> Result<rieko_detectors::DetectorCycle> {
+    let evaluated_at = chrono::Utc::now();
+    let start = evaluated_at - detector.thresholds.window;
+    events.retain(|event| event.timestamp() >= start);
+    let window: Vec<_> = events.iter().cloned().collect();
+    Ok(detector.evaluate(
+        graph,
+        &DetectorContext {
+            evaluated_at,
+            network,
+            history: None,
+            source: None,
+            normalizer: None,
+            node: Some(node),
+            events: Some(&window),
+            chain_synchronized: None,
+        },
+    )?)
+}
+
+async fn try_persist_complete_settlement_cycle(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    network: BitcoinNetwork,
+    node: &str,
+    detector: &SettlementReliabilityDetector,
+    graph: &InMemoryGraph,
+    events: &mut VecDeque<NodeEvent>,
+) -> Result<bool> {
+    let cycle = evaluate_settlement_window(network, node, detector, graph, events)?;
+    let persistence_storage = storage.clone();
+    let completed = tokio::task::spawn_blocking(move || {
+        let mut storage = persistence_storage.blocking_lock();
+        // Webhook admission uses this same mutex. Keep it through the cycle's
+        // transaction commit so no accepted delivery can slip past this check.
+        if !storage.pending_webhook_events(1)?.is_empty() {
+            return Ok::<_, rieko_storage::StorageError>(false);
+        }
+        persist_operational_detector_cycle(&mut **storage, &cycle)?;
+        Ok(true)
+    })
+    .await
+    .context("joining complete BTCPay settlement persistence")??;
+    Ok(completed)
 }
 
 async fn drain_pending_webhook_events(
@@ -1117,22 +1216,35 @@ async fn drain_pending_webhook_events(
     detector: &SettlementReliabilityDetector,
     graph: &InMemoryGraph,
     events: &mut VecDeque<NodeEvent>,
+    reconcile_if_idle: bool,
 ) -> Result<()> {
+    let mut processed_any = false;
     loop {
         let pending_storage = storage.clone();
         let pending = tokio::task::spawn_blocking(move || {
             pending_storage
                 .blocking_lock()
-                .pending_webhook_events(BTCPAY_DETECTOR_WINDOW as u32)
+                .pending_webhook_events(BTCPAY_REPLAY_BATCH)
         })
         .await
         .context("joining pending webhook event query")??;
         if pending.is_empty() {
-            return Ok(());
+            if (!processed_any && !reconcile_if_idle)
+                || try_persist_complete_settlement_cycle(
+                    storage, network, node, detector, graph, events,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            // Admission raced the earlier empty query. Drain the newly accepted
+            // rows instead of reconciling an incomplete window.
+            continue;
         }
         for record in pending {
             process_pending_webhook_event(storage, network, node, detector, graph, events, record)
                 .await?;
+            processed_any = true;
         }
     }
 }
@@ -1150,19 +1262,16 @@ async fn process_pending_webhook_event(
     let event = record.event;
     push_settlement_event(events, event);
 
-    let window = events.iter().cloned().collect::<Vec<_>>();
-    let cycle = {
-        let context = DetectorContext {
-            network,
-            history: None,
-            source: None,
-            normalizer: None,
-            node: Some(node),
-            events: Some(&window),
-            chain_synchronized: None,
-        };
-        detector.evaluate(graph, &context)?
+    let mut cycle = match evaluate_settlement_window(network, node, detector, graph, events) {
+        Ok(cycle) => cycle,
+        Err(error) => {
+            *events = previous_window;
+            return Err(error);
+        }
     };
+    // Observations and delivery acknowledgement stay atomic, but absence is
+    // meaningful only after the entire pending drain is known complete.
+    cycle.scope.complete = false;
     let detector_id = cycle.scope.detector.clone();
     let finding_count = cycle.findings.len();
     let delivery_id = record.delivery_id;
@@ -1191,12 +1300,11 @@ fn push_settlement_event(events: &mut VecDeque<NodeEvent>, event: NodeEvent) {
     if matches!(
         event,
         NodeEvent::InvoiceSettled(_)
+            | NodeEvent::InvoiceProcessing(_)
+            | NodeEvent::InvoiceInvalid(_)
             | NodeEvent::InvoiceExpired(_)
             | NodeEvent::InvoicePaymentReceived(_)
     ) {
-        if events.len() == BTCPAY_DETECTOR_WINDOW {
-            events.pop_front();
-        }
         events.push_back(event);
     }
 }
@@ -1208,11 +1316,7 @@ fn persist_finding_cycle(
 ) -> Result<()> {
     storage.begin_transaction()?;
     let result = (|| {
-        storage.resolve_findings_for_scope(&cycle.scope)?;
-        storage.sync_recommendation_lifecycles()?;
-        for finding in &cycle.findings {
-            storage.save_finding(finding)?;
-        }
+        storage.apply_finding_cycle(&cycle.scope, &cycle.findings)?;
         storage.mark_webhook_event_processed(delivery_id, chrono::Utc::now())?;
         Ok::<_, rieko_storage::StorageError>(())
     })();
@@ -1303,6 +1407,80 @@ mod tests {
 
     fn addr(value: &str) -> SocketAddr {
         value.parse().unwrap()
+    }
+
+    #[test]
+    fn settlement_agent_cycle_resolves_after_three_clean_complete_cycles() {
+        for mut storage in [
+            Box::new(MemoryStorage::new()) as Box<dyn Storage>,
+            Box::new(rieko_storage::SqliteStorage::in_memory().unwrap()),
+        ] {
+            let events: Vec<_> = (0..2)
+                .map(|i| {
+                    NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                        partially_paid: Some(true),
+                        id: format!("invoice-{i}"),
+                        store_id: Some("store".into()),
+                        amount_msat: None,
+                        timestamp: Utc::now(),
+                    })
+                })
+                .collect();
+            let detector = SettlementReliabilityDetector::new("node");
+            let graph = InMemoryGraph::new();
+            let context = DetectorContext {
+                events: Some(&events),
+                node: Some("node"),
+                ..DetectorContext::no_context(BitcoinNetwork::Regtest)
+            };
+            let raised = detector.evaluate(&graph, &context).unwrap();
+            assert_eq!(raised.findings.len(), 1);
+            assert!(raised.findings[0].provenance.is_none());
+            storage
+                .enqueue_webhook_event("raise", None, None, &events[0], Utc::now())
+                .unwrap();
+            persist_finding_cycle(storage.as_mut(), &raised, "raise").unwrap();
+
+            let mut clean = detector
+                .evaluate(
+                    &graph,
+                    &DetectorContext {
+                        events: Some(&[]),
+                        ..context
+                    },
+                )
+                .unwrap();
+            assert!(clean.findings.is_empty());
+            // A failed processing handoff must roll back absence counters.
+            for _ in 0..2 {
+                assert!(
+                    persist_finding_cycle(storage.as_mut(), &clean, "missing-delivery").is_err()
+                );
+            }
+            for (id, complete, resolved) in [
+                ("incomplete", false, false),
+                ("clean-1", true, false),
+                ("clean-2", true, false),
+                ("incomplete-2", false, false),
+                ("clean-3", true, true),
+            ] {
+                clean.scope.complete = complete;
+                storage
+                    .enqueue_webhook_event(id, None, None, &events[0], Utc::now())
+                    .unwrap();
+                persist_finding_cycle(storage.as_mut(), &clean, id).unwrap();
+                let finding = storage
+                    .finding_by_id(&raised.findings[0].id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    finding.lifecycle == rieko_findings::FindingLifecycle::Resolved,
+                    resolved,
+                    "{id}"
+                );
+                assert!(storage.pending_webhook_events(10).unwrap().is_empty());
+            }
+        }
     }
 
     async fn start_mock_btcpay(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -2475,6 +2653,34 @@ mod tests {
     }
 
     #[test]
+    fn settlement_window_configuration_is_bounded_and_defaults_to_sixty_minutes() {
+        use clap::Parser;
+        assert_eq!(
+            TestAgentCli::try_parse_from(["rieko-agent"])
+                .unwrap()
+                .args
+                .btcpay_settlement_window_minutes,
+            60
+        );
+        for value in ["1", "120", "10080"] {
+            assert!(TestAgentCli::try_parse_from([
+                "rieko-agent",
+                "--btcpay-settlement-window-minutes",
+                value
+            ])
+            .is_ok());
+        }
+        for value in ["0", "10081"] {
+            assert!(TestAgentCli::try_parse_from([
+                "rieko-agent",
+                "--btcpay-settlement-window-minutes",
+                value
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
     fn bitcoin_core_polling_configuration_is_bounded() {
         use clap::Parser;
 
@@ -2629,10 +2835,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("restart.db");
         let first_event = NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "invoice-a".into(),
             store_id: Some("store-test".into()),
             amount_msat: None,
-            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            timestamp: Utc::now(),
         });
         let first_storage: Arc<Mutex<Box<dyn Storage + Send>>> = Arc::new(Mutex::new(Box::new(
             SqliteStorage::open(&database).unwrap(),
@@ -2654,6 +2861,7 @@ mod tests {
             first_storage.clone(),
             BitcoinNetwork::Regtest,
             "node-test".into(),
+            SettlementConfig::default(),
         ));
         drop(first_sender);
         first_worker.await.unwrap();
@@ -2667,10 +2875,11 @@ mod tests {
 
         let mut stopped_storage = SqliteStorage::open(&database).unwrap();
         let second_event = NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "invoice-b".into(),
             store_id: Some("store-test".into()),
             amount_msat: None,
-            timestamp: Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
+            timestamp: Utc::now(),
         });
         stopped_storage
             .enqueue_webhook_event(
@@ -2693,6 +2902,7 @@ mod tests {
             storage.clone(),
             BitcoinNetwork::Regtest,
             "node-test".into(),
+            SettlementConfig::default(),
         ));
         drop(sender);
         worker.await.unwrap();
@@ -2714,43 +2924,438 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconstructed_btcpay_window_keeps_only_the_latest_hundred_events() {
+    async fn reconstructed_btcpay_window_keeps_all_recent_events_without_count_truncation() {
         let mut backend = MemoryStorage::new();
-        for index in 0..=BTCPAY_DETECTOR_WINDOW {
+        let now = Utc::now();
+        for index in 0..=101 {
             let delivery_id = format!("delivery-{index:03}");
-            let accepted_at = Utc.timestamp_opt(1_700_000_000 + index as i64, 0).unwrap();
             let event = NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                partially_paid: Some(true),
                 id: format!("invoice-{index:03}"),
                 store_id: Some("store-test".into()),
                 amount_msat: None,
-                timestamp: accepted_at,
+                timestamp: if index == 101 {
+                    now - chrono::Duration::hours(2)
+                } else {
+                    now
+                },
             });
             backend
-                .enqueue_webhook_event(
-                    &delivery_id,
-                    Some("webhook-test"),
-                    Some("InvoiceExpired"),
-                    &event,
-                    accepted_at,
-                )
+                .enqueue_webhook_event(&delivery_id, None, None, &event, now)
                 .unwrap();
             backend
-                .mark_webhook_event_processed(&delivery_id, accepted_at)
+                .mark_webhook_event_processed(&delivery_id, now)
                 .unwrap();
         }
         let storage: Arc<Mutex<Box<dyn Storage + Send>>> = Arc::new(Mutex::new(Box::new(backend)));
+        let window = reconstruct_btcpay_event_window(&storage, chrono::Duration::minutes(60))
+            .await
+            .unwrap();
+        assert_eq!(window.len(), 101);
+        assert!(window.iter().all(|event| event.timestamp() == now));
+    }
 
-        let window = reconstruct_btcpay_event_window(&storage).await.unwrap();
+    fn seed_aged_settlement_finding(storage: &mut dyn Storage) -> rieko_findings::Finding {
+        let old_time = Utc::now() - chrono::Duration::hours(2);
+        let old_events: Vec<_> = (0..2)
+            .map(|i| {
+                NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                    id: format!("old-failure-{i}"),
+                    store_id: Some("store".into()),
+                    amount_msat: None,
+                    partially_paid: Some(true),
+                    timestamp: old_time,
+                })
+            })
+            .collect();
+        let cycle = SettlementReliabilityDetector::new("node-test")
+            .evaluate(
+                &InMemoryGraph::new(),
+                &DetectorContext {
+                    evaluated_at: old_time,
+                    node: Some("node-test"),
+                    events: Some(&old_events),
+                    ..DetectorContext::no_context(BitcoinNetwork::Regtest)
+                },
+            )
+            .unwrap();
+        for (i, event) in old_events.iter().enumerate() {
+            let id = format!("old-delivery-{i}");
+            storage
+                .enqueue_webhook_event(&id, None, None, event, old_time)
+                .unwrap();
+            persist_finding_cycle(storage, &cycle, &id).unwrap();
+        }
+        cycle.findings[0].clone()
+    }
 
-        assert_eq!(window.len(), BTCPAY_DETECTOR_WINDOW);
-        assert!(matches!(
-            window.front(),
-            Some(NodeEvent::InvoiceExpired(event)) if event.id == "invoice-001"
+    fn enqueue_review_invoice(storage: &mut dyn Storage, id: &str, partially_paid: bool) {
+        let now = Utc::now();
+        let event = NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            id: id.into(),
+            store_id: Some("store".into()),
+            amount_msat: None,
+            partially_paid: Some(partially_paid),
+            timestamp: now,
+        });
+        storage
+            .enqueue_webhook_event(id, None, None, &event, now)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_settlement_replay_preserves_active_finding_and_recovers() {
+        for mut backend in [
+            Box::new(MemoryStorage::new()) as Box<dyn Storage + Send>,
+            Box::new(SqliteStorage::in_memory().unwrap()),
+        ] {
+            let original = seed_aged_settlement_finding(backend.as_mut());
+            for id in ["clean-a", "clean-b", "clean-c"] {
+                enqueue_review_invoice(backend.as_mut(), id, false);
+            }
+            for id in ["fresh-failure-a", "fresh-failure-b"] {
+                enqueue_review_invoice(backend.as_mut(), id, true);
+            }
+            let storage = Arc::new(Mutex::new(backend));
+            let detector = SettlementReliabilityDetector::new("node-test");
+            let graph = InMemoryGraph::new();
+            let mut events = reconstruct_btcpay_event_window(&storage, detector.thresholds.window)
+                .await
+                .unwrap();
+            assert!(events.is_empty(), "the processed failures have aged out");
+            for _ in 0..3 {
+                let record = storage
+                    .lock()
+                    .await
+                    .pending_webhook_events(1)
+                    .unwrap()
+                    .remove(0);
+                process_pending_webhook_event(
+                    &storage,
+                    BitcoinNetwork::Regtest,
+                    "node-test",
+                    &detector,
+                    &graph,
+                    &mut events,
+                    record,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                storage
+                    .lock()
+                    .await
+                    .finding_by_id(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                rieko_findings::FindingLifecycle::Active
+            );
+            // A missing processing identity forces the same acknowledgement
+            // failure/rollback path as the runtime fixture's SQLite trigger.
+            let mut failed = storage
+                .lock()
+                .await
+                .pending_webhook_events(1)
+                .unwrap()
+                .remove(0);
+            failed.delivery_id = "injected-missing-delivery".into();
+            assert!(process_pending_webhook_event(
+                &storage,
+                BitcoinNetwork::Regtest,
+                "node-test",
+                &detector,
+                &graph,
+                &mut events,
+                failed
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                events.len(),
+                3,
+                "failed delivery must be rolled out of the window"
+            );
+            assert_eq!(
+                storage
+                    .lock()
+                    .await
+                    .pending_webhook_events(10)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                storage
+                    .lock()
+                    .await
+                    .finding_by_id(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                rieko_findings::FindingLifecycle::Active
+            );
+            drain_pending_webhook_events(
+                &storage,
+                BitcoinNetwork::Regtest,
+                "node-test",
+                &detector,
+                &graph,
+                &mut events,
+                false,
+            )
+            .await
+            .unwrap();
+            let mut backend = storage.lock().await;
+            assert!(backend.pending_webhook_events(10).unwrap().is_empty());
+            let current = backend.finding_by_id(&original.id).unwrap().unwrap();
+            assert_eq!(current.lifecycle, rieko_findings::FindingLifecycle::Active);
+            assert_eq!(current.evidence_value("failed_invoices"), Some(&json!(2.0)));
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_drain_and_ticks_advance_hysteresis_once_per_complete_window() {
+        for mut backend in [
+            Box::new(MemoryStorage::new()) as Box<dyn Storage + Send>,
+            Box::new(SqliteStorage::in_memory().unwrap()),
+        ] {
+            let original = seed_aged_settlement_finding(backend.as_mut());
+            for i in 0..6 {
+                enqueue_review_invoice(backend.as_mut(), &format!("clean-{i}"), false);
+            }
+            let storage = Arc::new(Mutex::new(backend));
+            let detector = SettlementReliabilityDetector::new("node-test");
+            let graph = InMemoryGraph::new();
+            let mut events = VecDeque::new();
+            // Six delivery commits still constitute one complete drain.
+            drain_pending_webhook_events(
+                &storage,
+                BitcoinNetwork::Regtest,
+                "node-test",
+                &detector,
+                &graph,
+                &mut events,
+                false,
+            )
+            .await
+            .unwrap();
+            for complete_cycles in 1..=3 {
+                // An empty top/final drain must not count as another cycle.
+                drain_pending_webhook_events(
+                    &storage,
+                    BitcoinNetwork::Regtest,
+                    "node-test",
+                    &detector,
+                    &graph,
+                    &mut events,
+                    false,
+                )
+                .await
+                .unwrap();
+                let current = storage
+                    .lock()
+                    .await
+                    .finding_by_id(&original.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    current.lifecycle,
+                    if complete_cycles == 3 {
+                        rieko_findings::FindingLifecycle::Resolved
+                    } else {
+                        rieko_findings::FindingLifecycle::Active
+                    }
+                );
+                if complete_cycles < 3 {
+                    drain_pending_webhook_events(
+                        &storage,
+                        BitcoinNetwork::Regtest,
+                        "node-test",
+                        &detector,
+                        &graph,
+                        &mut events,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_completion_rechecks_admission_under_the_persistence_lock() {
+        for mut backend in [
+            Box::new(MemoryStorage::new()) as Box<dyn Storage + Send>,
+            Box::new(SqliteStorage::in_memory().unwrap()),
+        ] {
+            let original = seed_aged_settlement_finding(backend.as_mut());
+            let storage = Arc::new(Mutex::new(backend));
+            let mut admission = storage.lock().await;
+            assert!(admission.pending_webhook_events(1).unwrap().is_empty());
+            let completion_storage = storage.clone();
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let completion = tokio::spawn(async move {
+                let detector = SettlementReliabilityDetector::new("node-test");
+                let graph = InMemoryGraph::new();
+                let mut events = VecDeque::new();
+                started.send(()).unwrap();
+                try_persist_complete_settlement_cycle(
+                    &completion_storage,
+                    BitcoinNetwork::Regtest,
+                    "node-test",
+                    &detector,
+                    &graph,
+                    &mut events,
+                )
+                .await
+            });
+            waiting.await.unwrap();
+            // The completion is waiting for the mutex. Admit data after the
+            // earlier empty observation, before allowing persistence to proceed.
+            enqueue_review_invoice(admission.as_mut(), "newly-accepted-failure", true);
+            drop(admission);
+            assert!(!completion.await.unwrap().unwrap());
+            let detector = SettlementReliabilityDetector::new("node-test");
+            let graph = InMemoryGraph::new();
+            let mut events = VecDeque::new();
+            for _ in 0..3 {
+                assert!(!try_persist_complete_settlement_cycle(
+                    &storage,
+                    BitcoinNetwork::Regtest,
+                    "node-test",
+                    &detector,
+                    &graph,
+                    &mut events
+                )
+                .await
+                .unwrap());
+            }
+            let mut backend = storage.lock().await;
+            assert_eq!(backend.pending_webhook_events(10).unwrap().len(), 1);
+            assert_eq!(
+                backend
+                    .finding_by_id(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                rieko_findings::FindingLifecycle::Active
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_ticks_supersede_v1_and_resolve_without_new_traffic_on_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settlement-ticks.db");
+        let mut backend = SqliteStorage::open(&path).unwrap();
+        let now = Utc::now();
+        let events: Vec<_> = (0..2)
+            .map(|i| {
+                NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+                    id: format!("invoice-{i}"),
+                    store_id: Some("store".into()),
+                    amount_msat: None,
+                    partially_paid: Some(true),
+                    timestamp: now,
+                })
+            })
+            .collect();
+        let detector = SettlementReliabilityDetector::new("node-test");
+        let cycle = detector
+            .evaluate(
+                &InMemoryGraph::new(),
+                &DetectorContext {
+                    evaluated_at: now,
+                    node: Some("node-test"),
+                    events: Some(&events),
+                    ..DetectorContext::no_context(BitcoinNetwork::Regtest)
+                },
+            )
+            .unwrap();
+        let mut legacy = cycle.findings[0].clone();
+        legacy.detector_version = "1".into();
+        legacy.id = rieko_findings::finding_identity(
+            "settlement_reliability",
+            "1",
+            Some(BitcoinNetwork::Regtest),
+            Some("node-test"),
+            None,
+        );
+        backend.begin_transaction().unwrap();
+        backend
+            .apply_finding_cycle(&cycle.scope, std::slice::from_ref(&legacy))
+            .unwrap();
+        backend.commit_transaction().unwrap();
+        for (i, event) in events.iter().enumerate() {
+            backend
+                .enqueue_webhook_event(&format!("delivery-{i}"), None, None, event, now)
+                .unwrap();
+        }
+        let storage: Arc<Mutex<Box<dyn Storage + Send>>> = Arc::new(Mutex::new(Box::new(backend)));
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(run_btcpay_finding_loop(
+            receiver,
+            storage.clone(),
+            BitcoinNetwork::Regtest,
+            "node-test".into(),
+            SettlementConfig {
+                window: chrono::Duration::seconds(2),
+                interval: Duration::from_millis(50),
+            },
         ));
-        assert!(matches!(
-            window.back(),
-            Some(NodeEvent::InvoiceExpired(event)) if event.id == "invoice-100"
-        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let findings = storage.lock().await.latest_findings(10).unwrap();
+                if findings.iter().any(|f| {
+                    f.detector_version == "2"
+                        && f.lifecycle == rieko_findings::FindingLifecycle::Active
+                }) && findings.iter().any(|f| {
+                    f.id == legacy.id && f.lifecycle == rieko_findings::FindingLifecycle::Resolved
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("v2 should be raised and supersede v1 while the failure is still in the window");
+        // Keep the notification channel open, but send nothing: only ticks can
+        // expire the event window and perform the three clean cycles.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let findings = storage.lock().await.latest_findings(10).unwrap();
+                if findings.len() == 2
+                    && findings
+                        .iter()
+                        .all(|f| f.lifecycle == rieko_findings::FindingLifecycle::Resolved)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("quiet-store recovery should resolve on periodic ticks");
+        drop(sender);
+        worker.await.unwrap();
+        assert!(storage
+            .lock()
+            .await
+            .pending_webhook_events(10)
+            .unwrap()
+            .is_empty());
+        drop(storage);
+        let findings = SqliteStorage::open(&path)
+            .unwrap()
+            .latest_findings(10)
+            .unwrap();
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .all(|f| f.lifecycle == rieko_findings::FindingLifecycle::Resolved));
     }
 
     #[tokio::test]
@@ -2763,8 +3368,10 @@ mod tests {
             storage.clone(),
             BitcoinNetwork::Regtest,
             "node-test".into(),
+            SettlementConfig::default(),
         ));
         let event = NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "invoice-live".into(),
             store_id: Some("store-test".into()),
             amount_msat: None,
@@ -2808,6 +3415,7 @@ mod tests {
             btcpay_webhook_secret_file: None,
             btcpay_network: None,
             btcpay_node: None,
+            btcpay_settlement_window_minutes: 60,
             btcpay_greenfield_url: None,
             btcpay_greenfield_api_key_file: None,
             btcpay_greenfield_store: None,

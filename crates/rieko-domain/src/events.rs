@@ -43,6 +43,8 @@ pub struct PaymentEvent {
 pub struct InvoiceSettledEvent {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manually_marked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payment_method: Option<String>,
@@ -60,9 +62,22 @@ pub struct InvoiceSettledEvent {
 pub struct InvoiceExpiredEvent {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partially_paid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_msat: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// An invoice invalidated automatically or by a store operator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvoiceInvalidEvent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manually_marked: Option<bool>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -70,6 +85,8 @@ pub struct InvoiceExpiredEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvoicePaymentReceivedEvent {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_expiration: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,7 +136,9 @@ pub struct PeerStatusChangedEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeEvent {
     InvoiceSettled(InvoiceSettledEvent),
+    InvoiceProcessing(InvoiceSettledEvent),
     InvoiceExpired(InvoiceExpiredEvent),
+    InvoiceInvalid(InvoiceInvalidEvent),
     InvoicePaymentReceived(InvoicePaymentReceivedEvent),
     ForwardRouted(ForwardEvent),
     PaymentAttempt(PaymentEvent),
@@ -133,7 +152,9 @@ impl NodeEvent {
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::InvoiceSettled(e) => e.timestamp,
+            Self::InvoiceProcessing(e) => e.timestamp,
             Self::InvoiceExpired(e) => e.timestamp,
+            Self::InvoiceInvalid(e) => e.timestamp,
             Self::InvoicePaymentReceived(e) => e.timestamp,
             Self::ForwardRouted(e) => e.timestamp,
             Self::PaymentAttempt(e) => e.timestamp,

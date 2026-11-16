@@ -67,6 +67,7 @@ fn seed_demo_database() {
     let store_id = "btcpay-store-merchant";
     let events = vec![
         NodeEvent::InvoiceSettled(InvoiceSettledEvent {
+            manually_marked: Some(false),
             id: "inv-101".into(),
             store_id: Some(store_id.into()),
             payment_method: Some("BTC-LightningLike".into()),
@@ -77,24 +78,28 @@ fn seed_demo_database() {
             metadata: std::collections::HashMap::new(),
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "inv-102".into(),
             store_id: Some(store_id.into()),
             amount_msat: Some(100_000_000),
             timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "inv-103".into(),
             store_id: Some(store_id.into()),
             amount_msat: Some(250_000_000),
             timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "inv-104".into(),
             store_id: Some(store_id.into()),
             amount_msat: Some(80_000_000),
             timestamp: now,
         }),
         NodeEvent::InvoiceExpired(InvoiceExpiredEvent {
+            partially_paid: Some(true),
             id: "inv-105".into(),
             store_id: Some(store_id.into()),
             amount_msat: Some(150_000_000),
@@ -115,6 +120,7 @@ fn seed_demo_database() {
     };
 
     let ctx = DetectorContext {
+        evaluated_at: chrono::Utc::now(),
         network: BitcoinNetwork::Mainnet,
         history: None,
         source: Some(&btcpay_source),
