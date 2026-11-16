@@ -46,6 +46,9 @@ pub struct AppState {
     pub btcpay_webhook_secret: Option<String>,
     /// Optional channel sender for dispatched telemetry events.
     pub event_sender: Option<tokio::sync::mpsc::Sender<rieko_domain::NodeEvent>>,
+    /// How long an active finding may go without re-confirmation before the
+    /// API marks it stale. See [`rieko_status::HealthPolicy::finding_stale_after`].
+    pub finding_stale_after: chrono::Duration,
 }
 
 pub const SIMULATION_RATE_LIMIT: usize = 5;
@@ -83,9 +86,28 @@ impl RiekoApi {
                 simulation_rate: tokio::sync::Mutex::new(Vec::new()),
                 btcpay_webhook_secret: None,
                 event_sender: None,
+                finding_stale_after: rieko_status::HealthPolicy::default()
+                    .finding_stale_after(None),
             }),
             static_dir: None,
         })
+    }
+
+    /// Tells the API the longest interval at which this process observes its
+    /// sources, so findings are not marked stale before their next observation
+    /// is due. Without it the freshness minimum applies.
+    pub fn with_observation_interval(mut self, longest: Duration) -> Self {
+        let longest = chrono::Duration::from_std(longest).unwrap_or(chrono::Duration::MAX);
+        self.state = Arc::new(AppState {
+            storage: self.state.storage.clone(),
+            auth_token: self.state.auth_token.clone(),
+            simulation_rate: tokio::sync::Mutex::new(Vec::new()),
+            btcpay_webhook_secret: self.state.btcpay_webhook_secret.clone(),
+            event_sender: self.state.event_sender.clone(),
+            finding_stale_after: rieko_status::HealthPolicy::default()
+                .finding_stale_after(Some(longest)),
+        });
+        self
     }
 
     /// Serve the built UI from `dir` in addition to the JSON API.
@@ -108,6 +130,7 @@ impl RiekoApi {
             simulation_rate: tokio::sync::Mutex::new(Vec::new()),
             btcpay_webhook_secret: self.state.btcpay_webhook_secret.clone(),
             event_sender: self.state.event_sender.clone(),
+            finding_stale_after: self.state.finding_stale_after,
         });
         Ok(self)
     }
@@ -124,6 +147,7 @@ impl RiekoApi {
             simulation_rate: tokio::sync::Mutex::new(Vec::new()),
             btcpay_webhook_secret: Some(secret.into()),
             event_sender: Some(sender),
+            finding_stale_after: self.state.finding_stale_after,
         });
         self
     }

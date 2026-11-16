@@ -209,8 +209,8 @@ export function riekoCard(status: Status, activeFindings: string | null, now: Da
   const cycle = status.last_cycle?.success;
   const pipeline = pipelineBadge(status.overall);
   return {
-    // Labelled so it reads as Rieko's pipeline state, which does not yet cover
-    // Bitcoin Core or LND (finding M1).
+    // Labelled so it reads as Rieko's pipeline state: whether the sources the
+    // agent polls are answering, not the health of the systems behind them.
     badge: { kind: pipeline.kind, label: `Pipeline: ${pipeline.label}` },
     rows,
     records,

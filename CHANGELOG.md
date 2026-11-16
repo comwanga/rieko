@@ -7,6 +7,13 @@ Rieko uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Stale marker on findings**: every finding returned by the API carries
+  `observation_stale`, true when an active finding has not been re-confirmed
+  for two hours or twice the agent's longest polling interval, whichever is
+  longer. It is computed when read and nothing stored changes. The UI shows a
+  "Stale" tag; `rieko findings`, `explain`, `watch` and `doctor` show the flag.
+  Findings from a one-shot `rieko scan` read as stale once that threshold has
+  passed, since nothing re-confirms them.
 - **Source poll-failure findings** (`rieko-agent`): `bitcoin_core_poll_failure`
   and `lnd_poll_failure` are raised when three consecutive polls of that source
   fail, and resolve after three successful polls. The threshold is a heuristic

@@ -273,6 +273,16 @@ async fn run_until(
         None
     };
     let mut api = RiekoApi::new(Box::new(storage))?;
+    if let Some(interval) = longest_observation_interval([
+        btcpay_config
+            .as_ref()
+            .map(|_| SettlementConfig::default().interval),
+        greenfield_config.as_ref().map(|config| config.interval),
+        bitcoin_core_config.as_ref().map(|config| config.interval),
+        lnd_config.as_ref().map(|config| config.interval),
+    ]) {
+        api = api.with_observation_interval(interval);
+    }
     if let Some(dir) = args.static_dir.as_ref() {
         api = api.with_static_dir(dir);
     }
@@ -368,6 +378,15 @@ async fn run_until(
     stop_worker(&mut bitcoin_core_worker, "Bitcoin Core RPC polling").await;
     stop_worker(&mut lnd_worker, "LND REST polling").await;
     result
+}
+
+/// The longest interval at which this agent observes a configured source, or
+/// `None` when it observes nothing itself. The API uses it so a finding is not
+/// called stale while its next observation is not yet due.
+fn longest_observation_interval(
+    configured: impl IntoIterator<Item = Option<Duration>>,
+) -> Option<Duration> {
+    configured.into_iter().flatten().max()
 }
 
 fn apply_connection_config(args: &mut AgentArgs) -> Result<()> {
@@ -3697,6 +3716,25 @@ mod tests {
             .pending_webhook_events(10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn longest_observation_interval_is_the_slowest_configured_source() {
+        let seconds = Duration::from_secs;
+        assert_eq!(longest_observation_interval([None, None, None, None]), None);
+        assert_eq!(
+            longest_observation_interval([None, Some(seconds(60)), None, None]),
+            Some(seconds(60))
+        );
+        assert_eq!(
+            longest_observation_interval([
+                Some(seconds(60)),
+                Some(seconds(300)),
+                Some(seconds(86_400)),
+                Some(seconds(900)),
+            ]),
+            Some(seconds(86_400))
+        );
     }
 
     #[tokio::test]

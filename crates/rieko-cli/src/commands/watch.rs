@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_findings::{Finding, FindingLifecycle};
+use rieko_findings::{FindingLifecycle, FindingView};
 use tokio::time::MissedTickBehavior;
 
 use super::findings::{ApiArgs, ApiClient, Lifecycle};
@@ -75,7 +75,7 @@ impl WatchState {
         }
     }
 
-    fn observe(&mut self, findings: Vec<Finding>) -> Vec<Finding> {
+    fn observe(&mut self, findings: Vec<FindingView>) -> Vec<FindingView> {
         let mut next = HashMap::with_capacity(self.limit);
         let mut changed = Vec::new();
         for finding in findings.into_iter().take(self.limit) {
@@ -93,7 +93,7 @@ impl WatchState {
     }
 }
 
-fn write_findings<W: Write>(output: &mut W, findings: &[Finding]) -> Result<()> {
+fn write_findings<W: Write>(output: &mut W, findings: &[FindingView]) -> Result<()> {
     for finding in findings {
         serde_json::to_writer(&mut *output, finding).context("rendering watched finding")?;
         writeln!(output).context("writing watched finding")?;
@@ -105,11 +105,11 @@ fn write_findings<W: Write>(output: &mut W, findings: &[Finding]) -> Result<()> 
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use rieko_findings::{Evidence, Severity, FINDING_SCHEMA_VERSION};
+    use rieko_findings::{Evidence, Finding, Severity, FINDING_SCHEMA_VERSION};
 
-    fn finding(id: &str, lifecycle: FindingLifecycle, revision: i64) -> Finding {
+    fn finding(id: &str, lifecycle: FindingLifecycle, revision: i64) -> FindingView {
         let observed_at = Utc.timestamp_opt(1_700_000_000 + revision, 0).unwrap();
-        Finding {
+        let finding = Finding {
             id: id.into(),
             detector: "settlement_reliability".into(),
             detector_version: "1".into(),
@@ -124,6 +124,10 @@ mod tests {
             first_seen_at: observed_at,
             last_seen_at: observed_at,
             lifecycle,
+        };
+        FindingView {
+            finding,
+            observation_stale: lifecycle == FindingLifecycle::Active,
         }
     }
 
@@ -161,7 +165,9 @@ mod tests {
 
         let rendered = String::from_utf8(output).unwrap();
         let decoded: Finding = serde_json::from_str(rendered.trim()).unwrap();
-        assert_eq!(decoded, expected);
+        assert_eq!(decoded, expected.finding);
         assert_eq!(decoded.evidence[0].value, serde_json::json!(1.0));
+        let value: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(value["observation_stale"], true);
     }
 }

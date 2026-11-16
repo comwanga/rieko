@@ -17,6 +17,35 @@ impl Default for HealthPolicy {
     }
 }
 
+/// Observation intervals that must pass without a finding being re-confirmed
+/// before it is called stale. Two is the smallest allowance that guarantees a
+/// scheduled observation was missed rather than not yet due. A heuristic.
+pub const OBSERVATION_INTERVALS_BEFORE_STALE: i32 = 2;
+
+impl HealthPolicy {
+    /// How long an active finding may go without being re-confirmed before it
+    /// is marked stale when read.
+    ///
+    /// The freshness threshold is the minimum. When the process serving the
+    /// finding knows the longest interval at which it observes its sources,
+    /// the threshold grows to cover that cadence, so a finding is not called
+    /// stale while its next observation is not yet due. With no known interval
+    /// (a one-shot scan, or findings written by another process) the minimum
+    /// applies.
+    pub fn finding_stale_after(&self, longest_observation_interval: Option<Duration>) -> Duration {
+        match longest_observation_interval {
+            // Saturate: chrono panics on `*` overflow, and its `checked_mul`
+            // can return a value beyond `Duration::MAX`.
+            Some(interval) => self.freshness.max(
+                interval
+                    .checked_mul(OBSERVATION_INTERVALS_BEFORE_STALE)
+                    .map_or(Duration::MAX, |allowed| allowed.min(Duration::MAX)),
+            ),
+            None => self.freshness,
+        }
+    }
+}
+
 /// Exact health semantics (RIEKO-AUDIT-008).
 ///
 /// * **NotInitialized**: no source has ever been read successfully.
@@ -397,6 +426,51 @@ mod tests {
         s.bitcoin_core = Some(core(true, Some(now - Duration::seconds(10))));
         s.lightning = Some(lightning(true, Some(now - Duration::seconds(10))));
         assert_eq!(assess(&s, &policy, now, true), OverallState::Healthy);
+    }
+
+    #[test]
+    fn finding_stale_threshold_is_the_freshness_minimum_without_a_known_interval() {
+        let policy = HealthPolicy::default();
+        assert_eq!(policy.finding_stale_after(None), Duration::hours(2));
+    }
+
+    #[test]
+    fn finding_stale_threshold_keeps_the_minimum_for_short_intervals() {
+        let policy = HealthPolicy::default();
+        for seconds in [1, 60, 3_599, 3_600] {
+            assert_eq!(
+                policy.finding_stale_after(Some(Duration::seconds(seconds))),
+                Duration::hours(2),
+                "{seconds}s"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_stale_threshold_allows_two_intervals_once_that_exceeds_the_minimum() {
+        let policy = HealthPolicy::default();
+        assert_eq!(
+            policy.finding_stale_after(Some(Duration::seconds(3_601))),
+            Duration::seconds(7_202)
+        );
+        assert_eq!(
+            policy.finding_stale_after(Some(Duration::hours(6))),
+            Duration::hours(12)
+        );
+        // The longest interval the agent accepts.
+        assert_eq!(
+            policy.finding_stale_after(Some(Duration::seconds(86_400))),
+            Duration::hours(48)
+        );
+    }
+
+    #[test]
+    fn finding_stale_threshold_saturates_instead_of_overflowing() {
+        let policy = HealthPolicy::default();
+        assert_eq!(
+            policy.finding_stale_after(Some(Duration::MAX)),
+            Duration::MAX
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
   import { createQuery } from "@tanstack/svelte-query";
   import { derived, writable } from "svelte/store";
   import { get, type Finding } from "../lib/api";
+  import { staleNote } from "../lib/findings";
   import { findingsCount, formatTime } from "../lib/overview";
   import { findingHref } from "../lib/router";
 
@@ -56,9 +57,10 @@
           {@const target = finding.channel ?? finding.node ?? ""}
           {@const first = formatTime(finding.first_seen_at, now)}
           {@const last = formatTime(finding.last_seen_at, now)}
+          {@const stale = staleNote(finding, last)}
           <tr>
             <td><span class="tag {sevClass(finding.severity)}">{finding.severity}</span></td>
-            <td><span class="tag info">{finding.lifecycle}</span></td>
+            <td class="state"><span class="tag info">{finding.lifecycle}</span>{#if stale}{" "}<span class="tag stale">{stale.tag}</span>{/if}</td>
             <td><a href={findingHref(finding.id)}>{finding.detector}{#if target}<span class="visually-hidden"> on {target}</span>{/if}</a></td>
             <td class="mono">{target}</td>
             <td>{first.relative} <small class="muted">({first.absolute})</small></td>

@@ -198,6 +198,13 @@ td {
   font-weight: 600;
 }
 
+/* Not a severity: the finding has not been re-confirmed recently. */
+.tag.stale {
+  background: var(--neutral-bg);
+  border: 1px solid var(--border);
+  color: var(--neutral-text);
+}
+
 .critical {
   background: var(--critical-bg);
   color: var(--critical-text);

@@ -3,7 +3,7 @@
   import { get, type Finding } from "../lib/api";
   import { AuthenticationError } from "../lib/auth";
   import {
-    actionabilityLabel, describeProvenance, evidenceValue, recommendationsFor, type RecommendationDetail,
+    actionabilityLabel, describeProvenance, evidenceValue, recommendationsFor, staleNote, type RecommendationDetail,
   } from "../lib/findings";
   import { formatTime } from "../lib/overview";
   import { routeHref } from "../lib/router";
@@ -30,6 +30,7 @@
   // A failed refetch keeps earlier data; it is not shown as current.
   $: current = $finding.isError ? undefined : $finding.data;
   $: provenance = current ? describeProvenance(current.provenance) : null;
+  $: stale = current ? staleNote(current, formatTime(current.last_seen_at, now)) : null;
   $: linked = current && $recommendations.data && !$recommendations.isError
     ? recommendationsFor($recommendations.data, current.id, RECOMMENDATION_LIMIT) : null;
   const time = (iso: string, at: Date) => {
@@ -55,13 +56,14 @@
     <h3 id="finding-summary">Summary</h3>
     <dl>
       <div><dt>Severity</dt><dd><span class="tag {sevClass(current.severity)}">{current.severity}</span></dd></div>
-      <div><dt>State</dt><dd>{current.lifecycle}</dd></div>
+      <div><dt>State</dt><dd>{current.lifecycle}{#if stale}{" "}<span class="tag stale">{stale.tag}</span>{/if}</dd></div>
       <div><dt>Detector</dt><dd>{current.detector} v{current.detector_version}</dd></div>
       {#if current.node}<div><dt>Node</dt><dd class="mono">{current.node}</dd></div>{/if}
       {#if current.channel}<div><dt>Channel</dt><dd class="mono">{current.channel}</dd></div>{/if}
       <div><dt>First seen</dt><dd>{time(current.first_seen_at, now)}</dd></div>
       <div><dt>Last seen</dt><dd>{time(current.last_seen_at, now)}</dd></div>
     </dl>
+    {#if stale}<p class="stale-note">{stale.detail}</p>{/if}
   </section>
 
   {#if current.explanation}
@@ -168,6 +170,7 @@
   dt { color: var(--text-muted); overflow-wrap: anywhere; }
   dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   p { font-size: 0.85rem; margin: var(--space-1) 0; overflow-wrap: anywhere; }
+  .stale-note { border-top: 1px solid var(--border); margin-top: var(--space-2); padding-top: var(--space-2); }
   .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.8rem; }
   .snapshots, .recommendations { display: grid; gap: var(--space-2); list-style: none; margin: 0 0 var(--space-2); padding: 0; }
   .snapshots li { font-size: 0.85rem; overflow-wrap: anywhere; }

@@ -276,7 +276,7 @@ for checksum verification and installation without a Rust toolchain.
 | `GET /inspect/bitcoin` | Exact persisted Bitcoin Core operational state |
 | `GET /inspect/lightning` | Exact persisted Lightning operational state |
 | `GET /findings?limit=N&lifecycle=active` | Findings (active, resolved, or all) |
-| `GET /findings/:id` | One exact persisted finding |
+| `GET /findings/:id` | One persisted finding |
 | `GET /findings/channel/:id` | Findings for a channel |
 | `GET /recommendations?limit=N` | Recommendations |
 | `GET /audit?limit=N` | Audit trail |
@@ -289,6 +289,32 @@ for checksum verification and installation without a Rust toolchain.
 | `GET /api/v2/simulations/:id` | Projection detail |
 | `GET /api/v2/simulations/:id/report` | Structured simulation report |
 | `POST /api/v2/simulations/compare` | Compare two projections |
+
+Every finding the API returns carries `observation_stale`, computed when the
+finding is read and never stored. It is `true` when the finding is still active
+but Rieko has not re-confirmed it for longer than a threshold; resolved findings
+are never stale. The UI shows it as a "Stale" tag, and `rieko findings`,
+`rieko explain` and `rieko doctor` show it as received. `rieko watch` includes
+it in each line it prints, but prints a line only when a finding first appears
+or changes lifecycle, so it does not report a finding turning stale.
+
+- **Threshold:** two hours, or twice the longest polling interval configured
+  on the agent serving the findings, when that is longer. With the default
+  60-second intervals it is two hours; with a 24-hour interval it is 48 hours.
+  The multiple is a heuristic: two intervals is the shortest gap in which a
+  scheduled observation has certainly been missed. The agent applies this one
+  threshold to every finding it serves, whichever process stored it.
+- **What it means:** only that the last confirmation is old. A stale finding is
+  not resolved, hidden or removed from any count, and it says nothing about why
+  it was not re-confirmed. A finding that is not stale is not evidence that its
+  source is healthy.
+- **One-shot scans:** `rieko scan` evaluates once, so nothing re-confirms its
+  findings. They read as stale once the serving agent's threshold has passed:
+  two hours after the scan with default intervals, later if that agent polls a
+  source less often than once an hour.
+- **Findings from `rieko monitor`:** the agent knows only its own polling
+  intervals, not the `monitor` interval. If `monitor` runs less often than the
+  serving agent's threshold, its findings read as stale between cycles.
 
 Simulation POST routes produce local projections only — they never contact or
 mutate a node. All other routes are read-only. Request size is capped at 1 MB

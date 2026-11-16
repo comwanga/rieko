@@ -8,7 +8,7 @@ pub mod health;
 pub mod state;
 pub mod store;
 
-pub use health::{assess, HealthPolicy};
+pub use health::{assess, HealthPolicy, OBSERVATION_INTERVALS_BEFORE_STALE};
 pub use state::{
     BitcoinCoreState, ComponentState, LightningState, OperationalState, OverallState, SourceState,
 };

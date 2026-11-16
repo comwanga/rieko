@@ -179,6 +179,45 @@ pub enum FindingLifecycle {
     Resolved,
 }
 
+/// A finding as presented to a reader, with facts that depend on when it is
+/// read. Nothing here is stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingView {
+    #[serde(flatten)]
+    pub finding: Finding,
+    /// True when the finding is active but has not been re-confirmed for
+    /// longer than the threshold the reader applies. It describes the age of
+    /// the last confirmation only: a stale finding is not resolved, and a
+    /// finding that is not stale says nothing about the health of its source.
+    #[serde(default)]
+    pub observation_stale: bool,
+}
+
+impl FindingView {
+    /// Presents `finding` as read at `now`. `stale_after` is how long an
+    /// active finding may go without re-confirmation.
+    pub fn at(
+        finding: Finding,
+        now: chrono::DateTime<chrono::Utc>,
+        stale_after: chrono::Duration,
+    ) -> Self {
+        let observation_stale = finding.lifecycle == FindingLifecycle::Active
+            && now.signed_duration_since(finding.last_seen_at) > stale_after;
+        Self {
+            finding,
+            observation_stale,
+        }
+    }
+}
+
+impl std::ops::Deref for FindingView {
+    type Target = Finding;
+
+    fn deref(&self) -> &Finding {
+        &self.finding
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingLifecycleFilter {
     Active,
@@ -229,6 +268,89 @@ mod tests {
             last_seen_at: now,
             lifecycle: FindingLifecycle::Active,
         }
+    }
+
+    fn view_aged(
+        lifecycle: FindingLifecycle,
+        age: chrono::Duration,
+        stale_after: chrono::Duration,
+    ) -> FindingView {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let mut finding = finding(Severity::Warning, None);
+        finding.lifecycle = lifecycle;
+        finding.last_seen_at = now - age;
+        FindingView::at(finding, now, stale_after)
+    }
+
+    #[test]
+    fn an_active_finding_is_stale_only_past_the_threshold() {
+        let two_hours = chrono::Duration::hours(2);
+        let active = FindingLifecycle::Active;
+        assert!(!view_aged(active, chrono::Duration::zero(), two_hours).observation_stale);
+        assert!(!view_aged(active, chrono::Duration::minutes(119), two_hours).observation_stale);
+        // Exactly at the threshold is not yet stale.
+        assert!(!view_aged(active, two_hours, two_hours).observation_stale);
+        assert!(
+            view_aged(active, two_hours + chrono::Duration::seconds(1), two_hours)
+                .observation_stale
+        );
+        assert!(view_aged(active, chrono::Duration::days(30), two_hours).observation_stale);
+    }
+
+    #[test]
+    fn a_resolved_finding_is_never_stale() {
+        for age in [chrono::Duration::zero(), chrono::Duration::days(365)] {
+            assert!(
+                !view_aged(FindingLifecycle::Resolved, age, chrono::Duration::hours(2))
+                    .observation_stale
+            );
+        }
+    }
+
+    #[test]
+    fn a_longer_threshold_keeps_a_finding_fresh_until_it_passes() {
+        // A 24-hour observation interval allows 48 hours.
+        let allowed = chrono::Duration::hours(48);
+        let active = FindingLifecycle::Active;
+        assert!(!view_aged(active, chrono::Duration::hours(30), allowed).observation_stale);
+        assert!(!view_aged(active, allowed, allowed).observation_stale);
+        assert!(
+            view_aged(active, allowed + chrono::Duration::seconds(1), allowed).observation_stale
+        );
+    }
+
+    #[test]
+    fn a_last_seen_time_ahead_of_the_reader_clock_is_not_stale() {
+        let view = view_aged(
+            FindingLifecycle::Active,
+            chrono::Duration::hours(-3),
+            chrono::Duration::hours(2),
+        );
+        assert!(!view.observation_stale);
+    }
+
+    #[test]
+    fn the_view_serializes_the_finding_fields_unchanged_plus_the_flag() {
+        let view = view_aged(
+            FindingLifecycle::Active,
+            chrono::Duration::hours(3),
+            chrono::Duration::hours(2),
+        );
+        let stored = serde_json::to_value(&view.finding).unwrap();
+        assert!(stored.get("observation_stale").is_none());
+
+        // Every stored field keeps its name and value; only the flag is added.
+        let mut expected = stored.clone();
+        expected["observation_stale"] = serde_json::Value::Bool(true);
+        assert_eq!(serde_json::to_value(&view).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_response_without_the_flag_decodes_as_not_stale() {
+        let stored = serde_json::to_string(&finding(Severity::Info, Some(provenance()))).unwrap();
+        let view: FindingView = serde_json::from_str(&stored).unwrap();
+        assert!(!view.observation_stale);
+        assert_eq!(view.finding, finding(Severity::Info, Some(provenance())));
     }
 
     fn provenance() -> FindingProvenance {

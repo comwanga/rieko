@@ -1,6 +1,8 @@
 <script lang="ts">
   import { createQuery, useQueryClient } from "@tanstack/svelte-query";
   import { get, post, type Recommendation, type Finding, type ChannelSnapshot, type CreateSimulationOutcome } from "../lib/api";
+  import { staleNote } from "../lib/findings";
+  import { formatTime } from "../lib/overview";
 
   const recQ = createQuery<Recommendation[]>({
     queryKey: ["recommendations"],
@@ -93,9 +95,12 @@
     }
   }
 
-  function findingFor(rec: Recommendation): Finding | undefined {
-    return ($findingQ.data ?? []).find(f => f.id === rec.finding_id);
-  }
+  // The tag only; the finding's own page gives the last confirmation time.
+  const staleTag = (finding: Finding) =>
+    staleNote(finding, formatTime(finding.last_seen_at, new Date()))?.tag;
+
+  // A reactive lookup: rows re-render when findings arrive after recommendations.
+  $: findingsById = new Map(($findingQ.data ?? []).map(finding => [finding.id, finding]));
 
   function severityClass(s: string) {
     return s === "Critical" ? "critical" : s === "Warning" ? "warning" : "info";
@@ -116,11 +121,12 @@
     </thead>
     <tbody>
       {#each $recQ.data ?? [] as rec}
-        {@const fnd = findingFor(rec)}
+        {@const fnd = findingsById.get(rec.finding_id)}
         <tr>
           <td>
             {#if fnd}
               <span class="tag {severityClass(fnd.severity)}">{fnd.severity}</span>
+              {#if staleTag(fnd)}{" "}<span class="tag stale">{staleTag(fnd)}</span>{/if}
               {" "}{fnd.detector}
             {:else}
               <span class="muted">{rec.finding_id.slice(0, 8)}…</span>
@@ -148,10 +154,10 @@
   <div class="overlay" role="dialog" aria-label="Create simulation" tabindex="0" on:keydown={(e) => e.key === 'Escape' && closeSim()}>
     <div class="overlay-card">
       <h3>Simulate: {selectedRec.action.summary}</h3>
-      {#if findingFor(selectedRec)}
-        {@const fnd = findingFor(selectedRec)}
+      {#if findingsById.get(selectedRec.finding_id)}
+        {@const fnd = findingsById.get(selectedRec.finding_id)}
         {#if fnd}
-          <div class="kv"><span>Finding</span><span><span class="tag {severityClass(fnd.severity)}">{fnd.severity}</span> {fnd.detector} &mdash; {fnd.channel ?? fnd.node ?? "(node)"}</span></div>
+          <div class="kv"><span>Finding</span><span><span class="tag {severityClass(fnd.severity)}">{fnd.severity}</span>{#if staleTag(fnd)}{" "}<span class="tag stale">{staleTag(fnd)}</span>{/if} {fnd.detector} &mdash; {fnd.channel ?? fnd.node ?? "(node)"}</span></div>
           {#if fnd.explanation}
             <div class="kv"><span>Context</span><span class="muted">{fnd.explanation}</span></div>
           {/if}
