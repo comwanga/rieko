@@ -1,0 +1,2 @@
+# Keep bytes exactly as committed so CHECKSUMS.sha256 verifies on every platform.
+* -text
