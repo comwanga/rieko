@@ -224,6 +224,7 @@ mod tests {
 
     fn ctx<'a>(h: &'a InMemoryHistory) -> DetectorContext<'a> {
         DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Regtest,
             history: Some(h),
             source: None,
@@ -250,6 +251,7 @@ mod tests {
         graph.upsert_channel(channel("c1", 0.10)).unwrap();
         let detector = DriftDetector::new("local-node");
         let context = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Regtest,
             history: None,
             source: None,

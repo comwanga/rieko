@@ -91,6 +91,15 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError>;
+    /// Reconcile and save one detector cycle using its explicit network scope.
+    /// The caller owns the transaction so snapshots, recommendations and webhook
+    /// processing can commit atomically with the cycle. Incomplete cycles save
+    /// observations but never resolve findings.
+    fn apply_finding_cycle(
+        &mut self,
+        scope: &FindingCycleScope,
+        findings: &[Finding],
+    ) -> Result<(), StorageError>;
     /// Resolve active findings in a detector/node scope before observations
     /// from a complete cycle are upserted. Incomplete cycles must not resolve.
     fn resolve_findings_for_scope(&mut self, scope: &FindingCycleScope)
@@ -226,8 +235,9 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     /// Check whether a webhook delivery has already been durably accepted.
     fn is_webhook_delivery_processed(&mut self, delivery_id: &str) -> Result<bool, StorageError>;
 
-    /// Legacy delivery-ledger insertion retained for compatibility. New webhook
-    /// ingestion should use [`Storage::enqueue_webhook_event`].
+    /// Idempotently record delivery identity without a detector event, for
+    /// signed unsupported webhooks. Existing delivery metadata is preserved.
+    /// Telemetry ingestion must use [`Storage::enqueue_webhook_event`].
     fn record_webhook_delivery(
         &mut self,
         delivery_id: &str,
@@ -257,6 +267,13 @@ pub trait Storage: rieko_status::OperationalStateStore + Send {
     fn recent_processed_webhook_events(
         &mut self,
         limit: u32,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError>;
+
+    /// Restore all processed events whose source timestamp is in the detector
+    /// window. No event-count cap may silently change the settlement rate.
+    fn processed_webhook_events_since(
+        &mut self,
+        observed_since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<WebhookEventRecord>, StorageError>;
 
     /// Marks one normalized event processed inside the detector-cycle transaction.
@@ -336,6 +353,7 @@ pub struct MemoryStorage {
     operational_state: Option<rieko_status::OperationalState>,
     transaction_snapshot: Option<MemoryStorageState>,
     finding_absent: HashMap<String, u32>,
+    finding_networks: HashMap<String, Option<BitcoinNetwork>>,
     webhook_deliveries: HashMap<String, WebhookDeliveryRecord>,
     webhook_events: HashMap<String, WebhookEventRecord>,
 }
@@ -343,6 +361,8 @@ pub struct MemoryStorage {
 #[derive(Debug, Clone)]
 struct MemoryStorageState {
     findings: Vec<Finding>,
+    finding_absent: HashMap<String, u32>,
+    finding_networks: HashMap<String, Option<BitcoinNetwork>>,
     recommendations: Vec<Recommendation>,
     audit: Vec<AuditEntry>,
     channel_snapshots: Vec<ChannelSnapshot>,
@@ -356,6 +376,50 @@ struct MemoryStorageState {
 }
 
 impl MemoryStorage {
+    fn save_finding_scoped(
+        &mut self,
+        finding: &Finding,
+        network: Option<rieko_domain::BitcoinNetwork>,
+    ) -> Result<(), StorageError> {
+        validate_finding_schema(finding.schema_version)?;
+        let first_seen_at = self
+            .findings
+            .iter()
+            .filter(|existing| {
+                existing.detector == finding.detector
+                    && existing.detector_version == finding.detector_version
+                    && self.finding_networks.get(&existing.id).copied().flatten() == network
+                    && existing.node == finding.node
+                    && existing.channel == finding.channel
+            })
+            .map(|existing| existing.first_seen_at)
+            .chain(std::iter::once(finding.first_seen_at))
+            .min()
+            .expect("finding first-seen candidates are non-empty");
+        if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
+            existing.first_seen_at = existing.first_seen_at.min(first_seen_at);
+            if finding.last_seen_at >= existing.last_seen_at {
+                self.finding_absent.remove(&finding.id);
+                self.finding_networks.insert(finding.id.clone(), network);
+                existing.severity = finding.severity;
+                existing.evidence = finding.evidence.clone();
+                existing.provenance = finding.provenance.clone();
+                existing.explanation = finding.explanation.clone();
+                existing.schema_version = finding.schema_version;
+                existing.timestamp = finding.timestamp;
+                existing.last_seen_at = finding.last_seen_at;
+                existing.lifecycle = FindingLifecycle::Active;
+            }
+        } else {
+            let mut finding = finding.clone();
+            finding.first_seen_at = first_seen_at;
+            finding.lifecycle = FindingLifecycle::Active;
+            self.finding_networks.insert(finding.id.clone(), network);
+            self.findings.push(finding);
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -386,6 +450,8 @@ impl Storage for MemoryStorage {
         }
         self.transaction_snapshot = Some(MemoryStorageState {
             findings: self.findings.clone(),
+            finding_absent: self.finding_absent.clone(),
+            finding_networks: self.finding_networks.clone(),
             recommendations: self.recommendations.clone(),
             audit: self.audit.clone(),
             channel_snapshots: self.channel_snapshots.clone(),
@@ -415,6 +481,8 @@ impl Storage for MemoryStorage {
             .take()
             .ok_or_else(|| StorageError::Backend("rollback with no open transaction".into()))?;
         self.findings = snapshot.findings;
+        self.finding_absent = snapshot.finding_absent;
+        self.finding_networks = snapshot.finding_networks;
         self.recommendations = snapshot.recommendations;
         self.audit = snapshot.audit;
         self.channel_snapshots = snapshot.channel_snapshots;
@@ -429,40 +497,18 @@ impl Storage for MemoryStorage {
     }
 
     fn save_finding(&mut self, finding: &Finding) -> Result<(), StorageError> {
-        validate_finding_schema(finding.schema_version)?;
-        let first_seen_at = self
-            .findings
-            .iter()
-            .filter(|existing| {
-                existing.detector == finding.detector
-                    && existing.detector_version == finding.detector_version
-                    && existing.provenance.as_ref().and_then(|p| p.network)
-                        == finding.provenance.as_ref().and_then(|p| p.network)
-                    && existing.node == finding.node
-                    && existing.channel == finding.channel
-            })
-            .map(|existing| existing.first_seen_at)
-            .chain(std::iter::once(finding.first_seen_at))
-            .min()
-            .expect("finding first-seen candidates are non-empty");
-        if let Some(existing) = self.findings.iter_mut().find(|f| f.id == finding.id) {
-            self.finding_absent.remove(&finding.id);
-            existing.first_seen_at = existing.first_seen_at.min(first_seen_at);
-            if finding.last_seen_at >= existing.last_seen_at {
-                existing.severity = finding.severity;
-                existing.evidence = finding.evidence.clone();
-                existing.provenance = finding.provenance.clone();
-                existing.explanation = finding.explanation.clone();
-                existing.schema_version = finding.schema_version;
-                existing.timestamp = finding.timestamp;
-                existing.last_seen_at = finding.last_seen_at;
-                existing.lifecycle = FindingLifecycle::Active;
-            }
-        } else {
-            let mut finding = finding.clone();
-            finding.first_seen_at = first_seen_at;
-            finding.lifecycle = FindingLifecycle::Active;
-            self.findings.push(finding);
+        self.save_finding_scoped(finding, finding.provenance.as_ref().and_then(|p| p.network))
+    }
+
+    fn apply_finding_cycle(
+        &mut self,
+        scope: &FindingCycleScope,
+        findings: &[Finding],
+    ) -> Result<(), StorageError> {
+        self.resolve_findings_for_scope(scope)?;
+        self.sync_recommendation_lifecycles()?;
+        for finding in findings {
+            self.save_finding_scoped(finding, scope.network)?;
         }
         Ok(())
     }
@@ -474,7 +520,7 @@ impl Storage for MemoryStorage {
         if scope.complete {
             for finding in &mut self.findings {
                 if finding.detector == scope.detector
-                    && finding.provenance.as_ref().and_then(|p| p.network) == scope.network
+                    && self.finding_networks.get(&finding.id).copied().flatten() == scope.network
                     && finding.node == scope.node
                     && finding.lifecycle == FindingLifecycle::Active
                 {
@@ -985,14 +1031,13 @@ impl Storage for MemoryStorage {
         event_type: Option<&str>,
         processed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StorageError> {
-        self.webhook_deliveries.insert(
-            delivery_id.to_string(),
-            WebhookDeliveryRecord {
+        self.webhook_deliveries
+            .entry(delivery_id.to_string())
+            .or_insert_with(|| WebhookDeliveryRecord {
                 webhook_id: webhook_id.map(ToString::to_string),
                 event_type: event_type.map(ToString::to_string),
                 processed_at,
-            },
-        );
+            });
         Ok(())
     }
 
@@ -1063,6 +1108,26 @@ impl Storage for MemoryStorage {
         Ok(events)
     }
 
+    fn processed_webhook_events_since(
+        &mut self,
+        observed_since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<WebhookEventRecord>, StorageError> {
+        let mut events: Vec<_> = self
+            .webhook_events
+            .values()
+            .filter(|record| {
+                record.processed_at.is_some() && record.event.timestamp() >= observed_since
+            })
+            .cloned()
+            .collect();
+        events.sort_by(|a, b| {
+            a.accepted_at
+                .cmp(&b.accepted_at)
+                .then_with(|| a.delivery_id.cmp(&b.delivery_id))
+        });
+        Ok(events)
+    }
+
     fn mark_webhook_event_processed(
         &mut self,
         delivery_id: &str,
@@ -1110,5 +1175,38 @@ impl rieko_status::OperationalStateStore for MemoryStorage {
         let mut state = self.read_operational_state()?.unwrap_or_default();
         f(&mut state);
         self.write_operational_state(&state)
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    #[test]
+    fn recording_a_duplicate_delivery_preserves_original_metadata() {
+        let mut storage = MemoryStorage::new();
+        let first = chrono::Utc::now();
+        storage
+            .record_webhook_delivery(
+                "delivery",
+                Some("first-webhook"),
+                Some("InvoiceCreated"),
+                first,
+            )
+            .unwrap();
+        storage
+            .record_webhook_delivery(
+                "delivery",
+                Some("replacement"),
+                Some("InvoiceSettled"),
+                first + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        let record = &storage.webhook_deliveries["delivery"];
+        assert_eq!(record.webhook_id.as_deref(), Some("first-webhook"));
+        assert_eq!(record.event_type.as_deref(), Some("InvoiceCreated"));
+        assert_eq!(record.processed_at, first);
+        assert_eq!(storage.webhook_deliveries.len(), 1);
+        assert!(storage.webhook_events.is_empty());
     }
 }

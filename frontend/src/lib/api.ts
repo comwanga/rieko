@@ -1,3 +1,7 @@
+import {
+  AuthenticationError, assertCurrent, credentialSnapshot, rejectCredential, saveValidatedToken,
+} from "./auth";
+
 let apiBase = "";
 
 export function setupApiBase(base: string) {
@@ -9,31 +13,73 @@ export function apiUrl(path: string): string {
 }
 
 export async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(apiUrl(path));
-  if (!resp.ok) {
-    throw new Error(`${resp.status} ${await resp.text()}`);
-  }
-  return (await resp.json()) as T;
+  return request<T>("GET", path);
 }
 
 export async function post<T>(path: string, body: unknown): Promise<T> {
-  const resp = await fetch(apiUrl(path), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return request<T>("POST", path, body);
+}
+
+async function request<T>(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  candidate?: { token: string; generation: number },
+): Promise<T> {
+  const snapshot = candidate ?? credentialSnapshot();
+  const url = new URL(apiUrl(path), window.location.href);
+  if (snapshot.token && url.origin !== window.location.origin) {
+    throw new Error("API tokens can only be sent to this application's origin.");
+  }
+  const headers = new Headers();
+  if (snapshot.token) {
+    try { headers.set("Authorization", `Bearer ${snapshot.token}`); }
+    catch { throw new Error("The token cannot be used as an HTTP header."); }
+  }
+  if (method === "POST") headers.set("Content-Type", "application/json");
+  let resp: Response;
+  try {
+    resp = await fetch(url, { method, headers, ...(method === "POST" ? { body: JSON.stringify(body) } : {}) });
+  } catch (error) {
+    assertCurrent(snapshot.generation);
+    throw error;
+  }
+  assertCurrent(snapshot.generation);
+  if (resp.status === 401) {
+    if (!candidate) rejectCredential(snapshot.generation);
+    throw new AuthenticationError(candidate ? "Token not accepted. Check the token and try again." : undefined);
+  }
   if (!resp.ok) {
-    const text = await resp.text();
+    const text = await readCurrentBody(() => resp.text(), snapshot.generation);
     let detail = text;
-    try {
-      const parsed = JSON.parse(text);
-      if (typeof parsed.message === "string") detail = parsed.message;
-    } catch {
-      /* use raw text */
+    if (method === "POST") {
+      try {
+        const parsed = JSON.parse(text);
+        if (typeof parsed.message === "string") detail = parsed.message;
+      } catch { /* Preserve non-JSON error messages. */ }
     }
     throw new Error(`${resp.status} ${detail}`);
   }
-  return (await resp.json()) as T;
+  return readCurrentBody<T>(() => resp.json(), snapshot.generation);
+}
+
+async function readCurrentBody<T>(read: () => Promise<T>, generation: number): Promise<T> {
+  try {
+    const value = await read();
+    assertCurrent(generation);
+    return value;
+  } catch (error) {
+    assertCurrent(generation);
+    throw error;
+  }
+}
+
+export async function authenticate(value: string) {
+  const token = value.trim();
+  if (!token) throw new Error("Enter an API token.");
+  const { generation } = credentialSnapshot();
+  await request<Status>("GET", "/status", undefined, { token, generation });
+  saveValidatedToken(token, generation);
 }
 
 // ─── Base types shared across routes ───

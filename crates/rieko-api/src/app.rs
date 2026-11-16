@@ -152,14 +152,12 @@ impl RiekoApi {
                         "/assets/*path",
                         axum::routing::get(crate::ui::embedded::asset),
                     )
-                    .route("/", axum::routing::get(crate::ui::embedded::index))
-                    // Embedding extends the router after `with_state()` which
-                    // freezes the middleware layers; re-apply security headers so
-                    // asset responses also receive the required headers.
-                    .layer(axum::middleware::from_fn(security_headers));
+                    .route("/", axum::routing::get(crate::ui::embedded::index));
             }
         }
-        router
+        // Apply after attaching UI services so API, static and fallback
+        // responses all receive the same security headers.
+        router.layer(axum::middleware::from_fn(security_headers))
     }
 
     fn router_with_state(&self, state: RiekoApi) -> axum::Router {
@@ -240,8 +238,6 @@ impl RiekoApi {
                 state.clone(),
                 require_auth,
             ))
-            // Security headers apply to every response, API and static alike.
-            .layer(axum::middleware::from_fn(security_headers))
             .layer(axum::middleware::from_fn(enforce_body_limit))
             // Enforce the ceiling while streaming, including chunked requests
             // without a trustworthy Content-Length header.
@@ -375,7 +371,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     headers.insert(
         CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(
-            "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+            "default-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
              script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );

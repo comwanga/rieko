@@ -77,6 +77,7 @@ fn correlates_btcpay_and_lnd_operational_evidence_into_typed_findings() {
     };
 
     let ctx = DetectorContext {
+        evaluated_at: chrono::Utc::now(),
         network: BitcoinNetwork::Regtest,
         history: None,
         source: Some(&btcpay_source),

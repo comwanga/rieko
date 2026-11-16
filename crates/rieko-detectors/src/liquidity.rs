@@ -480,6 +480,7 @@ mod tests {
             role: rieko_findings::ProducerRole::Normalizer,
         };
         let context = DetectorContext {
+            evaluated_at: chrono::Utc::now(),
             network: BitcoinNetwork::Signet,
             history: None,
             source: Some(&source),

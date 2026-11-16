@@ -772,7 +772,8 @@ pub async fn btcpay_webhook(
     body: axum::body::Bytes,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     use rieko_ingest_btcpay::{
-        normalize_webhook_payload, verify_btcpay_sig, BtcPayWebhookEvent, BTCPAY_SIG_HEADER,
+        normalize_webhook_payload, verify_btcpay_sig, BtcPayError, BtcPayWebhookEvent,
+        BTCPAY_SIG_HEADER,
     };
 
     // 1. Signature Verification (HMAC-SHA256 constant-time). The public route
@@ -857,34 +858,59 @@ pub async fn btcpay_webhook(
         ));
     }
 
-    // 4. Normalization into strongly-typed domain event
-    let event = normalize_webhook_payload(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "normalization_failed",
-                    "message": e.to_string()
-                }
-            })),
-        )
-    })?;
+    // 4. Unsupported types are distinct from malformed telemetry. They still
+    // require a well-formed, authenticated envelope before being acknowledged.
+    let event = match normalize_webhook_payload(&body) {
+        Ok(event) => Some(event),
+        Err(BtcPayError::UnsupportedWebhookEventType(_)) => {
+            if envelope.event_type.trim().is_empty()
+                || envelope.webhook_id.trim().is_empty()
+                || envelope.store_id.trim().is_empty()
+                || canonical_delivery_id.trim().is_empty()
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {"code":"invalid_payload", "message":"Webhook envelope identity and type must not be empty"}
+                    })),
+                ));
+            }
+            None
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {"code":"normalization_failed", "message":error.to_string()}
+                })),
+            ));
+        }
+    };
+    let ignored = event.is_none();
 
-    // 5. Durably hand the normalized event to the agent before acknowledging.
+    // 5. Persist delivery identity before acknowledging. Only telemetry gets
+    // a normalized event for the agent to process.
     let delivery_id = canonical_delivery_id.to_string();
     let webhook_id = envelope.webhook_id.clone();
     let event_type = envelope.event_type.clone();
     let durable_event = event.clone();
     block_storage(api.state.storage.clone(), move |storage| {
-        storage
-            .enqueue_webhook_event(
+        match durable_event {
+            Some(event) => storage.enqueue_webhook_event(
                 &delivery_id,
                 Some(&webhook_id),
                 Some(&event_type),
-                &durable_event,
+                &event,
                 chrono::Utc::now(),
-            )
-            .map_err(|error| error.to_string())
+            ),
+            None => storage.record_webhook_delivery(
+                &delivery_id,
+                Some(&webhook_id),
+                Some(&event_type),
+                chrono::Utc::now(),
+            ),
+        }
+        .map_err(|error| error.to_string())
     })
     .await
     .map_err(|(_, message)| {
@@ -901,7 +927,7 @@ pub async fn btcpay_webhook(
 
     // 6. Best-effort wake-up. A full or closed channel cannot lose the event:
     // the worker drains durable pending rows on its next wake-up or restart.
-    if let Some(sender) = &api.state.event_sender {
+    if let (Some(sender), Some(event)) = (&api.state.event_sender, event) {
         if let Err(error) = sender.try_send(event) {
             tracing::warn!(%error, %canonical_delivery_id, "BTCPay event persisted; worker wake-up deferred");
         }
@@ -910,7 +936,7 @@ pub async fn btcpay_webhook(
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
-            "status": "accepted",
+            "status": if ignored { "ignored" } else { "accepted" },
             "delivery_id": canonical_delivery_id
         })),
     ))

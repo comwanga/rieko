@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 /// database already at this version is opened as-is (idempotent); one *newer*
 /// than this is rejected as unsupported so an old binary refuses to touch a
 /// database it can no longer interpret.
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 18;
 
 /// One ordered, transactional upgrade step.
 pub struct Migration {
@@ -89,6 +89,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 17,
         sql: V17_LIGHTNING_STATE,
+    },
+    Migration {
+        version: 18,
+        sql: V18_FINDING_SCOPE,
     },
 ];
 
@@ -464,6 +468,14 @@ const V17_LIGHTNING_STATE: &str = r#"
 ALTER TABLE operational_state ADD COLUMN lightning TEXT;
 "#;
 
+/// v18: lifecycle scope is supplied by the detector cycle, independently of
+/// optional evidence provenance. Unknown legacy scopes remain NULL.
+const V18_FINDING_SCOPE: &str = r#"
+ALTER TABLE findings ADD COLUMN scope_network TEXT;
+UPDATE findings SET scope_network = json_extract(provenance, '$.network');
+CREATE INDEX idx_findings_scope_network_lifecycle ON findings (scope_network, lifecycle);
+"#;
+
 /// Read the persisted schema version (`PRAGMA user_version`).
 pub fn schema_version(conn: &Connection) -> Result<i64, StorageError> {
     let v: i64 = conn
@@ -525,13 +537,68 @@ fn apply(tx: &rusqlite::Transaction, step: &Migration) -> Result<(), StorageErro
     // Some supported legacy test/minimal databases contain only one v9-v11
     // subsystem table. Preserve that migration behavior while adding direct
     // observation columns to every normal database with operational state.
-    if !matches!(step.version, 16 | 17) || operational_state_exists()? {
+    let findings_exist: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings')",
+        [],
+        |row| row.get(0),
+    )?;
+    if (!matches!(step.version, 16 | 17) || operational_state_exists()?)
+        && (step.version != 18 || findings_exist)
+    {
         tx.execute_batch(step.sql).map_err(|e| {
             StorageError::Backend(format!("migration to v{} failed: {e}", step.version))
         })?;
+        if step.version == 18 {
+            reconcile_legacy_settlement_findings(tx)?;
+        }
     }
     tx.pragma_update(None, "user_version", step.version)
         .map_err(|e| StorageError::Backend(format!("recording schema version: {e}")))?;
+    Ok(())
+}
+
+fn reconcile_legacy_settlement_findings(tx: &rusqlite::Transaction) -> Result<(), StorageError> {
+    // Supported minimal legacy fixtures can omit the detector subsystem.
+    let has_detector: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('findings') WHERE name = 'detector')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_detector {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT id FROM findings WHERE detector = 'settlement_reliability'
+         AND provenance IS NULL AND lifecycle = 'active' ORDER BY id",
+    )?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let details = serde_json::json!({
+        "finding_ids": ids,
+        "reason": "Legacy settlement scope is unknown; current conditions are re-raised by the next detector cycle."
+    });
+    tx.execute(
+        "INSERT INTO audit (id, action_id, action_type, stage, actor, details, ts, previous_stage)
+         VALUES ('migration-v18-settlement-scope', 'migration-v18', 'custom', 'recommended',
+                 'migration:v18', ?1, ?2, NULL)",
+        rusqlite::params![details.to_string(), chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE recommendations SET lifecycle = 'resolved' WHERE finding_id IN (
+            SELECT id FROM findings WHERE detector = 'settlement_reliability'
+            AND provenance IS NULL AND lifecycle = 'active'
+         )",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE findings SET lifecycle = 'resolved', consecutive_absent = 0
+         WHERE detector = 'settlement_reliability' AND provenance IS NULL AND lifecycle = 'active'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -577,6 +644,142 @@ mod tests {
         // Applying migrations again is a no-op that must not error or bump higher.
         migrate(&mut conn).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    fn populated_v17(mut conn: Connection) -> Connection {
+        let tx = conn.transaction().unwrap();
+        for step in MIGRATIONS.iter().filter(|step| step.version <= 17) {
+            apply(&tx, step).unwrap();
+        }
+        tx.commit().unwrap();
+        for (id, detector, provenance, lifecycle) in [
+            ("stuck", "settlement_reliability", None, "active"),
+            (
+                "already-resolved",
+                "settlement_reliability",
+                None,
+                "resolved",
+            ),
+            ("unrelated", "channel_liquidity", None, "active"),
+            (
+                "scoped",
+                "channel_liquidity",
+                Some(r#"{"network":"regtest"}"#),
+                "active",
+            ),
+            (
+                "known-settlement",
+                "settlement_reliability",
+                Some(r#"{"network":"mainnet"}"#),
+                "active",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO findings (id, detector, severity, evidence, ts, first_seen_at,
+                 last_seen_at, provenance, lifecycle, consecutive_absent)
+                 VALUES (?1, ?2, 1, '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z', ?3, ?4, 2)",
+                rusqlite::params![id, detector, provenance, lifecycle],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO recommendations (finding_id, action_id, action_type, stage, params,
+             summary, created_at, updated_at) VALUES
+             ('stuck', 'action-stuck', 'custom', 'recommended', '{}', 'investigate',
+              '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+             ('unrelated', 'action-other', 'custom', 'recommended', '{}', 'investigate',
+              '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn v18_backfills_scope_and_audits_only_unknown_active_settlement_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v17.db");
+        let conn = populated_v17(Connection::open(&path).unwrap());
+        drop(conn);
+        let mut conn = Connection::open(&path).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 18);
+        for (id, network, lifecycle) in [
+            ("stuck", None, "resolved"),
+            ("already-resolved", None, "resolved"),
+            ("unrelated", None, "active"),
+            ("scoped", Some("regtest"), "active"),
+            ("known-settlement", Some("mainnet"), "active"),
+        ] {
+            let row: (Option<String>, String) = conn
+                .query_row(
+                    "SELECT scope_network, lifecycle FROM findings WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (network.map(str::to_string), lifecycle.into()), "{id}");
+        }
+        let details: String = conn
+            .query_row("SELECT details FROM audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&details).unwrap()["finding_ids"],
+            serde_json::json!(["stuck"])
+        );
+        for (id, lifecycle) in [("action-stuck", "resolved"), ("action-other", "active")] {
+            let stored: String = conn
+                .query_row(
+                    "SELECT lifecycle FROM recommendations WHERE action_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, lifecycle);
+        }
+        drop(conn);
+        let mut conn = Connection::open(&path).unwrap();
+        migrate(&mut conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "reopening must not repeat reconciliation");
+    }
+
+    #[test]
+    fn v18_reconciliation_failure_rolls_back_schema_backfill_and_audit() {
+        let mut conn = populated_v17(bare_conn());
+        conn.execute_batch(
+            "CREATE TRIGGER fail_v18 BEFORE UPDATE ON findings
+             WHEN NEW.lifecycle = 'resolved' AND OLD.lifecycle = 'active'
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
+        assert!(migrate(&mut conn).is_err());
+        assert_eq!(schema_version(&conn).unwrap(), 17);
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('findings') WHERE name = 'scope_network'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 0);
+        let audit: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit, 0);
+        let lifecycle: String = conn
+            .query_row(
+                "SELECT lifecycle FROM recommendations WHERE action_id = 'action-stuck'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "active");
+        conn.execute_batch("DROP TRIGGER fail_v18").unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 18);
     }
 
     #[test]

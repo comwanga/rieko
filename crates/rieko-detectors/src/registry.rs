@@ -12,6 +12,9 @@ use thiserror::Error;
 /// and chain synchronization status so trend-based and multi-source correlation
 /// detectors can reason over time while staying pure.
 pub struct DetectorContext<'a> {
+    /// Evaluation clock supplied by the caller; time-sensitive detectors do not
+    /// read a wall clock themselves.
+    pub evaluated_at: chrono::DateTime<chrono::Utc>,
     pub network: BitcoinNetwork,
     pub history: Option<&'a dyn HistoryView>,
     pub source: Option<&'a ObservationSource>,
@@ -24,6 +27,7 @@ pub struct DetectorContext<'a> {
 impl<'a> DetectorContext<'a> {
     pub fn no_context(network: BitcoinNetwork) -> Self {
         Self {
+            evaluated_at: chrono::Utc::now(),
             network,
             history: None,
             source: None,
