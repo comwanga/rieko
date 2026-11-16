@@ -97,7 +97,7 @@ jobs:
       - name: Build embedded binary
         run: cargo build --release --features rieko_ui_embedded
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/release/rieko
           generate_release_notes: true
