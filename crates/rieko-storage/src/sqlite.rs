@@ -3070,6 +3070,7 @@ mod tests {
             source_data_at: Some(Utc::now()),
             bitcoin_core: Some(rieko_status::BitcoinCoreState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt: Utc::now(),
                 last_success: Some(Utc::now()),
                 snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
@@ -3082,6 +3083,7 @@ mod tests {
             }),
             lightning: Some(rieko_status::LightningState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt: Utc::now(),
                 last_success: Some(Utc::now()),
                 snapshot: Some(rieko_domain::LightningSnapshot {

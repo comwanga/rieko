@@ -7,6 +7,10 @@ Rieko uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Source poll-failure findings** (`rieko-agent`): `bitcoin_core_poll_failure`
+  and `lnd_poll_failure` are raised when three consecutive polls of that source
+  fail, and resolve after three successful polls. The threshold is a heuristic
+  and is recorded in the finding's evidence.
 - **GetInfo-based identity discovery** (`rieko-ingest-lnd`): `LndClient::get_info()`
   now derives node identity from `/v1/getinfo` rather than relying on a
   caller-supplied `--node` flag. The CLI flag is now optional and emits a warning
@@ -34,6 +38,11 @@ Rieko uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fixture-based smoke test.
 
 ### Changed
+- **`/status` health covers Bitcoin Core and LND polling**: a polled source that
+  is disconnected makes the overall state `degraded`, or `unhealthy` if it has
+  never connected. An agent polling only Core or LND now leaves
+  `not_initialized` after its first successful poll. `/inspect/bitcoin` and
+  `/inspect/lightning` include a `consecutive_failures` count.
 - `--node` flag in `scan` and `monitor` is now advisory; the live LND node
   identity takes precedence.
 - `GraphSource` gained `allow_insecure: bool` propagated from both `scan` and
