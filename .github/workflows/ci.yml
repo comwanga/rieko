@@ -66,7 +66,7 @@ jobs:
         run: npm run test:browser
       - name: Browser failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-test-results
           path: frontend/test-results/
