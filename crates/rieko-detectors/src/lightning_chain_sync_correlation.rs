@@ -187,6 +187,7 @@ mod tests {
             last_ingestion_success: btcpay_connected.then_some(btcpay_at),
             bitcoin_core: Some(BitcoinCoreState {
                 connected: core_connected,
+                consecutive_failures: 0,
                 last_attempt: core_at,
                 last_success: core_connected.then_some(core_at),
                 snapshot: Some(BitcoinCoreSnapshot {
@@ -199,6 +200,7 @@ mod tests {
             }),
             lightning: Some(LightningState {
                 connected: lightning_connected,
+                consecutive_failures: 0,
                 last_attempt: lightning_at,
                 last_success: lightning_connected.then_some(lightning_at),
                 snapshot: Some(LightningSnapshot {

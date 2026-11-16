@@ -10,8 +10,8 @@ use clap::Args;
 use rieko_api::RiekoApi;
 use rieko_detectors::{
     BitcoinCoreSyncCorrelationDetector, BtcPayBackendHealthDetector, Detector, DetectorContext,
-    LightningChainSyncCorrelationDetector, SettlementReliabilityDetector,
-    SettlementReliabilityThresholds,
+    LightningChainSyncCorrelationDetector, PolledSource, SettlementReliabilityDetector,
+    SettlementReliabilityThresholds, SourcePollFailureDetector,
 };
 use rieko_domain::{BitcoinNetwork, NodeEvent, NodeIngestionAdapter, NodeSnapshot};
 use rieko_findings::channel_snapshot_state_digest;
@@ -609,20 +609,23 @@ async fn run_bitcoin_core_poll_loop(
                                     "Bitcoin Core state persisted"
                                 );
                                 run_bitcoin_core_sync_correlation_detector(&storage).await;
+                                run_source_poll_failure_detector(&storage, PolledSource::BitcoinCore).await;
                             }
                             Err(error) => warn!(attempt = attempts, %error, "Bitcoin Core state persistence failed"),
                         }
                     }
                     Ok(Err(error)) => {
                         warn!(attempt = attempts, %error, "Bitcoin Core RPC polling failed");
-                        if let Err(state_error) = record_bitcoin_core_failure(&storage).await {
-                            warn!(%state_error, "failed to persist Bitcoin Core failure state");
+                        match record_bitcoin_core_failure(&storage).await {
+                            Ok(()) => run_source_poll_failure_detector(&storage, PolledSource::BitcoinCore).await,
+                            Err(state_error) => warn!(%state_error, "failed to persist Bitcoin Core failure state"),
                         }
                     }
                     Err(_) => {
                         warn!(attempt = attempts, timeout_seconds = config.timeout.as_secs(), "Bitcoin Core RPC polling timed out");
-                        if let Err(error) = record_bitcoin_core_failure(&storage).await {
-                            warn!(%error, "failed to persist Bitcoin Core timeout state");
+                        match record_bitcoin_core_failure(&storage).await {
+                            Ok(()) => run_source_poll_failure_detector(&storage, PolledSource::BitcoinCore).await,
+                            Err(error) => warn!(%error, "failed to persist Bitcoin Core timeout state"),
                         }
                     }
                 }
@@ -678,20 +681,23 @@ async fn run_lnd_poll_loop(
                                     "Lightning state persisted"
                                 );
                                 run_lightning_chain_sync_correlation_detector(&storage).await;
+                                run_source_poll_failure_detector(&storage, PolledSource::Lnd).await;
                             }
                             Err(error) => warn!(attempt = attempts, %error, "Lightning state persistence failed"),
                         }
                     }
                     Ok(Err(error)) => {
                         warn!(attempt = attempts, %error, "LND REST polling failed");
-                        if let Err(state_error) = record_lnd_failure(&storage).await {
-                            warn!(%state_error, "failed to persist LND failure state");
+                        match record_lnd_failure(&storage).await {
+                            Ok(()) => run_source_poll_failure_detector(&storage, PolledSource::Lnd).await,
+                            Err(state_error) => warn!(%state_error, "failed to persist LND failure state"),
                         }
                     }
                     Err(_) => {
                         warn!(attempt = attempts, timeout_seconds = timeout.as_secs(), "LND REST polling timed out");
-                        if let Err(error) = record_lnd_failure(&storage).await {
-                            warn!(%error, "failed to persist LND timeout state");
+                        match record_lnd_failure(&storage).await {
+                            Ok(()) => run_source_poll_failure_detector(&storage, PolledSource::Lnd).await,
+                            Err(error) => warn!(%error, "failed to persist LND timeout state"),
                         }
                     }
                 }
@@ -731,6 +737,45 @@ async fn run_lightning_chain_sync_correlation_detector(
     if let Err(error) = evaluate_persisted_lightning_chain_sync_correlation(storage).await {
         warn!(%error, "Lightning chain-sync correlation detector cycle failed");
     }
+}
+
+async fn run_source_poll_failure_detector(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    source: PolledSource,
+) {
+    if let Err(error) = evaluate_persisted_source_poll_failure(storage, source).await {
+        warn!(%error, ?source, "source poll-failure detector cycle failed");
+    }
+}
+
+async fn evaluate_persisted_source_poll_failure(
+    storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    source: PolledSource,
+) -> Result<()> {
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut storage = storage.blocking_lock();
+        let state = storage
+            .read_operational_state()
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?
+            .unwrap_or_default();
+        let detector = SourcePollFailureDetector::new(source, &state);
+        let graph = InMemoryGraph::new();
+        // The detector is service-scoped, so the network is not part of its
+        // identity or lifecycle scope.
+        let context = DetectorContext {
+            node: Some(source.node_label()),
+            ..DetectorContext::no_context(BitcoinNetwork::Mainnet)
+        };
+        let cycle = detector
+            .evaluate(&graph, &context)
+            .map_err(|error| rieko_storage::StorageError::Backend(error.to_string()))?;
+
+        persist_operational_detector_cycle(&mut **storage, &cycle)
+    })
+    .await
+    .context("joining source poll-failure detector persistence")??;
+    Ok(())
 }
 
 async fn evaluate_persisted_lightning_chain_sync_correlation(
@@ -886,6 +931,7 @@ async fn record_bitcoin_core_attempt(storage: &Arc<Mutex<Box<dyn Storage + Send>
                 None => {
                     state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
                         connected: false,
+                        consecutive_failures: 0,
                         last_attempt: attempted_at,
                         last_success: None,
                         snapshot: None,
@@ -913,6 +959,7 @@ async fn record_bitcoin_core_success(
                 .map_or(completed_at, |core| core.last_attempt);
             state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt,
                 last_success: Some(completed_at),
                 snapshot: Some(snapshot.clone()),
@@ -931,10 +978,14 @@ async fn record_bitcoin_core_failure(storage: &Arc<Mutex<Box<dyn Storage + Send>
         storage.blocking_lock().update_operational_state(&|state| {
             let failed_at = chrono::Utc::now();
             match state.bitcoin_core.as_mut() {
-                Some(core) => core.connected = false,
+                Some(core) => {
+                    core.connected = false;
+                    core.consecutive_failures = core.consecutive_failures.saturating_add(1);
+                }
                 None => {
                     state.bitcoin_core = Some(rieko_status::BitcoinCoreState {
                         connected: false,
+                        consecutive_failures: 1,
                         last_attempt: failed_at,
                         last_success: None,
                         snapshot: None,
@@ -958,6 +1009,7 @@ async fn record_lnd_attempt(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Re
                 None => {
                     state.lightning = Some(rieko_status::LightningState {
                         connected: false,
+                        consecutive_failures: 0,
                         last_attempt: attempted_at,
                         last_success: None,
                         snapshot: None,
@@ -985,6 +1037,7 @@ async fn record_lnd_success(
                 .map_or(completed_at, |lightning| lightning.last_attempt);
             state.lightning = Some(rieko_status::LightningState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt,
                 last_success: Some(completed_at),
                 snapshot: Some(snapshot.clone()),
@@ -1003,10 +1056,15 @@ async fn record_lnd_failure(storage: &Arc<Mutex<Box<dyn Storage + Send>>>) -> Re
         storage.blocking_lock().update_operational_state(&|state| {
             let failed_at = chrono::Utc::now();
             match state.lightning.as_mut() {
-                Some(lightning) => lightning.connected = false,
+                Some(lightning) => {
+                    lightning.connected = false;
+                    lightning.consecutive_failures =
+                        lightning.consecutive_failures.saturating_add(1);
+                }
                 None => {
                     state.lightning = Some(rieko_status::LightningState {
                         connected: false,
+                        consecutive_failures: 1,
                         last_attempt: failed_at,
                         last_success: None,
                         snapshot: None,
@@ -1687,6 +1745,7 @@ mod tests {
             source: rieko_status::SourceState::BtcPayGreenfield { connected: true },
             bitcoin_core: Some(rieko_status::BitcoinCoreState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt: observed_at,
                 last_success: Some(observed_at),
                 snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
@@ -2128,6 +2187,243 @@ mod tests {
         assert!(storage.latest_findings(10).unwrap().is_empty());
     }
 
+    /// Polls a mock Bitcoin Core once per entry of `outcomes` (`true` answers,
+    /// `false` returns 503) against the given storage.
+    async fn poll_bitcoin_core_with_outcomes(
+        storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+        outcomes: &'static [bool],
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/",
+            post(move || {
+                let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if outcomes[attempt] {
+                        Json(bitcoin_core_response()).into_response()
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_bitcoin_core_poll_loop(
+            bitcoin_core_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                outcomes.len() as u64,
+            ),
+            storage.clone(),
+            shutdown_rx,
+        )
+        .await;
+        server.abort();
+    }
+
+    /// The LND counterpart of [`poll_bitcoin_core_with_outcomes`].
+    async fn poll_lnd_with_outcomes(
+        storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+        outcomes: &'static [bool],
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/getinfo",
+            get(move || {
+                let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if outcomes[attempt] {
+                        Json(lnd_info()).into_response()
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = start_mock_btcpay(app).await;
+        run_finite_lnd_poll(
+            lnd_poll_config(
+                &endpoint,
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+                outcomes.len() as u64,
+            )
+            .await,
+            storage.clone(),
+        )
+        .await;
+        server.abort();
+    }
+
+    async fn poll_source_with_outcomes(
+        source: PolledSource,
+        storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+        outcomes: &'static [bool],
+    ) {
+        match source {
+            PolledSource::BitcoinCore => poll_bitcoin_core_with_outcomes(storage, outcomes).await,
+            PolledSource::Lnd => poll_lnd_with_outcomes(storage, outcomes).await,
+        }
+    }
+
+    async fn stored_findings(
+        storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    ) -> Vec<rieko_findings::Finding> {
+        storage.lock().await.latest_findings(10).unwrap()
+    }
+
+    async fn stored_consecutive_failures(
+        source: PolledSource,
+        storage: &Arc<Mutex<Box<dyn Storage + Send>>>,
+    ) -> u32 {
+        let state = storage
+            .lock()
+            .await
+            .read_operational_state()
+            .unwrap()
+            .unwrap();
+        match source {
+            PolledSource::BitcoinCore => state.bitcoin_core.unwrap().consecutive_failures,
+            PolledSource::Lnd => state.lightning.unwrap().consecutive_failures,
+        }
+    }
+
+    fn poll_failure_backends() -> Vec<Arc<Mutex<Box<dyn Storage + Send>>>> {
+        vec![
+            memory_storage(),
+            Arc::new(Mutex::new(Box::new(SqliteStorage::in_memory().unwrap()))),
+        ]
+    }
+
+    const POLLED_SOURCES: [(PolledSource, &str); 2] = [
+        (PolledSource::BitcoinCore, "bitcoin_core_poll_failure"),
+        (PolledSource::Lnd, "lnd_poll_failure"),
+    ];
+
+    #[tokio::test]
+    async fn source_outage_raises_one_finding_on_the_third_failed_poll_and_recovery_resolves_it() {
+        for (source, detector) in POLLED_SOURCES {
+            for storage in poll_failure_backends() {
+                // A source that has never answered: two failures are not yet a finding.
+                poll_source_with_outcomes(source, &storage, &[false, false]).await;
+                assert_eq!(stored_consecutive_failures(source, &storage).await, 2);
+                assert!(stored_findings(&storage).await.is_empty(), "{detector}");
+
+                // The third consecutive failure raises it.
+                poll_source_with_outcomes(source, &storage, &[false]).await;
+                let findings = stored_findings(&storage).await;
+                assert_eq!(findings.len(), 1, "{detector}");
+                assert_eq!(findings[0].detector, detector);
+                assert_eq!(findings[0].node.as_deref(), Some(source.node_label()));
+                assert_eq!(
+                    findings[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Active
+                );
+                let evidence = findings[0].evidence_value("source_state").unwrap();
+                assert_eq!(evidence["consecutive_failures"], 3);
+                assert_eq!(evidence["last_success"], serde_json::Value::Null);
+                let id = findings[0].id.clone();
+
+                // A continuing outage updates the same finding.
+                poll_source_with_outcomes(source, &storage, &[false, false]).await;
+                let findings = stored_findings(&storage).await;
+                assert_eq!(findings.len(), 1, "{detector}");
+                assert_eq!(findings[0].id, id);
+                assert_eq!(
+                    findings[0].evidence_value("source_state").unwrap()["consecutive_failures"],
+                    5
+                );
+
+                // Two successful polls are not enough to resolve it.
+                poll_source_with_outcomes(source, &storage, &[true, true]).await;
+                assert_eq!(stored_consecutive_failures(source, &storage).await, 0);
+                assert_eq!(
+                    stored_findings(&storage).await[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Active
+                );
+
+                // The third resolves it.
+                poll_source_with_outcomes(source, &storage, &[true]).await;
+                let findings = stored_findings(&storage).await;
+                assert_eq!(findings.len(), 1, "{detector}");
+                assert_eq!(
+                    findings[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Resolved
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_source_failures_raise_no_finding() {
+        for (source, detector) in POLLED_SOURCES {
+            for storage in poll_failure_backends() {
+                poll_source_with_outcomes(
+                    source,
+                    &storage,
+                    &[true, false, false, true, false, true, false, false],
+                )
+                .await;
+                assert_eq!(stored_consecutive_failures(source, &storage).await, 2);
+                assert!(stored_findings(&storage).await.is_empty(), "{detector}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_polls_below_the_threshold_do_not_count_toward_resolution() {
+        for (source, detector) in POLLED_SOURCES {
+            for storage in poll_failure_backends() {
+                poll_source_with_outcomes(source, &storage, &[true, false, false, false]).await;
+                assert_eq!(stored_findings(&storage).await.len(), 1, "{detector}");
+
+                // Two clean polls with two failed polls between them: the
+                // failed polls are incomplete cycles and prove nothing.
+                poll_source_with_outcomes(source, &storage, &[true, false, false, true]).await;
+                let findings = stored_findings(&storage).await;
+                assert_eq!(
+                    findings[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Active,
+                    "{detector}"
+                );
+                // The finding keeps the evidence of the outage that raised it.
+                assert_eq!(
+                    findings[0].evidence_value("source_state").unwrap()["consecutive_failures"],
+                    3
+                );
+
+                poll_source_with_outcomes(source, &storage, &[true]).await;
+                assert_eq!(
+                    stored_findings(&storage).await[0].lifecycle,
+                    rieko_findings::FindingLifecycle::Resolved,
+                    "{detector}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_outage_does_not_disturb_the_other_sources_findings_or_state() {
+        let storage = memory_storage();
+        poll_lnd_with_outcomes(&storage, &[true]).await;
+        poll_bitcoin_core_with_outcomes(&storage, &[false, false, false]).await;
+
+        let findings = stored_findings(&storage).await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector, "bitcoin_core_poll_failure");
+        let state = storage
+            .lock()
+            .await
+            .read_operational_state()
+            .unwrap()
+            .unwrap();
+        let lightning = state.lightning.unwrap();
+        assert!(lightning.connected);
+        assert_eq!(lightning.consecutive_failures, 0);
+    }
+
     #[tokio::test]
     async fn successful_greenfield_poll_persists_normalized_state_without_findings() {
         let saw_scoped_key = Arc::new(AtomicBool::new(false));
@@ -2363,6 +2659,7 @@ mod tests {
                     last_ingestion_success: Some(observed_at),
                     bitcoin_core: Some(rieko_status::BitcoinCoreState {
                         connected: true,
+                        consecutive_failures: 0,
                         last_attempt: observed_at,
                         last_success: Some(observed_at),
                         snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
@@ -2442,6 +2739,7 @@ mod tests {
                     last_ingestion_success: Some(observed_at),
                     bitcoin_core: Some(rieko_status::BitcoinCoreState {
                         connected: true,
+                        consecutive_failures: 0,
                         last_attempt: observed_at,
                         last_success: Some(observed_at),
                         snapshot: Some(rieko_domain::BitcoinCoreSnapshot {
@@ -2454,6 +2752,7 @@ mod tests {
                     }),
                     lightning: Some(rieko_status::LightningState {
                         connected: true,
+                        consecutive_failures: 0,
                         last_attempt: observed_at,
                         last_success: Some(observed_at),
                         snapshot: Some(rieko_domain::LightningSnapshot {

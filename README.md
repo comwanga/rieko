@@ -139,8 +139,9 @@ plus the active findings. Service cards report only what the agent has observed:
 **Not observed** (no poll recorded), **Never connected** (polls attempted, none
 succeeded), **Connected**, or **Disconnected** (the values shown are the last ones
 seen). The Rieko card and the top-bar pill show the agent's own pipeline state from
-`/status`; it does not yet account for Bitcoin Core or LND reachability, so it is
-never presented as the health of every system.
+`/status`. That state reflects whether the sources the agent polls are answering,
+not whether the systems behind them are healthy, so it is never presented as the
+health of every system.
 
 When the API requires authentication, the UI prompts for the raw token from your
 configured token file. A successful check remembers it in `sessionStorage` for
@@ -372,6 +373,8 @@ LND / BTCPay / Core ──▶ Ingestion Adapters ──▶ Normalized Domain Eve
 | BTCPay backend health | `btcpay_backend_health` | Persisted Greenfield connectivity is degraded |
 | Bitcoin Core sync correlation | `bitcoin_core_sync_correlation` | BTCPay and Core are reachable, but persisted Core state is unsynchronized |
 | Lightning chain sync correlation | `lightning_chain_sync_correlation` | BTCPay and synchronized Core are reachable, but persisted LND state is not synced to chain |
+| Bitcoin Core poll failure | `bitcoin_core_poll_failure` | The agent's last 3 or more consecutive Bitcoin Core RPC polls failed |
+| LND poll failure | `lnd_poll_failure` | The agent's last 3 or more consecutive LND REST polls failed |
 
 They produce deterministic findings with stable identities. Replay produces
 zero duplicates.

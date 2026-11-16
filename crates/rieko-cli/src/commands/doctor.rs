@@ -195,6 +195,7 @@ mod tests {
             source_data_at: Some(observed_at),
             bitcoin_core: Some(BitcoinCoreState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt: observed_at,
                 last_success: Some(observed_at),
                 snapshot: Some(BitcoinCoreSnapshot {
@@ -207,6 +208,7 @@ mod tests {
             }),
             lightning: Some(LightningState {
                 connected: true,
+                consecutive_failures: 0,
                 last_attempt: observed_at,
                 last_success: Some(observed_at),
                 snapshot: Some(LightningSnapshot {

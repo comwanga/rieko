@@ -68,6 +68,10 @@ impl Default for OperationalState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BitcoinCoreState {
     pub connected: bool,
+    /// Failed polls since the last success. Rows written before the counter
+    /// existed decode as zero.
+    #[serde(default)]
+    pub consecutive_failures: u32,
     pub last_attempt: DateTime<Utc>,
     pub last_success: Option<DateTime<Utc>>,
     pub snapshot: Option<BitcoinCoreSnapshot>,
@@ -77,6 +81,10 @@ pub struct BitcoinCoreState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LightningState {
     pub connected: bool,
+    /// Failed polls since the last success. Rows written before the counter
+    /// existed decode as zero.
+    #[serde(default)]
+    pub consecutive_failures: u32,
     pub last_attempt: DateTime<Utc>,
     pub last_success: Option<DateTime<Utc>>,
     pub snapshot: Option<LightningSnapshot>,
@@ -141,7 +149,7 @@ impl ComponentState {
 /// [`crate::assess`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverallState {
-    /// Rieko has never completed an ingestion.
+    /// No source has ever been read successfully.
     NotInitialized,
     /// Operating within policy.
     Healthy,
@@ -159,5 +167,19 @@ impl OverallState {
             Self::Degraded => "degraded",
             Self::Unhealthy => "unhealthy",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_state_stored_before_the_failure_counter_decodes_as_zero() {
+        let stored = r#"{"connected":false,"last_attempt":"2026-11-01T00:00:00Z","last_success":null,"snapshot":null}"#;
+        let core: BitcoinCoreState = serde_json::from_str(stored).unwrap();
+        let lightning: LightningState = serde_json::from_str(stored).unwrap();
+        assert_eq!(core.consecutive_failures, 0);
+        assert_eq!(lightning.consecutive_failures, 0);
     }
 }

@@ -5,6 +5,7 @@ pub mod lightning_chain_sync_correlation;
 pub mod liquidity;
 pub mod registry;
 pub mod settlement;
+pub mod source_poll_failure;
 
 pub use bitcoin_core_sync_correlation::BitcoinCoreSyncCorrelationDetector;
 pub use btcpay_health::BtcPayBackendHealthDetector;
@@ -13,3 +14,4 @@ pub use lightning_chain_sync_correlation::LightningChainSyncCorrelationDetector;
 pub use liquidity::{LiquidityDetector, LiquidityThresholds};
 pub use registry::{Detector, DetectorContext, DetectorCycle, DetectorError};
 pub use settlement::{SettlementReliabilityDetector, SettlementReliabilityThresholds};
+pub use source_poll_failure::{PolledSource, SourcePollFailureDetector, SOURCE_FAILURE_THRESHOLD};

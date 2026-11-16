@@ -19,12 +19,14 @@ impl Default for HealthPolicy {
 
 /// Exact health semantics (RIEKO-AUDIT-008).
 ///
-/// * **NotInitialized**: no ingestion has ever succeeded.
+/// * **NotInitialized**: no source has ever been read successfully.
 /// * **Unhealthy**: the database failed its integrity check, or a live source
-///   was configured but has never connected.
+///   (BTCPay, LND, or directly polled Bitcoin Core or Lightning) was configured
+///   but has never connected.
 /// * **Degraded**:
 ///   * the latest ingestion attempt failed while valid older data exists;
-///   * a previously successful live source is currently disconnected;
+///   * a previously successful live source, including directly polled Bitcoin
+///     Core or Lightning, is currently disconnected;
 ///   * the latest detector-cycle attempt did not complete;
 ///   * source data is older than the freshness threshold;
 ///   * an LLM is configured but unverified or failing (explanations expected);
@@ -48,19 +50,41 @@ pub fn assess(
         return OverallState::Unhealthy;
     }
 
-    let Some(last_success) = state.last_ingestion_success else {
-        // Never ingested anything. A configured live source that has also
-        // never connected is not operating at all, rather than not-yet-used.
-        if !state.source.connected() {
-            return OverallState::Unhealthy;
-        }
+    // Bitcoin Core and Lightning are polled independently of `source`. Each is
+    // present only once the agent has attempted to poll it.
+    let polled = [
+        state
+            .bitcoin_core
+            .as_ref()
+            .map(|core| (core.connected, core.last_success)),
+        state
+            .lightning
+            .as_ref()
+            .map(|lightning| (lightning.connected, lightning.last_success)),
+    ];
+    let polled = || polled.iter().flatten();
+
+    // A configured live source that has never connected is not operating at
+    // all, rather than not-yet-used.
+    if (state.last_ingestion_success.is_none() && !state.source.connected())
+        || polled().any(|(connected, last_success)| !connected && last_success.is_none())
+    {
+        return OverallState::Unhealthy;
+    }
+
+    // Any source's first success initializes the pipeline.
+    if state.last_ingestion_success.is_none()
+        && polled().all(|(_, last_success)| last_success.is_none())
+    {
         return OverallState::NotInitialized;
-    };
+    }
 
     let mut degraded = false;
 
     // Latest attempt failed but recent valid data exists.
-    if let Some(attempt) = state.last_ingestion_attempt {
+    if let (Some(attempt), Some(last_success)) =
+        (state.last_ingestion_attempt, state.last_ingestion_success)
+    {
         if attempt > last_success {
             degraded = true;
         }
@@ -68,7 +92,7 @@ pub fn assess(
 
     // A live source that worked before is temporarily unavailable. A source
     // that has never connected is handled as Unhealthy above.
-    if !state.source.connected() {
+    if !state.source.connected() || polled().any(|(connected, _)| !connected) {
         degraded = true;
     }
 
@@ -261,6 +285,118 @@ mod tests {
             assess(&never_connected, &policy, now, true),
             OverallState::Degraded
         );
+    }
+
+    fn core(connected: bool, last_success: Option<DateTime<Utc>>) -> crate::BitcoinCoreState {
+        crate::BitcoinCoreState {
+            connected,
+            consecutive_failures: u32::from(!connected),
+            last_attempt: Utc::now(),
+            last_success,
+            snapshot: None,
+        }
+    }
+
+    fn lightning(connected: bool, last_success: Option<DateTime<Utc>>) -> crate::LightningState {
+        crate::LightningState {
+            connected,
+            consecutive_failures: u32::from(!connected),
+            last_attempt: Utc::now(),
+            last_success,
+            snapshot: None,
+        }
+    }
+
+    fn healthy_btcpay(now: DateTime<Utc>) -> OperationalState {
+        let mut s = base();
+        s.source = SourceState::BtcPayGreenfield { connected: true };
+        s.last_ingestion_attempt = Some(now - Duration::seconds(10));
+        s.last_ingestion_success = Some(now - Duration::seconds(10));
+        s.source_data_at = Some(now - Duration::seconds(10));
+        s
+    }
+
+    #[test]
+    fn core_and_lightning_without_btcpay_are_healthy_after_their_first_success() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = base();
+        s.bitcoin_core = Some(core(true, Some(now - Duration::seconds(10))));
+        s.lightning = Some(lightning(true, Some(now - Duration::seconds(10))));
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Healthy);
+
+        let mut core_only = base();
+        core_only.bitcoin_core = Some(core(true, Some(now - Duration::seconds(10))));
+        assert_eq!(
+            assess(&core_only, &policy, now, true),
+            OverallState::Healthy
+        );
+
+        let mut lightning_only = base();
+        lightning_only.lightning = Some(lightning(true, Some(now - Duration::seconds(10))));
+        assert_eq!(
+            assess(&lightning_only, &policy, now, true),
+            OverallState::Healthy
+        );
+    }
+
+    #[test]
+    fn disconnected_core_or_lightning_after_a_success_is_degraded() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let earlier = Some(now - Duration::minutes(5));
+
+        let mut core_down = healthy_btcpay(now);
+        core_down.bitcoin_core = Some(core(false, earlier));
+        assert_eq!(
+            assess(&core_down, &policy, now, true),
+            OverallState::Degraded
+        );
+
+        let mut lightning_down = healthy_btcpay(now);
+        lightning_down.lightning = Some(lightning(false, earlier));
+        assert_eq!(
+            assess(&lightning_down, &policy, now, true),
+            OverallState::Degraded
+        );
+
+        let mut both_down_without_btcpay = base();
+        both_down_without_btcpay.bitcoin_core = Some(core(false, earlier));
+        both_down_without_btcpay.lightning = Some(lightning(false, earlier));
+        assert_eq!(
+            assess(&both_down_without_btcpay, &policy, now, true),
+            OverallState::Degraded
+        );
+    }
+
+    #[test]
+    fn never_connected_core_or_lightning_is_unhealthy() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+
+        let mut core_never = healthy_btcpay(now);
+        core_never.bitcoin_core = Some(core(false, None));
+        assert_eq!(
+            assess(&core_never, &policy, now, true),
+            OverallState::Unhealthy
+        );
+
+        let mut lightning_never = base();
+        lightning_never.lightning = Some(lightning(false, None));
+        assert_eq!(
+            assess(&lightning_never, &policy, now, true),
+            OverallState::Unhealthy
+        );
+    }
+
+    #[test]
+    fn connected_core_and_lightning_do_not_change_a_healthy_btcpay_verdict() {
+        let policy = HealthPolicy::default();
+        let now = Utc::now();
+        let mut s = healthy_btcpay(now);
+        s.bitcoin_core = Some(core(true, Some(now - Duration::seconds(10))));
+        s.lightning = Some(lightning(true, Some(now - Duration::seconds(10))));
+        assert_eq!(assess(&s, &policy, now, true), OverallState::Healthy);
     }
 
     #[test]

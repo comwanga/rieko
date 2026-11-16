@@ -13,6 +13,7 @@ async fn returns_exact_persisted_lightning_state() {
     let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 10, 0, 0).unwrap();
     let expected = LightningState {
         connected: true,
+        consecutive_failures: 0,
         last_attempt: observed_at,
         last_success: Some(observed_at),
         snapshot: Some(LightningSnapshot {
