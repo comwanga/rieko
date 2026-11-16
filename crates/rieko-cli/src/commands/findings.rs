@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use reqwest::{Client, Url};
-use rieko_findings::Finding;
+use rieko_findings::FindingView;
 use serde::de::DeserializeOwned;
 #[cfg(feature = "simulate")]
 use serde::Serialize;
@@ -90,7 +90,7 @@ impl ApiClient {
         &self,
         limit: u32,
         lifecycle: Lifecycle,
-    ) -> Result<Vec<Finding>> {
+    ) -> Result<Vec<FindingView>> {
         let url = findings_url(&self.api_url, limit, lifecycle);
         self.get(
             url,
@@ -101,7 +101,7 @@ impl ApiClient {
         .await
     }
 
-    pub(super) async fn fetch_finding(&self, finding_id: &str) -> Result<Finding> {
+    pub(super) async fn fetch_finding(&self, finding_id: &str) -> Result<FindingView> {
         let mut url = self.api_url.clone();
         url.set_query(None);
         url.path_segments_mut()
@@ -328,7 +328,7 @@ fn load_token(path: Option<&std::path::Path>) -> Result<Option<String>> {
     }
 }
 
-fn render_findings(findings: &[Finding]) -> Result<String> {
+fn render_findings(findings: &[FindingView]) -> Result<String> {
     serde_json::to_string_pretty(findings).context("rendering typed findings")
 }
 
@@ -337,7 +337,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use rieko_api::RiekoApi;
-    use rieko_findings::{Evidence, FindingLifecycle, Severity, FINDING_SCHEMA_VERSION};
+    use rieko_findings::{Evidence, Finding, FindingLifecycle, Severity, FINDING_SCHEMA_VERSION};
     use rieko_storage::{MemoryStorage, Storage};
 
     fn args(api_url: String) -> FindingsArgs {
@@ -388,7 +388,11 @@ mod tests {
     #[test]
     fn rendering_roundtrips_typed_findings_and_structured_evidence() {
         let expected = finding();
-        let rendered = render_findings(std::slice::from_ref(&expected)).unwrap();
+        let view = FindingView {
+            finding: expected.clone(),
+            observation_stale: false,
+        };
+        let rendered = render_findings(std::slice::from_ref(&view)).unwrap();
         let decoded: Vec<Finding> = serde_json::from_str(&rendered).unwrap();
         assert_eq!(decoded, [expected]);
         assert_eq!(
@@ -423,6 +427,48 @@ mod tests {
             .unwrap();
 
         server.abort();
-        assert_eq!(received, [expected]);
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].finding, expected);
+        assert!(!received[0].observation_stale);
+    }
+
+    #[tokio::test]
+    async fn rendered_findings_carry_the_stale_flag_computed_by_the_api() {
+        let mut storage = MemoryStorage::new();
+        let fresh = finding();
+        let mut aged = finding();
+        aged.id = "finding-aged".into();
+        aged.detector = "aged_detector".into();
+        aged.timestamp = Utc::now() - chrono::Duration::hours(3);
+        aged.first_seen_at = aged.timestamp;
+        aged.last_seen_at = aged.timestamp;
+        storage.save_finding(&fresh).unwrap();
+        storage.save_finding(&aged).unwrap();
+        let app = RiekoApi::new(Box::new(storage)).unwrap().router();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request_args = args(format!("http://{address}"));
+        let client = ApiClient::new(&request_args.api).unwrap();
+
+        let received = client
+            .fetch_findings(request_args.limit, request_args.lifecycle)
+            .await
+            .unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_findings(&received).unwrap()).unwrap();
+
+        server.abort();
+        let stale_of = |id: &str| {
+            rendered
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|finding| finding["id"] == id)
+                .unwrap()["observation_stale"]
+                .clone()
+        };
+        assert_eq!(stale_of(&fresh.id), false);
+        assert_eq!(stale_of("finding-aged"), true);
     }
 }

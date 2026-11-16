@@ -142,6 +142,11 @@ export interface Finding {
   first_seen_at: string;
   last_seen_at: string;
   lifecycle: "active" | "resolved";
+  /**
+   * Computed by the API when the finding is read: active, but not re-confirmed
+   * for longer than the agent's threshold. Absent from agents that predate it.
+   */
+  observation_stale?: boolean;
 }
 
 export interface FindingProvenance {

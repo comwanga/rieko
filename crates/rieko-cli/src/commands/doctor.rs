@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use rieko_api::routes::Status;
-use rieko_findings::Finding;
+use rieko_findings::FindingView;
 use serde::{Deserialize, Serialize};
 
 use super::findings::{ApiArgs, ApiClient, Lifecycle};
@@ -23,7 +23,7 @@ pub struct DoctorArgs {
 struct DoctorReport {
     status: Status,
     inspections: AllInspection,
-    active_findings: Vec<Finding>,
+    active_findings: Vec<FindingView>,
 }
 
 pub fn run(args: DoctorArgs) -> Result<()> {
@@ -80,8 +80,13 @@ fn render_report(report: &DoctorReport, api_url: &str) -> String {
     ];
     for finding in &report.active_findings {
         lines.push(format!(
-            "    - {} [{:?}] lifecycle={:?} id={} last_seen={}",
-            finding.detector, finding.severity, finding.lifecycle, finding.id, finding.last_seen_at
+            "    - {} [{:?}] lifecycle={:?} id={} last_seen={} stale={}",
+            finding.detector,
+            finding.severity,
+            finding.lifecycle,
+            finding.id,
+            finding.last_seen_at,
+            finding.observation_stale
         ));
     }
     lines.join("\n") + "\n"
@@ -162,7 +167,7 @@ mod tests {
         BtcPayInspection, BtcPayInspectionState, LightningInspection, StatusCounts,
     };
     use rieko_domain::{BitcoinCoreSnapshot, BitcoinNetwork, LightningSnapshot};
-    use rieko_findings::{Evidence, FindingLifecycle, Severity, FINDING_SCHEMA_VERSION};
+    use rieko_findings::{Evidence, Finding, FindingLifecycle, Severity, FINDING_SCHEMA_VERSION};
     use rieko_status::{
         BitcoinCoreState, LightningState, OperationalState, OperationalStateStore, SourceState,
     };
@@ -283,10 +288,45 @@ mod tests {
         let rendered = render_report(&report, &api_url);
 
         server.abort();
-        assert_eq!(report.active_findings, vec![expected]);
+        assert_eq!(report.active_findings.len(), 1);
+        assert_eq!(report.active_findings[0].finding, expected);
         assert!(rendered.contains("active findings:  1"));
         assert!(rendered.contains("bitcoin_core_sync_correlation"));
         assert!(rendered.contains("lifecycle=Active"));
+    }
+
+    #[tokio::test]
+    async fn marks_only_a_finding_the_api_reports_as_stale() {
+        let fresh = active_finding();
+        let mut aged = active_finding();
+        aged.id = "finding-aged".into();
+        aged.detector = "aged_detector".into();
+        aged.timestamp = Utc::now() - chrono::Duration::hours(3);
+        aged.first_seen_at = aged.timestamp;
+        aged.last_seen_at = aged.timestamp;
+        let mut storage = MemoryStorage::new();
+        storage.write_operational_state(&healthy_state()).unwrap();
+        storage.save_finding(&fresh).unwrap();
+        storage.save_finding(&aged).unwrap();
+        let app = rieko_api::RiekoApi::new(Box::new(storage))
+            .unwrap()
+            .router();
+        let (api_url, server) = start(app).await;
+
+        let report = fetch_report(&client(api_url.clone(), None)).await.unwrap();
+        let rendered = render_report(&report, &api_url);
+
+        server.abort();
+        let line_for = |id: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(&format!("id={id} ")))
+                .unwrap()
+                .to_string()
+        };
+        assert!(line_for("finding-aged").ends_with(" stale=true"));
+        assert!(line_for(&fresh.id).ends_with(" stale=false"));
+        assert!(rendered.contains("active findings:  2"));
     }
 
     #[tokio::test]

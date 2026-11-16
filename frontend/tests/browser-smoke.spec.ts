@@ -1047,6 +1047,105 @@ test.describe("Findings and Services", () => {
     }, undefined, true);
   });
 
+  test("findings the agent has just confirmed carry no stale tag on any view", async ({ page }, info) => {
+    await withAgent("embedded", info, async url => {
+      // Real responses from the seeded agent: the API always sends the flag,
+      // and for findings it has just stored the flag is false.
+      const findings = await (await fetch(`${url}/findings?lifecycle=active`)).json();
+      expect(findings.length).toBeGreaterThan(0);
+      for (const finding of findings) expect(finding.observation_stale, finding.id).toBe(false);
+      const detail = await (await fetch(`${url}/findings/${encodeURIComponent(findings[0].id)}`)).json();
+      expect(detail.observation_stale).toBe(false);
+
+      await page.goto(`${url}/#/findings`);
+      await expect(findingRows(page).first()).toBeVisible();
+      await expect(page.locator("main").getByText("Stale", { exact: true })).toHaveCount(0);
+      await page.goto(`${url}/#/overview`);
+      await expect(page.getByRole("region", { name: "Active findings", exact: true }).getByRole("listitem").first()).toBeVisible();
+      await expect(page.locator("main").getByText("Stale", { exact: true })).toHaveCount(0);
+      await page.goto(`${url}/#/findings/${encodeURIComponent(findings[0].id)}`);
+      await expect(page.getByRole("region", { name: "Summary", exact: true })).toBeVisible();
+      await expect(page.locator("main").getByText("Stale", { exact: true })).toHaveCount(0);
+      await expect(page.locator("main")).not.toContainText("has not confirmed it since");
+    }, undefined, true);
+  });
+
+  test("a stale finding is tagged on the list, the Overview and its detail page, and stays counted (labelled test double)", async ({ page }, info) => {
+    test.setTimeout(90_000);
+    await withAgent("embedded", info, async url => {
+      const findings = await (await fetch(`${url}/findings?lifecycle=active`)).json();
+      expect(findings.length).toBeGreaterThan(1);
+      // Choose a finding that has recommendations, so the Recommendations page is covered too.
+      const recommendations = await (await fetch(`${url}/recommendations`)).json();
+      const stale = findings.find((finding: { id: string }) =>
+        recommendations.some((recommendation: { finding_id: string }) => recommendation.finding_id === finding.id));
+      expect(stale, "the seed links at least one recommendation to an active finding").toBeTruthy();
+      const linked = recommendations.filter((recommendation: { finding_id: string }) => recommendation.finding_id === stale.id).length;
+      // Test double: the real responses with `observation_stale` set on one
+      // finding. The seed's findings were stored seconds ago, so the agent
+      // reports them all as fresh; the API's own computation from an aged
+      // stored finding is covered by crates/rieko-api/tests/finding_staleness.rs.
+      await page.route(route => new URL(route).pathname.startsWith("/findings"), async route => {
+        const response = await route.fetch();
+        if (!response.ok()) return route.fulfill({ response });
+        const body = await response.json();
+        const mark = (finding: { id: string }) => finding.id === stale.id ? { ...finding, observation_stale: true } : finding;
+        await route.fulfill({ response, json: Array.isArray(body) ? body.map(mark) : mark(body) });
+      });
+
+      // List: tagged in its State cell, still active, still counted.
+      await page.goto(`${url}/#/findings`);
+      await expect(findingRows(page)).toHaveCount(findings.length);
+      const row = findingRows(page).filter({ has: page.locator(`a[href="#/findings/${encodeURIComponent(stale.id)}"]`) });
+      await expect(row.getByRole("cell").nth(1)).toHaveText(/^active\s*Stale$/);
+      await expect(page.locator("main").getByText("Stale", { exact: true })).toHaveCount(1);
+
+      // Overview: tagged in the active-findings list, with the count unchanged.
+      await page.goto(`${url}/#/overview`);
+      const active = page.getByRole("region", { name: "Active findings", exact: true });
+      await expect(active.getByRole("listitem")).toHaveCount(findings.length);
+      await expect(active.getByText("Stale", { exact: true })).toHaveCount(1);
+      await expect(page.getByRole("link", { name: "Findings", exact: true })).toHaveAccessibleDescription(`${findings.length} active findings`);
+
+      // Recommendations: each recommendation built on the stale finding says so,
+      // in the table and in the dialog where the operator acts on it.
+      await page.goto(`${url}/#/recommendations`);
+      const recommendationRows = page.locator("main tbody tr").filter({ has: page.getByRole("button", { name: "Simulate", exact: true }) });
+      await expect(recommendationRows).toHaveCount(recommendations.length);
+      const staleRows = recommendationRows.filter({ has: page.getByText("Stale", { exact: true }) });
+      await expect(staleRows).toHaveCount(linked);
+      await staleRows.first().getByRole("button", { name: "Simulate", exact: true }).click();
+      await expect(simulationDialog(page).getByText("Stale", { exact: true })).toBeVisible();
+      await page.keyboard.press("Escape");
+
+      // Detail: the state stays "active"; the sentence gives the last confirmation.
+      for (const theme of ["dark", "light"] as const) {
+        for (const width of WIDTHS) {
+          await page.setViewportSize({ width, height: 900 });
+          await page.goto(`${url}/#/findings/${encodeURIComponent(stale.id)}`);
+          await useTheme(page, theme);
+          const summary = page.getByRole("region", { name: "Summary", exact: true });
+          await expect(summary.getByText("Stale", { exact: true })).toBeVisible();
+          await expect(summary).toContainText(/Rieko last confirmed this finding .+ \(.+\) and has not confirmed it since\. It may no longer describe the current state\./);
+          await expect(summary).toContainText("active");
+          await expect(summary.getByRole("alert")).toHaveCount(0);
+          await expectReadable(page, `${theme} ${width}px stale detail`);
+          const overflow = await page.evaluate(() => {
+            const main = document.querySelector("main")!;
+            return { page: document.documentElement.scrollWidth - document.documentElement.clientWidth, main: main.scrollWidth - main.clientWidth };
+          });
+          expect(overflow, `${theme} ${width}px stale detail`).toEqual({ page: 0, main: 0 });
+
+          await page.goto(`${url}/#/findings`);
+          await useTheme(page, theme);
+          await expect(page.locator("main").getByText("Stale", { exact: true })).toBeVisible();
+          await expectReadable(page, `${theme} ${width}px stale list`);
+        }
+      }
+      await page.screenshot({ path: info.outputPath("findings-stale.png"), fullPage: true });
+    }, undefined, true);
+  });
+
   test("an unknown finding is reported as not found without retries", async ({ page }, info) => {
     await withAgent("embedded", info, async url => {
       let requests = 0;

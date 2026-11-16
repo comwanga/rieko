@@ -310,17 +310,26 @@ pub async fn findings(
             .map_err(|e| e.to_string())
     })
     .await?;
-    let out: Vec<Value> = rows
+    Ok(Json(finding_values(&api, rows)))
+}
+
+/// Presents stored findings as read now. `observation_stale` is computed here
+/// and never written back.
+fn finding_values(api: &RiekoApi, findings: Vec<rieko_findings::Finding>) -> Vec<Value> {
+    let now = Utc::now();
+    findings
         .into_iter()
-        .map(|f| serde_json::to_value(&f).unwrap_or(Value::Null))
-        .collect();
-    Ok(Json(out))
+        .map(|finding| {
+            let view = rieko_findings::FindingView::at(finding, now, api.state.finding_stale_after);
+            serde_json::to_value(&view).unwrap_or(Value::Null)
+        })
+        .collect()
 }
 
 pub async fn finding_by_id(
     State(api): State<RiekoApi>,
     Path(finding_id): Path<String>,
-) -> Result<Json<rieko_findings::Finding>, (StatusCode, String)> {
+) -> Result<Json<rieko_findings::FindingView>, (StatusCode, String)> {
     let requested_id = finding_id.clone();
     let finding = block_storage(api.state.storage.clone(), move |storage| {
         storage
@@ -328,10 +337,18 @@ pub async fn finding_by_id(
             .map_err(|error| error.to_string())
     })
     .await?;
-    finding.map(Json).ok_or((
-        StatusCode::NOT_FOUND,
-        format!("finding {requested_id} not found"),
-    ))
+    finding
+        .map(|finding| {
+            Json(rieko_findings::FindingView::at(
+                finding,
+                Utc::now(),
+                api.state.finding_stale_after,
+            ))
+        })
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("finding {requested_id} not found"),
+        ))
 }
 
 pub async fn findings_for_channel(
@@ -345,11 +362,7 @@ pub async fn findings_for_channel(
             .map_err(|e| e.to_string())
     })
     .await?;
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(|f| serde_json::to_value(&f).unwrap_or(Value::Null))
-        .collect();
-    Ok(Json(out))
+    Ok(Json(finding_values(&api, rows)))
 }
 
 pub async fn recommendations(

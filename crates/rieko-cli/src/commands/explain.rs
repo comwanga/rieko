@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Args;
-use rieko_findings::Finding;
+use rieko_findings::FindingView;
 
 use super::findings::{ApiArgs, ApiClient};
 
@@ -25,7 +25,7 @@ pub fn run(args: ExplainArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_finding(finding: &Finding) -> Result<String> {
+fn render_finding(finding: &FindingView) -> Result<String> {
     serde_json::to_string_pretty(finding).context("rendering typed finding")
 }
 
@@ -37,7 +37,7 @@ mod tests {
     use rieko_api::RiekoApi;
     use rieko_domain::BitcoinNetwork;
     use rieko_findings::{
-        ChannelSnapshotReference, Evidence, FindingLifecycle, FindingProvenance,
+        ChannelSnapshotReference, Evidence, Finding, FindingLifecycle, FindingProvenance,
         ObservationReference, ObservationSource, ProducerRole, ProducerVersion, Severity,
         FINDING_SCHEMA_VERSION,
     };
@@ -115,9 +115,13 @@ mod tests {
             .unwrap();
         let rendered = render_finding(&actual).unwrap();
         let decoded: Finding = serde_json::from_str(&rendered).unwrap();
+        let rendered_value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         server.abort();
         assert_eq!(decoded, expected);
+        // The fixture was last seen in 2023 and is still active, so the API
+        // reports it as stale and the rendered output keeps that.
+        assert_eq!(rendered_value["observation_stale"], true);
         assert_eq!(
             decoded.evidence[0].value,
             serde_json::json!(["invoice-a", "invoice-b"])

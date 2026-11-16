@@ -1,9 +1,39 @@
 import { expect, test } from "@playwright/test";
 import {
-  actionabilityLabel, describeProvenance, evidenceValue, recommendationsFor,
+  actionabilityLabel, describeProvenance, evidenceValue, recommendationsFor, staleNote,
   type RecommendationDetail,
 } from "../src/lib/findings";
 import { parseLocation } from "../src/lib/router";
+
+test.describe("stale findings", () => {
+  const lastSeen = { relative: "3 hours ago", absolute: "2026-11-16 09:00:00 UTC" };
+
+  test("only a finding the API reports as stale gets the tag and sentence", () => {
+    expect(staleNote({ observation_stale: true }, lastSeen)).toEqual({
+      tag: "Stale",
+      detail: "Rieko last confirmed this finding 3 hours ago (2026-11-16 09:00:00 UTC) and has not confirmed it since. "
+        + "It may no longer describe the current state.",
+    });
+    expect(staleNote({ observation_stale: false }, lastSeen)).toBeNull();
+  });
+
+  test("a response without the field, as an older agent sends, is not stale", () => {
+    expect(staleNote({}, lastSeen)).toBeNull();
+  });
+
+  test("anything other than true is not trusted as stale", () => {
+    for (const value of ["true", 1, null, {}]) {
+      expect(staleNote({ observation_stale: value as unknown as boolean }, lastSeen)).toBeNull();
+    }
+  });
+
+  test("the wording states the age of the last confirmation and asserts no cause or resolution", () => {
+    const { detail } = staleNote({ observation_stale: true }, lastSeen)!;
+    for (const claim of ["down", "unreachable", "offline", "disconnected", "resolved", "healthy", "fixed"]) {
+      expect(detail.toLowerCase()).not.toContain(claim);
+    }
+  });
+});
 
 test.describe("routes", () => {
   test("finding detail carries its identifier", () => {

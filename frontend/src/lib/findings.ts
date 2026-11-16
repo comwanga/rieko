@@ -17,6 +17,27 @@ export interface RecommendationDetail extends Recommendation {
 
 export interface Row { label: string; value: string }
 
+export interface StaleNote { tag: string; detail: string }
+
+/**
+ * Wording for a finding the API reports as stale: active, but not re-confirmed
+ * for longer than the agent's threshold. It states the age of the last
+ * confirmation and nothing about why. Null for any other finding, including
+ * one from an agent too old to send the flag; the absence of a note says
+ * nothing about the health of the finding's source.
+ */
+export function staleNote(
+  finding: { observation_stale?: boolean },
+  lastSeen: { relative: string; absolute: string },
+): StaleNote | null {
+  if (finding.observation_stale !== true) return null;
+  return {
+    tag: "Stale",
+    detail: `Rieko last confirmed this finding ${lastSeen.relative} (${lastSeen.absolute}) and has not confirmed it since. `
+      + "It may no longer describe the current state.",
+  };
+}
+
 export function evidenceValue(value: unknown): { text: string; block: boolean } {
   if (value !== null && typeof value === "object") return { text: JSON.stringify(value, null, 2), block: true };
   return { text: String(value), block: false };

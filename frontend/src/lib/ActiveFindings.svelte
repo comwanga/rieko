@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Finding } from "./api";
+  import { staleNote } from "./findings";
   import { findingsCount, formatTime } from "./overview";
   import { findingHref } from "./router";
 
@@ -31,9 +32,11 @@
       {#each findings as finding (finding.id)}
         {@const first = formatTime(finding.first_seen_at, now)}
         {@const last = formatTime(finding.last_seen_at, now)}
+        {@const stale = staleNote(finding, last)}
         <li>
           <div class="title">
             <span class="tag {severityClass(finding.severity)}">{finding.severity}</span>
+            {#if stale}<span class="tag stale">{stale.tag}</span>{/if}
             <strong>{finding.detector}</strong>
             <span class="target">{finding.channel ?? finding.node ?? ""}</span>
           </div>
