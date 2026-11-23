@@ -47,7 +47,7 @@ jobs:
           npm run check
           npm run build
       - name: Cache Rust
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
